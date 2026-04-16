@@ -1,0 +1,54 @@
+/**
+ * PigCache — Metrics page styles.
+ *
+ * @package PigCache
+ */
+
+.pigcache-metrics-guide {
+	max-width: 920px;
+	margin: 16px 0;
+}
+
+.pigcache-metrics-guide h2:first-child {
+	margin-top: 0;
+}
+
+.pigcache-metrics-notice {
+	padding: 12px 14px;
+	margin: 0 0 12px;
+}
+
+.pigcache-metrics-notice p:first-child {
+	margin-top: 0;
+}
+
+.pigcache-metrics-notice ul {
+	margin: 0 0 0 1.25em;
+	list-style: disc;
+}
+
+.pigcache-key-cell {
+	word-break: break-all;
+}
+
+.pigcache-oc-summary {
+	max-width: 720px;
+}
+
+.pigcache-oc-hint {
+	max-width: 720px;
+	padding: 10px 12px;
+}
+
+.pigcache-oc-hint ul {
+	margin: 0 0 0 1.25em;
+	list-style: disc;
+}
+
+.pigcache-oc-hint p:first-child {
+	margin-top: 0;
+}
+
+.pigcache-redis-info {
+	max-width: 720px;
+}

@@ -1,0 +1,14 @@
+{
+	"name": "pigcache/plugin",
+	"description": "Composer dependencies for the PigCache WordPress plugin (Predis).",
+	"type": "wordpress-plugin",
+	"version": "1.0.0",
+	"license": "GPL-3.0-or-later",
+	"require": {
+		"php": ">=7.4",
+		"predis/predis": "^2.2 || ^1.1.9"
+	},
+	"config": {
+		"sort-packages": true
+	}
+}

@@ -1,0 +1,10 @@
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Development only – vendor/ IS committed for distribution as a WordPress plugin.
+# If you need to rebuild: composer install --no-dev

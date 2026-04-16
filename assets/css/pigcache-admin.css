@@ -1,0 +1,143 @@
+/**
+ * PigCache — Settings page styles.
+ *
+ * @package PigCache
+ */
+
+.pigcache-table {
+	max-width: 640px;
+}
+
+.pigcache-table-wide {
+	max-width: 720px;
+}
+
+.pigcache-form {
+	margin: 12px 0;
+}
+
+.pigcache-form-narrow {
+	margin: 12px 0;
+	max-width: 640px;
+}
+
+.pigcache-form-wide {
+	margin: 12px 0;
+	max-width: 720px;
+}
+
+.pigcache-code-block {
+	background: #f0f0f1;
+	padding: 12px;
+}
+
+.pigcache-install-note {
+	max-width: 720px;
+	padding: 12px;
+	margin: 12px 0;
+}
+
+.pigcache-install-note ul {
+	margin: 0 0 0 1.25em;
+	list-style: disc;
+}
+
+.pigcache-group-list {
+	max-height: 220px;
+	overflow: auto;
+	margin: 8px 0;
+	white-space: pre-wrap;
+	font-size: 12px;
+}
+
+.pigcache-inline-problem {
+	padding: 10px 12px;
+	margin: 12px 0;
+	max-width: 720px;
+}
+
+.pigcache-inline-problem p:first-child {
+	margin: 0;
+}
+
+.pigcache-inline-problem p.description {
+	margin: 8px 0 0;
+}
+
+/* Cache Dashboard */
+.pigcache-dashboard {
+	display: grid;
+	grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+	gap: 16px;
+	margin: 16px 0;
+	max-width: 1200px;
+}
+
+.pigcache-dashboard-card {
+	background: #fff;
+	border: 1px solid #c3c4c7;
+	border-radius: 4px;
+	padding: 0 16px 16px;
+}
+
+.pigcache-dashboard-card h3 {
+	margin: 12px 0 8px;
+	padding-bottom: 8px;
+	border-bottom: 1px solid #f0f0f1;
+	font-size: 14px;
+}
+
+.pigcache-dashboard-card .widefat {
+	border: none;
+	box-shadow: none;
+}
+
+.pigcache-dashboard-card .widefat th {
+	width: 45%;
+	font-weight: 400;
+	color: #50575e;
+	font-size: 12px;
+}
+
+.pigcache-dashboard-card .widefat td {
+	font-size: 13px;
+}
+
+.pigcache-dashboard-details {
+	margin-top: 8px;
+}
+
+.pigcache-dashboard-details summary {
+	cursor: pointer;
+	color: #2271b1;
+	font-size: 12px;
+}
+
+.pigcache-dashboard-details summary:hover {
+	color: #135e96;
+}
+
+.pigcache-dashboard-details .widefat {
+	margin-top: 8px;
+}
+
+.pigcache-dashboard-details .widefat th,
+.pigcache-dashboard-details .widefat td {
+	font-size: 12px;
+	padding: 4px 8px;
+}
+
+/* Pro badge */
+.pigcache-pro-badge {
+	display: inline-block;
+	background: #2271b1;
+	color: #fff;
+	font-size: 11px;
+	font-weight: 600;
+	line-height: 1;
+	padding: 3px 8px;
+	border-radius: 3px;
+	vertical-align: middle;
+	margin-left: 6px;
+	letter-spacing: 0.5px;
+}
