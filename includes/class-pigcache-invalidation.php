@@ -121,11 +121,15 @@ class PigCache_Invalidation {
 			return;
 		}
 
-		$tags = self::resolve_post_tags( $post_id );
-		$tags = apply_filters( 'pigcache_invalidation_tags', $tags, $post_id );
+		if ( self::can_use_tag_invalidation() ) {
+			$tags = self::resolve_post_tags( $post_id );
+			$tags = apply_filters( 'pigcache_invalidation_tags', $tags, $post_id );
 
-		if ( class_exists( 'PigCache_Tag_Index', false ) && ! empty( $tags ) ) {
-			PigCache_Tag_Index::purge_by_tags( $tags );
+			if ( class_exists( 'PigCache_Tag_Index', false ) && ! empty( $tags ) ) {
+				PigCache_Tag_Index::purge_by_tags( $tags );
+			}
+		} else {
+			self::global_flush();
 		}
 
 		self::bump_sql_epoch();
@@ -184,13 +188,17 @@ class PigCache_Invalidation {
 			return;
 		}
 
-		$tags = array(
-			'term:' . (int) $term_id,
-			'taxonomy:' . $taxonomy,
-		);
+		if ( self::can_use_tag_invalidation() ) {
+			$tags = array(
+				'term:' . (int) $term_id,
+				'taxonomy:' . $taxonomy,
+			);
 
-		if ( class_exists( 'PigCache_Tag_Index', false ) ) {
-			PigCache_Tag_Index::purge_by_tags( $tags );
+			if ( class_exists( 'PigCache_Tag_Index', false ) ) {
+				PigCache_Tag_Index::purge_by_tags( $tags );
+			}
+		} else {
+			self::global_flush();
 		}
 
 		self::bump_sql_epoch();
@@ -209,12 +217,16 @@ class PigCache_Invalidation {
 			return;
 		}
 
-		$comment_obj = get_comment( $comment_id );
-		if ( $comment_obj && $comment_obj->comment_post_ID ) {
-			$tags = self::resolve_post_tags( (int) $comment_obj->comment_post_ID );
-			if ( class_exists( 'PigCache_Tag_Index', false ) ) {
-				PigCache_Tag_Index::purge_by_tags( $tags );
+		if ( self::can_use_tag_invalidation() ) {
+			$comment_obj = get_comment( $comment_id );
+			if ( $comment_obj && $comment_obj->comment_post_ID ) {
+				$tags = self::resolve_post_tags( (int) $comment_obj->comment_post_ID );
+				if ( class_exists( 'PigCache_Tag_Index', false ) ) {
+					PigCache_Tag_Index::purge_by_tags( $tags );
+				}
 			}
+		} else {
+			self::global_flush();
 		}
 
 		self::bump_sql_epoch();
@@ -247,10 +259,14 @@ class PigCache_Invalidation {
 			return;
 		}
 
-		$tags = array( 'nav_menu:' . (int) $menu_id );
+		if ( self::can_use_tag_invalidation() ) {
+			$tags = array( 'nav_menu:' . (int) $menu_id );
 
-		if ( class_exists( 'PigCache_Tag_Index', false ) ) {
-			PigCache_Tag_Index::purge_by_tags( $tags );
+			if ( class_exists( 'PigCache_Tag_Index', false ) ) {
+				PigCache_Tag_Index::purge_by_tags( $tags );
+			}
+		} else {
+			self::global_flush();
 		}
 
 		self::bump_sql_epoch();
@@ -268,10 +284,14 @@ class PigCache_Invalidation {
 			return;
 		}
 
-		$tags = array( 'author:' . (int) $user_id );
+		if ( self::can_use_tag_invalidation() ) {
+			$tags = array( 'author:' . (int) $user_id );
 
-		if ( class_exists( 'PigCache_Tag_Index', false ) ) {
-			PigCache_Tag_Index::purge_by_tags( $tags );
+			if ( class_exists( 'PigCache_Tag_Index', false ) ) {
+				PigCache_Tag_Index::purge_by_tags( $tags );
+			}
+		} else {
+			self::global_flush();
 		}
 
 		self::bump_sql_epoch();
@@ -302,13 +322,18 @@ class PigCache_Invalidation {
 	// ------------------------------------------------------------------
 
 	/**
-	 * Generic content change handler for non-taggable events.
-	 * Only bumps the SQL epoch (HTML pages remain cached until TTL expires
-	 * or until a tagged object changes).
+	 * Generic content change handler for non-taggable events (options, theme,
+	 * widgets). Pro: only bumps SQL epoch — HTML stays cached until a tagged
+	 * object changes. Free: also flushes HTML/fragments globally since there
+	 * are no tags to resolve.
 	 */
 	public static function on_generic_change() {
 		if ( ! self::acquire_throttle() ) {
 			return;
+		}
+
+		if ( ! self::can_use_tag_invalidation() ) {
+			self::global_flush();
 		}
 
 		self::bump_sql_epoch();
@@ -350,5 +375,25 @@ class PigCache_Invalidation {
 		if ( class_exists( 'PigCache_Sql_Cache', false ) ) {
 			PigCache_Sql_Cache::bump_epoch();
 		}
+	}
+
+	/**
+	 * Flush all HTML and fragment cache entries (Free-tier global invalidation).
+	 */
+	private static function global_flush() {
+		if ( class_exists( 'PigCache_Html_Cache', false ) ) {
+			PigCache_Html_Cache::flush_all();
+		}
+
+		if ( class_exists( 'PigCache_Fragments', false ) ) {
+			PigCache_Fragments::flush_all();
+		}
+	}
+
+	/**
+	 * @return bool
+	 */
+	private static function can_use_tag_invalidation() {
+		return class_exists( 'PigCache_License', false ) && PigCache_License::can_use_tag_invalidation();
 	}
 }

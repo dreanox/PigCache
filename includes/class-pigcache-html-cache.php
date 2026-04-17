@@ -55,7 +55,9 @@ class PigCache_Html_Cache {
 			return;
 		}
 
-		if ( class_exists( 'PigCache_Tag_Collector', false ) ) {
+		$tag_inv = class_exists( 'PigCache_License', false ) && PigCache_License::can_use_tag_invalidation();
+
+		if ( $tag_inv && class_exists( 'PigCache_Tag_Collector', false ) ) {
 			PigCache_Tag_Collector::start();
 		}
 
@@ -96,7 +98,9 @@ class PigCache_Html_Cache {
 
 		wp_cache_set( $key, $pack, self::GROUP_HTML, $ttl );
 
-		if ( class_exists( 'PigCache_Tag_Index', false ) && ! empty( $tags ) ) {
+		$tag_inv = class_exists( 'PigCache_License', false ) && PigCache_License::can_use_tag_invalidation();
+
+		if ( $tag_inv && class_exists( 'PigCache_Tag_Index', false ) && ! empty( $tags ) ) {
 			PigCache_Tag_Index::store_tags( $key, self::GROUP_HTML, $tags );
 		}
 
@@ -228,5 +232,12 @@ class PigCache_Html_Cache {
 		}
 
 		return (string) wp_unslash( $_SERVER['REQUEST_URI'] );
+	}
+
+	/**
+	 * Flush the entire HTML cache group (global invalidation for Free tier).
+	 */
+	public static function flush_all() {
+		wp_cache_flush_group( self::GROUP_HTML );
 	}
 }

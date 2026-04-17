@@ -30,7 +30,7 @@ class PigCache_Admin {
 	 * @param string $hook_suffix
 	 */
 	public static function enqueue_assets( $hook_suffix ) {
-		if ( 'settings_page_pigcache' !== $hook_suffix && 'settings_page_pigcache-metrics' !== $hook_suffix ) {
+		if ( 'settings_page_pigcache' !== $hook_suffix ) {
 			return;
 		}
 
@@ -41,6 +41,13 @@ class PigCache_Admin {
 			PIGCACHE_VERSION
 		);
 
+		wp_enqueue_style(
+			'pigcache-metrics',
+			PIGCACHE_URL . 'assets/css/pigcache-metrics.css',
+			array( 'pigcache-admin' ),
+			PIGCACHE_VERSION
+		);
+
 		wp_enqueue_script(
 			'pigcache-admin',
 			PIGCACHE_URL . 'assets/js/pigcache-admin.js',
@@ -48,15 +55,6 @@ class PigCache_Admin {
 			PIGCACHE_VERSION,
 			true
 		);
-
-		if ( 'settings_page_pigcache-metrics' === $hook_suffix ) {
-			wp_enqueue_style(
-				'pigcache-metrics',
-				PIGCACHE_URL . 'assets/css/pigcache-metrics.css',
-				array( 'pigcache-admin' ),
-				PIGCACHE_VERSION
-			);
-		}
 	}
 
 	/**
@@ -186,7 +184,7 @@ class PigCache_Admin {
 
 		check_admin_referer( 'pigcache_sql_profiler' );
 
-		if ( ! PigCache_License::can_use_profiler() ) {
+		if ( ! class_exists( 'PigCache_Sql_Profiler', false ) || ! PigCache_License::can_use_profiler() ) {
 			return;
 		}
 
@@ -241,7 +239,7 @@ class PigCache_Admin {
 				$url = add_query_arg( 'pigcache_err', rawurlencode( $result->get_error_message() ), $url );
 			} elseif ( ! empty( $result['valid'] ) ) {
 				$url = add_query_arg( 'pigcache_license', 'activated', $url );
-				if ( PigCache_Cloud_Sync::is_enabled() ) {
+				if ( class_exists( 'PigCache_Cloud_Sync', false ) && PigCache_Cloud_Sync::is_enabled() ) {
 					PigCache_Cloud_Sync::schedule();
 				}
 			} else {
@@ -250,11 +248,17 @@ class PigCache_Admin {
 			}
 		} elseif ( 'deactivate' === $action ) {
 			PigCache_License::deactivate();
-			PigCache_Cloud_Sync::unschedule();
+			if ( class_exists( 'PigCache_Cloud_Sync', false ) ) {
+				PigCache_Cloud_Sync::unschedule();
+			}
 			$url = add_query_arg( 'pigcache_license', 'deactivated', $url );
 		} elseif ( 'sync_now' === $action ) {
-			$result = PigCache_Cloud_Sync::force_sync();
-			$url    = add_query_arg( 'pigcache_license', 'synced', $url );
+			if ( class_exists( 'PigCache_Cloud_Sync', false ) ) {
+				PigCache_Cloud_Sync::force_sync();
+				$url = add_query_arg( 'pigcache_license', 'synced', $url );
+			} else {
+				$url = add_query_arg( 'pigcache_err', rawurlencode( __( 'Cloud sync is not available in this build.', 'pigcache' ) ), $url );
+			}
 		} elseif ( 'refresh_status' === $action ) {
 			PigCache_License::flush_cache();
 			$url = add_query_arg( 'pigcache_license', 'refreshed', $url );
@@ -268,11 +272,47 @@ class PigCache_Admin {
 	 * Render the License & Cloud section on the admin page.
 	 */
 	public static function render_license_section() {
-		$has_key  = PigCache_License::has_key();
-		$is_pro   = PigCache_License::is_pro();
-		$plan     = PigCache_License::get_plan();
-		$site_id  = PigCache_License::get_site_id();
-		$key_hint = $has_key ? substr( PigCache_License::get_key(), 0, 8 ) . '...' : '';
+		$has_key   = PigCache_License::has_key();
+		$is_pro    = PigCache_License::is_pro();
+		$plan      = PigCache_License::get_plan();
+		$site_id   = PigCache_License::get_site_id();
+		$key_hint  = $has_key ? substr( PigCache_License::get_key(), 0, 8 ) . '...' : '';
+		$full_pkg  = PigCache_License::has_pro_distribution();
+
+		if ( ! $full_pkg ) {
+			echo '<h2>';
+			echo esc_html__( 'PigCache Pro (full package)', 'pigcache' );
+			echo ' <span class="pigcache-pro-badge" style="background:#646970">' . esc_html__( 'Community build', 'pigcache' ) . '</span>';
+			echo '</h2>';
+			echo '<div class="notice notice-info inline"><p>';
+			echo esc_html__( 'This WordPress.org release does not include the license client, cloud sync, or the SQL profiler. Those ship only in the paid Pro ZIP.', 'pigcache' );
+			echo ' ';
+			echo esc_html__( 'Entering a key here cannot unlock or download Pro code — replace this plugin with the Pro package from your purchase, then activate your license in that install.', 'pigcache' );
+			echo '</p></div>';
+
+			if ( $has_key ) {
+				echo '<div class="notice notice-warning inline"><p>';
+				echo esc_html__( 'A license key is still stored from a previous Pro install. You can clear it below; it will not enable features in this build.', 'pigcache' );
+				echo '</p></div>';
+				echo '<table class="widefat striped pigcache-table"><tbody>';
+				echo '<tr><th>' . esc_html__( 'API key', 'pigcache' ) . '</th>';
+				echo '<td><code>' . esc_html( $key_hint ) . '</code></td></tr>';
+				if ( $site_id ) {
+					echo '<tr><th>' . esc_html__( 'Site ID', 'pigcache' ) . '</th>';
+					echo '<td><code>' . esc_html( $site_id ) . '</code></td></tr>';
+				}
+				echo '</tbody></table>';
+				echo '<form method="post" class="pigcache-form">';
+				wp_nonce_field( 'pigcache_license' );
+				echo '<p><button type="submit" name="pigcache_license_action" value="deactivate" class="button pigcache-confirm" data-confirm="' . esc_attr__( 'Clear the stored license data from this site?', 'pigcache' ) . '">';
+				echo esc_html__( 'Clear stored license', 'pigcache' ) . '</button></p>';
+				echo '</form>';
+			}
+
+			self::render_license_flash_notices();
+
+			return;
+		}
 
 		echo '<h2>';
 		echo esc_html__( 'PigCache Pro — License & Cloud', 'pigcache' );
@@ -295,7 +335,7 @@ class PigCache_Admin {
 			echo '<td><code>' . esc_html( $site_id ) . '</code></td></tr>';
 		}
 
-		if ( $is_pro ) {
+		if ( $is_pro && class_exists( 'PigCache_Cloud_Sync', false ) ) {
 			$last_sync = PigCache_Cloud_Sync::last_sync();
 			$is_cloud  = PigCache_Cloud_Sync::is_cloud_profile();
 			$env_hash  = class_exists( 'PigCache_Environment', false ) ? PigCache_Environment::get_signature() : '-';
@@ -339,9 +379,11 @@ class PigCache_Admin {
 			echo esc_html__( 'Activate License', 'pigcache' ) . '</button></p>';
 		} else {
 			echo '<p>';
-			if ( $is_pro ) {
+			if ( $is_pro && class_exists( 'PigCache_Cloud_Sync', false ) ) {
 				echo '<button type="submit" name="pigcache_license_action" value="sync_now" class="button button-primary">';
 				echo esc_html__( 'Sync Now', 'pigcache' ) . '</button> ';
+			}
+			if ( $is_pro ) {
 				echo '<button type="submit" name="pigcache_license_action" value="refresh_status" class="button">';
 				echo esc_html__( 'Refresh Status', 'pigcache' ) . '</button> ';
 			}
@@ -352,17 +394,32 @@ class PigCache_Admin {
 
 		echo '</form>';
 
-		if ( isset( $_GET['pigcache_license'] ) ) {
-			$msg_key  = sanitize_key( $_GET['pigcache_license'] );
-			$messages = array(
-				'activated'   => __( 'License activated. Cloud sync is now enabled.', 'pigcache' ),
-				'deactivated' => __( 'License deactivated. Cloud features disabled.', 'pigcache' ),
-				'synced'      => __( 'Cloud sync completed.', 'pigcache' ),
-				'refreshed'   => __( 'License status refreshed.', 'pigcache' ),
-			);
-			if ( isset( $messages[ $msg_key ] ) ) {
-				echo '<div class="notice notice-success inline"><p>' . esc_html( $messages[ $msg_key ] ) . '</p></div>';
-			}
+		self::render_license_flash_notices();
+	}
+
+	/**
+	 * Success notices after license actions (shared by Pro UI and edge cases).
+	 */
+	private static function render_license_flash_notices() {
+		if ( ! isset( $_GET['pigcache_license'] ) ) {
+			return;
+		}
+
+		$msg_key = sanitize_key( $_GET['pigcache_license'] );
+
+		$activated_msg = class_exists( 'PigCache_Cloud_Sync', false )
+			? __( 'License activated. Cloud sync is available when enabled.', 'pigcache' )
+			: __( 'License activated.', 'pigcache' );
+
+		$messages = array(
+			'activated'   => $activated_msg,
+			'deactivated' => __( 'License removed from this site.', 'pigcache' ),
+			'synced'      => __( 'Cloud sync completed.', 'pigcache' ),
+			'refreshed'   => __( 'License status refreshed.', 'pigcache' ),
+		);
+
+		if ( isset( $messages[ $msg_key ] ) ) {
+			echo '<div class="notice notice-success inline"><p>' . esc_html( $messages[ $msg_key ] ) . '</p></div>';
 		}
 	}
 
@@ -370,11 +427,8 @@ class PigCache_Admin {
 	 * Render the SQL Profiler section on the admin page.
 	 */
 	public static function render_sql_profiler_section() {
-		$can_use     = PigCache_License::can_use_profiler();
-		$access      = PigCache_License::profiler_access_label();
-		$learning    = PigCache_Sql_Profiler::is_learning();
-		$has_profile = PigCache_Sql_Profiler::has_profile();
-		$remaining   = PigCache_Sql_Profiler::learning_remaining();
+		$access  = PigCache_License::profiler_access_label();
+		$can_use = PigCache_License::can_use_profiler();
 
 		echo '<h2>' . esc_html__( 'SQL Query Profiler', 'pigcache' );
 		if ( 'pro' === $access ) {
@@ -386,13 +440,28 @@ class PigCache_Admin {
 		}
 		echo '</h2>';
 
+		if ( ! class_exists( 'PigCache_Sql_Profiler', false ) ) {
+			echo '<div class="notice notice-info inline"><p>';
+			if ( 'community' === $access ) {
+				echo esc_html__( 'Smarter per-table SQL invalidation and the query profiler are only in the full PigCache Pro plugin (the paid ZIP). This WordPress.org build still caches SQL, but uses one global invalidation epoch.', 'pigcache' );
+			} else {
+				echo esc_html__( 'The SQL Profiler module is missing from this install. Reinstall the complete PigCache Pro package.', 'pigcache' );
+			}
+			echo '</p></div>';
+			return;
+		}
+
+		$learning    = PigCache_Sql_Profiler::is_learning();
+		$has_profile = PigCache_Sql_Profiler::has_profile();
+		$remaining   = PigCache_Sql_Profiler::learning_remaining();
+
 		if ( ! $can_use && ! $has_profile ) {
 			echo '<div class="notice notice-warning inline"><p>';
 			echo '<strong>' . esc_html__( 'Premium feature', 'pigcache' ) . '</strong> — ';
 			if ( 'expired' === $access ) {
 				echo esc_html__( 'Trial expired. Activate a Pro license to use the SQL Profiler.', 'pigcache' );
 			} else {
-				echo esc_html__( 'Requires Pro license. A 14-day trial starts on first activation.', 'pigcache' );
+				echo esc_html__( 'Activate a trial or Pro license key from your PigCache account to unlock the SQL Profiler.', 'pigcache' );
 			}
 			echo '</p></div>';
 		}
@@ -523,8 +592,14 @@ class PigCache_Admin {
 		echo '<h3>' . esc_html__( 'HTML Cache', 'pigcache' ) . '</h3>';
 		echo '<table class="widefat striped"><tbody>';
 
+		$tag_inv_active = class_exists( 'PigCache_License', false ) && PigCache_License::can_use_tag_invalidation();
+
 		echo '<tr><th>' . esc_html__( 'Invalidation', 'pigcache' ) . '</th>';
-		echo '<td><strong>' . esc_html__( 'Tag-based (selective)', 'pigcache' ) . '</strong></td></tr>';
+		echo '<td><strong>' . esc_html(
+			$tag_inv_active
+				? __( 'Tag-based (selective)', 'pigcache' )
+				: __( 'Global flush (upgrade to Pro for tag-based)', 'pigcache' )
+		) . '</strong></td></tr>';
 
 		$tag_table = $wpdb->prefix . 'pigcache_tags';
 		$table_exists = $wpdb->get_var( $wpdb->prepare( 'SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = %s AND table_name = %s', DB_NAME, $tag_table ) );
@@ -645,7 +720,11 @@ class PigCache_Admin {
 		echo '<table class="widefat striped"><tbody>';
 
 		echo '<tr><th>' . esc_html__( 'Invalidation', 'pigcache' ) . '</th>';
-		echo '<td>' . esc_html__( 'Tag-based (when tags provided) + TTL', 'pigcache' ) . '</td></tr>';
+		echo '<td>' . esc_html(
+			$tag_inv_active
+				? __( 'Tag-based (when tags provided) + TTL', 'pigcache' )
+				: __( 'Global flush + TTL (tag-based requires Pro)', 'pigcache' )
+		) . '</td></tr>';
 
 		if ( $table_exists ) {
 			$frag_keys = (int) $wpdb->get_var( "SELECT COUNT(DISTINCT cache_key) FROM {$tag_table} WHERE grp = 'pigcache_fragments'" );
@@ -745,6 +824,7 @@ class PigCache_Admin {
 			'pigcache',
 			array( __CLASS__, 'render_page' )
 		);
+		// Metrics are now embedded in the main page — no separate submenu.
 	}
 
 	/**
@@ -823,10 +903,6 @@ class PigCache_Admin {
 		}
 
 		echo '<div class="wrap"><h1>PigCache</h1>';
-
-		if ( $oc ) {
-			echo '<p><a href="' . esc_url( admin_url( 'options-general.php?page=pigcache-metrics' ) ) . '">' . esc_html__( 'View metrics', 'pigcache' ) . ' &rarr;</a></p>';
-		}
 
 		self::render_flash_notices();
 
@@ -950,6 +1026,10 @@ class PigCache_Admin {
 		if ( $wp_config_line ) {
 			echo '<h2>' . esc_html__( 'wp-config.php', 'pigcache' ) . '</h2>';
 			echo '<pre class="pigcache-code-block">' . esc_html( $wp_config_line ) . '</pre>';
+		}
+
+		if ( $oc && class_exists( 'PigCache_Metrics', false ) ) {
+			PigCache_Metrics::render_sections();
 		}
 
 		echo '</div>';

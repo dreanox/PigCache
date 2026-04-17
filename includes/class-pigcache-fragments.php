@@ -14,7 +14,7 @@ class PigCache_Fragments {
 	 * @param callable $callback
 	 * @param int      $ttl
 	 * @param string   $group
-	 * @param string[] $tags  Optional tags for selective invalidation.
+	 * @param string[] $tags  Optional tags for selective invalidation (Pro only).
 	 * @return mixed
 	 */
 	public static function remember( $key, $callback, $ttl = 60, $group = 'pigcache_fragments', $tags = array() ) {
@@ -33,10 +33,19 @@ class PigCache_Fragments {
 
 		wp_cache_set( $safe_key, $data, $group, (int) $ttl );
 
-		if ( ! empty( $tags ) && class_exists( 'PigCache_Tag_Index', false ) ) {
+		$tag_inv = class_exists( 'PigCache_License', false ) && PigCache_License::can_use_tag_invalidation();
+
+		if ( $tag_inv && ! empty( $tags ) && class_exists( 'PigCache_Tag_Index', false ) ) {
 			PigCache_Tag_Index::store_tags( $safe_key, $group, $tags );
 		}
 
 		return $data;
+	}
+
+	/**
+	 * Flush the entire fragment cache group (global invalidation for Free tier).
+	 */
+	public static function flush_all() {
+		wp_cache_flush_group( 'pigcache_fragments' );
 	}
 }

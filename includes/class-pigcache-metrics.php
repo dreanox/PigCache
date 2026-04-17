@@ -14,65 +14,40 @@ class PigCache_Metrics {
 	const TRANSIENT     = 'pigcache_metrics_key_index';
 	const TRANSIENT_TTL = 120;
 
+	/**
+	 * No separate menu — sections are rendered inline on the main PigCache settings page.
+	 */
 	public static function init() {
-		add_action( 'admin_menu', array( __CLASS__, 'register_menu' ), 20 );
-	}
-
-	public static function register_menu() {
-		add_submenu_page(
-			'options-general.php',
-			__( 'PigCache metrics', 'pigcache' ),
-			__( 'PigCache metrics', 'pigcache' ),
-			'manage_options',
-			'pigcache-metrics',
-			array( __CLASS__, 'render_page' )
-		);
 	}
 
 	/**
+	 * Render all metrics sections (object cache stats, Redis INFO, key browser).
+	 * Called from PigCache_Admin::render_page() when Redis is connected.
+	 *
 	 * @return void
 	 */
-	public static function render_page() {
-		if ( ! current_user_can( 'manage_options' ) ) {
-			return;
-		}
-
-		echo '<div class="wrap"><h1>' . esc_html__( 'PigCache metrics', 'pigcache' ) . '</h1>';
-
-		echo '<p><a href="' . esc_url( admin_url( 'options-general.php?page=pigcache' ) ) . '">' . esc_html__( '← PigCache settings', 'pigcache' ) . '</a></p>';
-
-		self::render_monitoring_guide();
-
+	public static function render_sections() {
 		if ( ! wp_using_ext_object_cache() ) {
-			echo '<div class="notice notice-warning"><p>' . esc_html__( 'External object cache is not active. Enable the object cache drop-in on the PigCache settings page.', 'pigcache' ) . '</p></div></div>';
 			return;
 		}
 
 		global $wp_object_cache;
 
 		if ( ! is_object( $wp_object_cache ) || ! $wp_object_cache->redis_status() ) {
-			echo '<div class="notice notice-warning"><p>' . esc_html__( 'Redis is not connected. Check your Redis server and wp-config constants.', 'pigcache' ) . '</p></div></div>';
 			return;
 		}
 
 		self::maybe_bust_key_cache();
 
 		$redis = $wp_object_cache->redis_instance();
+
 		if ( self::is_cluster( $redis ) ) {
-			echo '<div class="notice notice-info"><p>' . esc_html__( 'Redis Cluster mode: server INFO and key listing are limited; only request-level object cache stats are shown.', 'pigcache' ) . '</p></div>';
+			echo '<div class="notice notice-info inline"><p>' . esc_html__( 'Redis Cluster mode: server INFO and key listing are limited; only request-level object cache stats are shown.', 'pigcache' ) . '</p></div>';
 		}
 
 		self::render_object_cache_summary( $wp_object_cache );
 		self::render_redis_info_section( $redis );
 		self::render_keys_table( $wp_object_cache, $redis );
-
-		echo '</div>';
-	}
-
-	/**
-	 * @return void
-	 */
-	private static function render_monitoring_guide() {
 	}
 
 	/**
@@ -99,7 +74,7 @@ class PigCache_Metrics {
 	/**
 	 * @param object $wp_object_cache
 	 */
-	private static function render_object_cache_summary( $wp_object_cache ) {
+	public static function render_object_cache_summary( $wp_object_cache ) {
 		echo '<h2>' . esc_html__( 'Object cache (this request)', 'pigcache' ) . '</h2>';
 
 		if ( ! method_exists( $wp_object_cache, 'info' ) ) {
@@ -174,7 +149,7 @@ class PigCache_Metrics {
 	/**
 	 * @param mixed $redis
 	 */
-	private static function render_redis_info_section( $redis ) {
+	public static function render_redis_info_section( $redis ) {
 		if ( self::is_cluster( $redis ) ) {
 			return;
 		}
@@ -332,7 +307,7 @@ class PigCache_Metrics {
 	 * @param object $wp_object_cache
 	 * @param mixed  $redis
 	 */
-	private static function render_keys_table( $wp_object_cache, $redis ) {
+	public static function render_keys_table( $wp_object_cache, $redis ) {
 		echo '<h2>' . esc_html__( 'Cached keys', 'pigcache' ) . '</h2>';
 
 		if ( self::is_cluster( $redis ) ) {
@@ -365,7 +340,7 @@ class PigCache_Metrics {
 		$slice  = array_slice( $keys, $offset, self::PER_PAGE );
 
 		$refresh_url = wp_nonce_url(
-			add_query_arg( 'pigcache_refresh_keys', '1', admin_url( 'options-general.php?page=pigcache-metrics' ) ),
+			add_query_arg( 'pigcache_refresh_keys', '1', admin_url( 'options-general.php?page=pigcache' ) ),
 			'pigcache_refresh_keys'
 		);
 
@@ -415,7 +390,7 @@ class PigCache_Metrics {
 			echo '<div class="tablenav" style="margin-top:12px"><div class="tablenav-pages">';
 			echo paginate_links( // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
 				array(
-					'base'      => add_query_arg( 'paged', '%#%', admin_url( 'options-general.php?page=pigcache-metrics' ) ),
+					'base'      => add_query_arg( 'paged', '%#%', admin_url( 'options-general.php?page=pigcache' ) ),
 					'format'    => '',
 					'prev_text' => __( '&laquo;', 'pigcache' ),
 					'next_text' => __( '&raquo;', 'pigcache' ),

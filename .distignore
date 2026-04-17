@@ -1,0 +1,55 @@
+# Files and directories excluded from BOTH the Free and Pro ZIP builds.
+# The build script reads this file with rsync --exclude-from.
+#
+# WordPress.org rejects plugins that contain .git, build ZIPs inside the tree, etc.
+# Always upload ONLY dist/pigcache-free-*.zip (from ./bin/build.sh free), never a zip of the repo root.
+
+# Version control & CI (never ship inside the plugin ZIP)
+.git/
+.github/
+
+# Build output (contains pigcache-free-*.zip / pigcache-pro-*.zip — must not nest inside uploads)
+dist/
+*.zip
+
+# Dev tooling
+bin/
+.distignore
+.gitignore
+.gitattributes
+.editorconfig
+phpcs.xml
+phpunit.xml
+phpunit.xml.dist
+Makefile
+
+# Composer lockfile (optional); composer.json is shipped so Plugin Check sees it next to vendor/
+composer.lock
+
+# Tests
+tests/
+
+# Internal docs (not for end users)
+CHANGELOG.md
+CACHE-FLOW.md
+MANUAL.md
+
+# CLI analyzer (developer tool, not for distribution)
+cli/
+
+# README source files (build script injects the correct one as README.md)
+README.md
+README-free.md
+README-pro.md
+
+# Node / front-end tooling (if added later)
+node_modules/
+package.json
+package-lock.json
+webpack.config.js
+
+# IDE / OS
+.idea/
+.vscode/
+*.DS_Store
+Thumbs.db

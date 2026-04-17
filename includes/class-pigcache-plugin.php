@@ -29,7 +29,9 @@ class PigCache_Plugin {
 		load_plugin_textdomain( 'pigcache', false, dirname( plugin_basename( PIGCACHE_FILE ) ) . '/languages' );
 
 		PigCache_Sql_Cache::init();
-		PigCache_Sql_Profiler::init();
+		if ( class_exists( 'PigCache_Sql_Profiler', false ) ) {
+			PigCache_Sql_Profiler::init();
+		}
 		PigCache_Html_Cache::init();
 		PigCache_Invalidation::init();
 

@@ -6,5 +6,8 @@
 .DS_Store
 Thumbs.db
 
+# Local ZIPs from bin/build.sh — never commit; WordPress.org uploads must not include these inside the plugin tree.
+dist/
+
 # Development only – vendor/ IS committed for distribution as a WordPress plugin.
 # If you need to rebuild: composer install --no-dev

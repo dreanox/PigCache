@@ -1,13 +1,13 @@
 <?php
 /**
  * Plugin Name:       PigCache
- * Description:       Standalone Redis object cache (drop-in): defaults to 127.0.0.1:6379 until you set WP_REDIS_*; PhpRedis when available, else Predis. Plus optional SQL cache, HTML cache, fragments.
+ * Description:       Redis object-cache drop-in with optional SQL, HTML page, and fragment caching.
  * Version:           1.0.0
  * Requires at least: 5.8
  * Requires PHP:      7.4
  * Author:            PigCache
- * License:           GPL-3.0-or-later
- * License URI:       https://www.gnu.org/licenses/gpl-3.0.html
+ * License:           GPLv2 or later
+ * License URI:       https://www.gnu.org/licenses/gpl-2.0.html
  * Text Domain:       pigcache
  *
  * @package PigCache
@@ -32,14 +32,10 @@ if ( ! defined( 'WP_REDIS_VERSION' ) && ! empty( $oc_meta['Version'] ) ) {
 	define( 'WP_REDIS_VERSION', $oc_meta['Version'] );
 }
 
+// Always loaded (Free + Pro).
 require_once PIGCACHE_DIR . 'includes/class-pigcache-config.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-license.php';
-require_once PIGCACHE_DIR . 'includes/class-pigcache-environment.php';
-require_once PIGCACHE_DIR . 'includes/class-pigcache-cloud-client.php';
-require_once PIGCACHE_DIR . 'includes/class-pigcache-cloud-sync.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-sql-cache.php';
-require_once PIGCACHE_DIR . 'includes/class-pigcache-sql-profile-store.php';
-require_once PIGCACHE_DIR . 'includes/class-pigcache-sql-profiler.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-tag-collector.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-tag-index.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-html-cache.php';
@@ -51,15 +47,34 @@ require_once PIGCACHE_DIR . 'includes/class-pigcache-admin.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-metrics.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-plugin.php';
 
+// Pro-only — present in the Pro build, absent in the Free build.
+foreach ( array(
+	'class-pigcache-environment.php',
+	'class-pigcache-cloud-client.php',
+	'class-pigcache-cloud-sync.php',
+	'class-pigcache-sql-profile-store.php',
+	'class-pigcache-sql-profiler.php',
+	'class-pigcache-updates.php',
+) as $_pigcache_pro_file ) {
+	$_pigcache_pro_path = PIGCACHE_DIR . 'includes/' . $_pigcache_pro_file;
+	if ( is_readable( $_pigcache_pro_path ) ) {
+		require_once $_pigcache_pro_path;
+	}
+}
+unset( $_pigcache_pro_file, $_pigcache_pro_path );
+
 register_activation_hook(
 	PIGCACHE_FILE,
 	static function () {
 		PigCache_Config::on_activate();
 		PigCache_Tag_Index::create_table();
-		PigCache_Sql_Profile_Store::create_table();
 		PigCache_License::maybe_start_trial();
 
-		if ( PigCache_Cloud_Sync::is_enabled() ) {
+		if ( class_exists( 'PigCache_Sql_Profile_Store', false ) ) {
+			PigCache_Sql_Profile_Store::create_table();
+		}
+
+		if ( class_exists( 'PigCache_Cloud_Sync', false ) && PigCache_Cloud_Sync::is_enabled() ) {
 			PigCache_Cloud_Sync::schedule();
 		}
 	}
@@ -72,12 +87,19 @@ register_deactivation_hook(
 			PigCache_Dropin_Object_Cache::remove();
 		}
 
-		PigCache_Cloud_Sync::unschedule();
+		if ( class_exists( 'PigCache_Cloud_Sync', false ) ) {
+			PigCache_Cloud_Sync::unschedule();
+		}
 	}
 );
 
 add_action( 'plugins_loaded', array( 'PigCache_Config', 'apply_extra_non_persistent_groups' ), 1 );
-add_action( 'plugins_loaded', array( 'PigCache_Cloud_Sync', 'init' ), 10 );
+if ( class_exists( 'PigCache_Updates', false ) ) {
+	add_action( 'plugins_loaded', array( 'PigCache_Updates', 'init' ), 5 );
+}
+if ( class_exists( 'PigCache_Cloud_Sync', false ) ) {
+	add_action( 'plugins_loaded', array( 'PigCache_Cloud_Sync', 'init' ), 10 );
+}
 add_action( 'plugins_loaded', array( 'PigCache_Plugin', 'instance' ), 20 );
 
 /**
@@ -106,10 +128,14 @@ function pigcache_tag( $tag ) {
 }
 
 /**
- * Full path to the compiled SQL profiler profile.
+ * Full path to the compiled SQL profiler profile (Pro only).
  *
- * @return string
+ * @return string Empty string in the Free build.
  */
 function pigcache_sql_profile_path() {
+	if ( ! class_exists( 'PigCache_Sql_Profiler', false ) ) {
+		return '';
+	}
+
 	return PigCache_Sql_Profiler::profile_path();
 }

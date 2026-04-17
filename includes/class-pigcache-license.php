@@ -18,7 +18,19 @@ class PigCache_License {
 	const OPTION_TRIAL   = 'pigcache_trial_started';
 	const TRANSIENT      = 'pigcache_license_status';
 	const CACHE_TTL      = DAY_IN_SECONDS;
-	const TRIAL_DAYS     = 14;
+
+	/**
+	 * Whether this install includes the Pro-only modules (cloud client, profiler, etc.).
+	 *
+	 * The WordPress.org "Free" ZIP omits these files; trial and license API apply only
+	 * to the full Pro package — activating a key does not download code, you must install
+	 * the Pro ZIP from your account.
+	 *
+	 * @return bool
+	 */
+	public static function has_pro_distribution() {
+		return class_exists( 'PigCache_Cloud_Client', false );
+	}
 
 	/**
 	 * Get the stored API key (wp-config constant takes precedence).
@@ -71,6 +83,13 @@ class PigCache_License {
 	 * @return array|WP_Error Decoded response body or error.
 	 */
 	public static function activate( $api_key = '' ) {
+		if ( ! self::has_pro_distribution() ) {
+			return new WP_Error(
+				'pigcache_community_build',
+				__( 'License activation requires the full PigCache Pro plugin package. The WordPress.org build does not include license or cloud code — install the Pro ZIP from your purchase; your site does not download Pro features automatically.', 'pigcache' )
+			);
+		}
+
 		if ( ! $api_key ) {
 			$api_key = self::get_key();
 		}
@@ -96,7 +115,22 @@ class PigCache_License {
 				self::set_site_id( $response['site_id'] );
 			}
 
-			self::cache_status( $response );
+			$status_payload = array_merge(
+				array(
+					'valid'             => true,
+					'plan'              => isset( $response['plan'] ) ? (string) $response['plan'] : 'pro',
+					'updates_allowed'   => array_key_exists( 'updates_allowed', $response ) ? (bool) $response['updates_allowed'] : true,
+					'trial_ends_at'     => isset( $response['trial_ends_at'] ) ? (string) $response['trial_ends_at'] : '',
+					'trial_expired'     => false,
+					'sites_used'        => isset( $response['sites_used'] ) ? (int) $response['sites_used'] : 0,
+					'sites_max'         => isset( $response['sites_max'] ) ? (int) $response['sites_max'] : 1,
+					'expires_at'        => isset( $response['expires_at'] ) ? (string) $response['expires_at'] : '',
+					'features'          => isset( $response['features'] ) && is_array( $response['features'] ) ? $response['features'] : array(),
+				),
+				$response
+			);
+
+			self::cache_status( $status_payload );
 		}
 
 		return $response;
@@ -110,7 +144,7 @@ class PigCache_License {
 	public static function deactivate() {
 		$site_id = self::get_site_id();
 
-		if ( $site_id ) {
+		if ( $site_id && self::has_pro_distribution() ) {
 			$response = PigCache_Cloud_Client::post( 'license/deactivate', array(
 				'site_id' => $site_id,
 			) );
@@ -164,18 +198,66 @@ class PigCache_License {
 		}
 
 		if ( ! self::has_key() ) {
-			return array( 'valid' => false, 'plan' => 'free' );
+			return array(
+				'valid'             => false,
+				'plan'              => 'free',
+				'updates_allowed'   => true,
+				'trial_expired'     => false,
+				'trial_ends_at'     => '',
+				'sites_used'        => 0,
+				'sites_max'         => 0,
+				'features'          => array(),
+			);
+		}
+
+		if ( ! self::has_pro_distribution() ) {
+			return array(
+				'valid'             => false,
+				'plan'              => 'free',
+				'updates_allowed'   => true,
+				'trial_expired'     => false,
+				'error'             => __( 'License status checks are not available in the WordPress.org community build.', 'pigcache' ),
+			);
 		}
 
 		$response = PigCache_Cloud_Client::get( 'license/status' );
 
 		if ( is_wp_error( $response ) ) {
-			return array( 'valid' => false, 'plan' => 'free', 'error' => $response->get_error_message() );
+			return array(
+				'valid'             => false,
+				'plan'              => 'free',
+				'updates_allowed'   => true,
+				'trial_expired'     => false,
+				'error'             => $response->get_error_message(),
+			);
+		}
+
+		if ( ! isset( $response['updates_allowed'] ) ) {
+			$response['updates_allowed'] = ! empty( $response['valid'] );
 		}
 
 		self::cache_status( $response );
 
 		return $response;
+	}
+
+	/**
+	 * Whether this install should receive PigCache Pro package updates (from your update server / transient).
+	 *
+	 * @return bool
+	 */
+	public static function updates_allowed() {
+		if ( ! self::has_pro_distribution() || ! self::has_key() ) {
+			return true;
+		}
+
+		$status = self::get_status();
+
+		if ( array_key_exists( 'updates_allowed', $status ) ) {
+			return (bool) $status['updates_allowed'];
+		}
+
+		return ! empty( $status['valid'] );
 	}
 
 	/**
@@ -195,75 +277,70 @@ class PigCache_License {
 	}
 
 	// ------------------------------------------------------------------
-	// Trial management — SQL Profiler is a premium feature
+	// Trial — server-managed (see API license status / trial_ends_at).
 	// ------------------------------------------------------------------
 
 	/**
-	 * Start the trial period (called on first plugin activation).
+	 * Legacy hook: trial window is defined by the PigCache API, not local options.
 	 */
 	public static function maybe_start_trial() {
-		if ( false === get_option( self::OPTION_TRIAL ) ) {
-			update_option( self::OPTION_TRIAL, time(), false );
-		}
 	}
 
 	/**
-	 * Unix timestamp when the trial started, or 0 if never.
-	 *
-	 * @return int
+	 * @return int Always 0; trial start is tracked on the license server.
 	 */
 	public static function trial_started() {
-		return (int) get_option( self::OPTION_TRIAL, 0 );
+		return 0;
 	}
 
 	/**
-	 * Whether the trial is currently active (not expired, not Pro).
+	 * Active API trial (plan "trial" with valid entitlement).
 	 *
 	 * @return bool
 	 */
 	public static function is_trial() {
-		if ( self::is_pro() ) {
-			return false;
-		}
-
-		$start = self::trial_started();
-		if ( $start < 1 ) {
-			return false;
-		}
-
-		return ( time() - $start ) < ( self::TRIAL_DAYS * DAY_IN_SECONDS );
+		return self::has_pro_distribution()
+			&& self::has_key()
+			&& self::is_pro()
+			&& 'trial' === self::get_plan();
 	}
 
 	/**
-	 * Whether the trial has expired (started but past the window).
+	 * Trial window ended according to the last license/status response.
 	 *
 	 * @return bool
 	 */
 	public static function is_trial_expired() {
-		if ( self::is_pro() ) {
+		if ( ! self::has_pro_distribution() || ! self::has_key() ) {
 			return false;
 		}
 
-		$start = self::trial_started();
-		if ( $start < 1 ) {
-			return false;
-		}
+		$status = self::get_status();
 
-		return ( time() - $start ) >= ( self::TRIAL_DAYS * DAY_IN_SECONDS );
+		return ! empty( $status['trial_expired'] );
 	}
 
 	/**
-	 * Days remaining in the trial, or 0.
+	 * Days remaining on an API trial (from trial_ends_at), or 0.
 	 *
 	 * @return int
 	 */
 	public static function trial_days_remaining() {
-		$start = self::trial_started();
-		if ( $start < 1 ) {
+		if ( ! self::has_key() ) {
 			return 0;
 		}
 
-		$end  = $start + ( self::TRIAL_DAYS * DAY_IN_SECONDS );
+		$status = self::get_status();
+
+		if ( empty( $status['trial_ends_at'] ) ) {
+			return 0;
+		}
+
+		$end = strtotime( (string) $status['trial_ends_at'] );
+		if ( ! $end ) {
+			return 0;
+		}
+
 		$left = $end - time();
 
 		return $left > 0 ? (int) ceil( $left / DAY_IN_SECONDS ) : 0;
@@ -281,25 +358,47 @@ class PigCache_License {
 	 * @return bool
 	 */
 	public static function can_use_profiler() {
-		if ( self::is_pro() ) {
-			return true;
+		if ( ! self::has_pro_distribution() ) {
+			return false;
 		}
 
-		return self::is_trial();
+		return self::is_pro();
+	}
+
+	/**
+	 * Whether tag-based selective invalidation is available.
+	 *
+	 * Free tier uses a global flush on any content change. Pro and trial
+	 * get per-tag purging so only the affected pages are evicted.
+	 *
+	 * @return bool
+	 */
+	public static function can_use_tag_invalidation() {
+		if ( ! self::has_pro_distribution() ) {
+			return false;
+		}
+
+		return self::is_pro();
 	}
 
 	/**
 	 * Human-readable label for the current profiler access level.
 	 *
-	 * @return string "pro", "trial", or "expired"
+	 * @return string "community", "pro", "trial", or "expired"
 	 */
 	public static function profiler_access_label() {
-		if ( self::is_pro() ) {
-			return 'pro';
+		if ( ! self::has_pro_distribution() ) {
+			return 'community';
 		}
 
-		if ( self::is_trial() ) {
-			return 'trial';
+		$status = self::get_status();
+
+		if ( ! empty( $status['trial_expired'] ) ) {
+			return 'expired';
+		}
+
+		if ( self::is_pro() ) {
+			return 'trial' === self::get_plan() ? 'trial' : 'pro';
 		}
 
 		return 'expired';

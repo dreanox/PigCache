@@ -1698,23 +1698,25 @@ class WP_Object_Cache {
         $salt = $escape ? $this->glob_quote( $salt ) : $salt;
 
         return function () use ( $salt ) {
-            // phpcs:disable Squiz.PHP.Heredoc.NotAllowed
-            $script = <<<LUA
-                local cur = 0
-                local i = 0
-                local tmp
-                repeat
-                    tmp = redis.call('SCAN', cur, 'MATCH', '{$salt}*')
-                    cur = tonumber(tmp[1])
-                    if tmp[2] then
-                        for _, v in pairs(tmp[2]) do
-                            redis.call('del', v)
-                            i = i + 1
-                        end
-                    end
-                until 0 == cur
-                return i
-LUA;
+            $script = implode(
+                "\n",
+                array(
+                    'local cur = 0',
+                    'local i = 0',
+                    'local tmp',
+                    'repeat',
+                    "    tmp = redis.call('SCAN', cur, 'MATCH', '{$salt}*')",
+                    '    cur = tonumber(tmp[1])',
+                    '    if tmp[2] then',
+                    '        for _, v in pairs(tmp[2]) do',
+                    "            redis.call('del', v)",
+                    '            i = i + 1',
+                    '        end',
+                    '    end',
+                    'until 0 == cur',
+                    'return i',
+                )
+            );
 
             if ( isset($this->redis_version) && version_compare( $this->redis_version, '5', '<' ) && version_compare( $this->redis_version, '3.2', '>=' ) ) {
                 $script = 'redis.replicate_commands()' . "\n" . $script;
@@ -1745,29 +1747,33 @@ LUA;
                 $this->unflushable_groups
             );
 
-            $script = <<<LUA
-                local cur = 0
-                local i = 0
-                local d, tmp
-                repeat
-                    tmp = redis.call('SCAN', cur, 'MATCH', '{$salt}*')
-                    cur = tonumber(tmp[1])
-                    if tmp[2] then
-                        for _, v in pairs(tmp[2]) do
-                            d = true
-                            for _, s in pairs(KEYS) do
-                                d = d and not v:find(s, {$salt_length})
-                                if not d then break end
-                            end
-                            if d then
-                                redis.call('del', v)
-                                i = i + 1
-                            end
-                        end
-                    end
-                until 0 == cur
-                return i
-LUA;
+            $salt_len = (int) $salt_length;
+            $script    = implode(
+                "\n",
+                array(
+                    'local cur = 0',
+                    'local i = 0',
+                    'local d, tmp',
+                    'repeat',
+                    "    tmp = redis.call('SCAN', cur, 'MATCH', '{$salt}*')",
+                    '    cur = tonumber(tmp[1])',
+                    '    if tmp[2] then',
+                    '        for _, v in pairs(tmp[2]) do',
+                    '            d = true',
+                    '            for _, s in pairs(KEYS) do',
+                    "                d = d and not v:find(s, {$salt_len})",
+                    '                if not d then break end',
+                    '            end',
+                    '            if d then',
+                    "                redis.call('del', v)",
+                    '                i = i + 1',
+                    '            end',
+                    '        end',
+                    '    end',
+                    'until 0 == cur',
+                    'return i',
+                )
+            );
             if ( isset($this->redis_version) && version_compare( $this->redis_version, '5', '<' ) && version_compare( $this->redis_version, '3.2', '>=' ) ) {
                 $script = 'redis.replicate_commands()' . "\n" . $script;
             }
