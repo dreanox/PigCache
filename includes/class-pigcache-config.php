@@ -243,6 +243,10 @@ class PigCache_Config {
 			}
 		}
 
+		if ( defined( 'WP_REDIS_DATABASE' ) && (int) WP_REDIS_DATABASE > 0 ) {
+			$redis->select( (int) WP_REDIS_DATABASE );
+		}
+
 		return $redis;
 	}
 

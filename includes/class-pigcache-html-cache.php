@@ -48,7 +48,7 @@ class PigCache_Html_Cache {
 			exit;
 		}
 
-		$lock_key = 'pigcache_lock_' . md5( self::request_uri() );
+		$lock_key = 'pigcache_lock_' . md5( self::host_key() . self::request_uri() );
 		$acquired = wp_cache_add( $lock_key, 1, self::GROUP_META, 30 );
 
 		if ( ! $acquired ) {
@@ -134,19 +134,35 @@ class PigCache_Html_Cache {
 	}
 
 	/**
-	 * URI-based cache key.
+	 * Host + URI cache key. Includes the hostname so multiple sites sharing
+	 * the same Redis instance (even on the same logical DB) never collide.
 	 *
 	 * @return string
 	 */
 	public static function cache_key() {
-		return 'doc_' . md5( self::request_uri() );
+		return 'doc_' . md5( self::host_key() . self::request_uri() );
+	}
+
+	/**
+	 * @return string Hostname used to namespace cache keys across sites.
+	 */
+	private static function host_key() {
+		if ( isset( $_SERVER['HTTP_HOST'] ) && $_SERVER['HTTP_HOST'] !== '' ) {
+			return strtolower( (string) wp_unslash( $_SERVER['HTTP_HOST'] ) );
+		}
+
+		if ( function_exists( 'site_url' ) ) {
+			return (string) wp_parse_url( site_url(), PHP_URL_HOST );
+		}
+
+		return '';
 	}
 
 	/**
 	 * Release the stampede lock for the current URI.
 	 */
 	private static function release_lock() {
-		wp_cache_delete( 'pigcache_lock_' . md5( self::request_uri() ), self::GROUP_META );
+		wp_cache_delete( 'pigcache_lock_' . md5( self::host_key() . self::request_uri() ), self::GROUP_META );
 	}
 
 	/**

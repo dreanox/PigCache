@@ -493,10 +493,64 @@ El dashboard muestra de un vistazo:
 |-----------|---------|-------------|
 | `WP_REDIS_HOST` | `127.0.0.1` | Host Redis |
 | `WP_REDIS_PORT` | `6379` | Puerto |
-| `WP_REDIS_DATABASE` | `0` | DB lógica |
+| `WP_REDIS_DATABASE` | `0` | DB lógica (ver nota abajo) |
 | `WP_REDIS_PASSWORD` | _(vacío)_ | Password |
-| `WP_REDIS_PREFIX` | _(auto)_ | Prefix para keys |
+| `WP_REDIS_PREFIX` | _(auto: `md5(DB_NAME\|table_prefix)`)_ | Prefijo para keys Redis. Se auto-genera si no se define. |
+| `WP_REDIS_SELECTIVE_FLUSH` | _(auto: `true` si hay prefix)_ | Solo borrar keys con el prefijo del sitio al hacer flush. Se activa automáticamente cuando hay un prefix. |
 | `WP_REDIS_CLIENT` | _(auto)_ | Forzar: `phpredis`, `predis`, `relay` |
+
+> **Auto-prefix:** Si no defines `WP_REDIS_PREFIX`, `WP_CACHE_KEY_SALT`,
+> ni estás en Cloudways, PigCache genera un hash de 8 caracteres a partir
+> de `DB_NAME` y `$table_prefix`. Esto garantiza que dos sitios con bases
+> de datos diferentes nunca colisionen en Redis, incluso si comparten la
+> misma instancia y la misma DB lógica.
+
+> **Nota sobre `WP_REDIS_DATABASE`:** Muchos hostings compartidos usan
+> proxies Redis (Twemproxy, Redis Cluster, servicios single-DB) que
+> **ignoran el comando `SELECT`** silenciosamente. No confíes solo en
+> esta constante para aislar sitios. El auto-prefix es la forma segura.
+
+### Hosting compartido — varios sitios, un solo Redis
+
+En hosting compartido donde varias instalaciones WordPress comparten el
+mismo servidor Redis (`public_html/sitio1/`, `public_html/sitio2/`, etc.):
+
+**Sin configurar nada** (recomendado si las bases de datos son distintas):
+
+PigCache genera automáticamente un prefijo único por sitio. Cada sitio
+tendrá sus propias claves Redis sin colisión. Al hacer flush en un sitio,
+solo se borran las claves de ese sitio.
+
+**Con configuración manual** (si quieres prefijos legibles):
+
+```php
+// wp-config.php — Sitio 1 (tienda.ejemplo.com)
+define( 'WP_REDIS_HOST', '127.0.0.1' );
+define( 'WP_REDIS_PREFIX', 'tienda:' );
+
+// wp-config.php — Sitio 2 (blog.ejemplo.com)
+define( 'WP_REDIS_HOST', '127.0.0.1' );
+define( 'WP_REDIS_PREFIX', 'blog:' );
+```
+
+**Con DB lógicas separadas** (se puede combinar con prefix):
+
+```php
+// wp-config.php — Sitio 1 (usa DB 0 por defecto)
+
+// wp-config.php — Sitio 2
+define( 'WP_REDIS_DATABASE', 7 );
+```
+
+**Qué pasa con el flush:**
+
+| Escenario | Qué borra el flush |
+|-----------|-------------------|
+| Con prefix (auto o manual) | Solo keys del sitio actual (selective flush) |
+| Sin prefix + sin selective flush | `FLUSHDB` — borra **todas** las keys del DB lógica actual |
+
+Por eso PigCache activa `WP_REDIS_SELECTIVE_FLUSH` automáticamente
+cuando hay un prefix activo.
 
 ### Invalidación
 
@@ -527,12 +581,11 @@ El dashboard muestra de un vistazo:
 | `PIGCACHE_CLOUD_API_URL` | `https://api.pigcache.com/v1` | URL del backend |
 | `PIGCACHE_CLOUD_SYNC` | `true` (cuando es pro) | Habilitar/deshabilitar sync |
 
-### Ejemplo wp-config.php
+### Ejemplo wp-config.php — Sitio único
 
 ```php
-// Redis
+// Redis (PigCache genera auto-prefix, no necesitas WP_REDIS_PREFIX)
 define( 'WP_REDIS_HOST', '127.0.0.1' );
-define( 'WP_REDIS_DATABASE', 5 );
 
 // Invalidación
 define( 'PIGCACHE_INVALIDATE_THROTTLE', 3 );
@@ -544,6 +597,22 @@ define( 'PIGCACHE_SQL_PROFILE_AUTO_RELEARN', true );
 
 // PigCache Pro
 define( 'PIGCACHE_LICENSE_KEY', 'pc_live_abc123...' );
+```
+
+### Ejemplo wp-config.php — Hosting compartido (varios sitios)
+
+```php
+// Sitio A (public_html/tienda/) — wp-config.php
+define( 'WP_REDIS_HOST', '127.0.0.1' );
+// Sin WP_REDIS_PREFIX ni WP_REDIS_DATABASE: PigCache aísla
+// automáticamente usando DB_NAME como semilla del prefix.
+
+// Sitio B (public_html/blog/) — wp-config.php
+define( 'WP_REDIS_HOST', '127.0.0.1' );
+// Mismo Redis, distinta DB MySQL = auto-prefix distinto = aislado.
+
+// Alternativa: prefixes explícitos para mayor claridad en redis-cli
+define( 'WP_REDIS_PREFIX', 'blog:' );
 ```
 
 ---
@@ -649,6 +718,18 @@ Comandos planificados para futuras versiones:
    ```
 2. Si no hay filas, la página no fue taqueada durante el render.
 3. Agrega `pigcache_tag('post:123')` manualmente en tu template.
+
+### Un sitio muestra el contenido de otro (hosting compartido)
+
+1. Verifica que ambos sitios tengan **bases de datos diferentes** (`DB_NAME`
+   distinto en cada wp-config.php). El auto-prefix se calcula a partir de
+   `DB_NAME`, así que DBs diferentes = prefixes diferentes = aislamiento.
+2. Si ambos sitios usan la misma DB MySQL (con distinto `$table_prefix`),
+   el auto-prefix también los diferencia.
+3. Si aun así hay contaminación, define `WP_REDIS_PREFIX` explícitamente
+   en cada sitio con un valor único.
+4. Después de cualquier cambio de prefix, haz flush de caché en **todos**
+   los sitios (o `redis-cli FLUSHALL` una sola vez).
 
 ### Redis no conecta
 

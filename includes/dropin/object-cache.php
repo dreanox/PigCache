@@ -262,6 +262,20 @@ function wp_cache_init() {
         define( 'WP_REDIS_PREFIX', getenv( 'HTTP_X_APP_USER' ) );
     }
 
+    // Auto-generate a prefix from DB_NAME + table_prefix so sites sharing
+    // the same Redis instance are isolated without any manual configuration.
+    if ( ! defined( 'WP_REDIS_PREFIX' ) && defined( 'DB_NAME' ) ) {
+        global $table_prefix;
+        $auto_seed = DB_NAME . '|' . ( isset( $table_prefix ) ? $table_prefix : '' );
+        define( 'WP_REDIS_PREFIX', substr( md5( $auto_seed ), 0, 8 ) . ':' );
+    }
+
+    // When a prefix is active, default to selective flush so FLUSHDB never
+    // wipes keys belonging to other sites on the same Redis instance.
+    if ( ! defined( 'WP_REDIS_SELECTIVE_FLUSH' ) && defined( 'WP_REDIS_PREFIX' ) && WP_REDIS_PREFIX ) {
+        define( 'WP_REDIS_SELECTIVE_FLUSH', true );
+    }
+
     if ( ! ( $wp_object_cache instanceof WP_Object_Cache ) ) {
         $fail_gracefully = defined( 'WP_REDIS_GRACEFUL' ) && WP_REDIS_GRACEFUL;
 

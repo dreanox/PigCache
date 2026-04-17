@@ -32,9 +32,41 @@ El *drop-in* de object cache está basado en [Redis Object Cache](https://github
 
 6. **No actives** el plugin **Redis Object Cache** a la vez: PigCache ya cumple ese papel y advertirá si detecta el otro plugin.
 
-### Instalaciones con varios sitios en un mismo Redis
+### Hosting compartido — varios sitios, un solo Redis
 
-Si varias instalaciones comparten una instancia Redis, define en `wp-config.php` constantes como `WP_REDIS_HOST`, `WP_REDIS_PORT`, `WP_REDIS_DATABASE`, `WP_REDIS_PREFIX`, etc. La pantalla de PigCache puede sugerirte `WP_REDIS_DATABASE` según el registro interno del plugin.
+Si varias instalaciones de WordPress comparten la misma instancia de Redis
+(típico en cPanel, Plesk o cualquier hosting compartido), PigCache **aísla
+cada sitio automáticamente** generando un prefijo único a partir de `DB_NAME`
+y `$table_prefix`. No necesitas configurar nada extra para que funcione.
+
+Si prefieres control manual o necesitas un esquema específico, define
+constantes en el `wp-config.php` de **cada sitio**:
+
+```php
+// wp-config.php — Sitio A (ejemplo: tienda)
+define( 'WP_REDIS_PREFIX', 'tienda:' );
+
+// wp-config.php — Sitio B (ejemplo: blog)
+define( 'WP_REDIS_PREFIX', 'blog:' );
+```
+
+Opcionalmente puedes usar bases de datos lógicas distintas de Redis:
+
+```php
+// wp-config.php — Sitio A (DB 0 por defecto, no necesitas definirla)
+
+// wp-config.php — Sitio B
+define( 'WP_REDIS_DATABASE', 7 );
+```
+
+> **Nota:** Muchos hostings compartidos usan proxies Redis que ignoran
+> `SELECT` (el comando para cambiar de DB). El auto-prefix de PigCache
+> garantiza aislamiento incluso en ese caso. Si defines `WP_REDIS_PREFIX`
+> manualmente, asegúrate de que sea único por sitio.
+
+Cuando hay un prefijo activo (automático o manual), PigCache activa
+`WP_REDIS_SELECTIVE_FLUSH` automáticamente para que al vaciar la caché
+de un sitio **no se borren las claves de los demás**.
 
 ### Desactivar el plugin
 
