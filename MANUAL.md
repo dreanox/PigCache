@@ -427,7 +427,7 @@ ni credenciales de conexión.
 ### Activar desde wp-config.php
 
 ```php
-define( 'PIGCACHE_LICENSE_KEY', 'pc_live_abc123...' );
+define( 'PIGCACHE_LICENSE_KEY', 'a1b2c3d4e5f678901234567890abcdef0123456789abcdef0123456789abcd' );
 define( 'PIGCACHE_CLOUD_API_URL', 'https://api.pigcache.com/v1' );  // default
 define( 'PIGCACHE_CLOUD_SYNC', true );  // default cuando es Pro
 ```
@@ -596,7 +596,7 @@ define( 'PIGCACHE_INVALIDATE_ON_TERM', true );
 define( 'PIGCACHE_SQL_PROFILE_AUTO_RELEARN', true );
 
 // PigCache Pro
-define( 'PIGCACHE_LICENSE_KEY', 'pc_live_abc123...' );
+define( 'PIGCACHE_LICENSE_KEY', 'a1b2c3d4e5f678901234567890abcdef0123456789abcdef0123456789abcd' );
 ```
 
 ### Ejemplo wp-config.php — Hosting compartido (varios sitios)

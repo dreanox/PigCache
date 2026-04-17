@@ -373,7 +373,7 @@ class PigCache_Admin {
 		if ( ! $has_key ) {
 			echo '<p>';
 			echo '<label for="pigcache_api_key">' . esc_html__( 'API key:', 'pigcache' ) . ' </label>';
-			echo '<input type="text" name="pigcache_api_key" id="pigcache_api_key" value="" class="regular-text" placeholder="pc_live_..." />';
+			echo '<input type="text" name="pigcache_api_key" id="pigcache_api_key" value="" class="regular-text" placeholder="' . esc_attr__( '64-character hex key from your account', 'pigcache' ) . '" />';
 			echo '</p>';
 			echo '<p><button type="submit" name="pigcache_license_action" value="activate" class="button button-primary">';
 			echo esc_html__( 'Activate License', 'pigcache' ) . '</button></p>';

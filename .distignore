@@ -37,6 +37,9 @@ MANUAL.md
 # CLI analyzer (developer tool, not for distribution)
 cli/
 
+# Concrete cache examples (developer/sales docs, not for distribution)
+cases/
+
 # README source files (build script injects the correct one as README.md)
 README.md
 README-free.md
