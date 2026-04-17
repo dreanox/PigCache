@@ -738,6 +738,50 @@ Comandos planificados para futuras versiones:
 3. Si usas password: `WP_REDIS_PASSWORD`.
 4. Revisa el log de PHP para errores de conexión.
 
+### Flush de Redis desde línea de comandos
+
+Después de actualizar PigCache o cambiar prefixes, necesitas limpiar las
+claves viejas de Redis. Desde SSH:
+
+```bash
+# Borrar TODAS las claves de TODAS las DB lógicas (nuclear, úsalo solo
+# si Redis es exclusivo para tus sitios WordPress):
+redis-cli FLUSHALL
+
+# Si Redis tiene password:
+redis-cli -a tu_password FLUSHALL
+```
+
+Si necesitas borrar solo una DB lógica específica (sin afectar las demás):
+
+```bash
+# Borrar solo DB 0 (la default):
+redis-cli -n 0 FLUSHDB
+
+# Borrar solo DB 7:
+redis-cli -n 7 FLUSHDB
+
+# Con password + DB específica:
+redis-cli -a tu_password -n 7 FLUSHDB
+```
+
+Si solo quieres borrar las claves de **un sitio** (sin tocar los demás)
+y conoces su prefix:
+
+```bash
+# Ver qué prefixes hay:
+redis-cli KEYS "*" | head -20
+
+# Borrar solo las keys de un prefix (ejemplo: a3f8b21c:*):
+redis-cli --scan --pattern "a3f8b21c:*" | xargs redis-cli DEL
+
+# Con password:
+redis-cli -a tu_password --scan --pattern "a3f8b21c:*" | xargs redis-cli -a tu_password DEL
+```
+
+> **Tip:** Después del flush, visita cada sitio una vez para que se
+> regenere la caché. La primera visita será más lenta de lo normal.
+
 ### Demasiada memoria en Redis
 
 1. Revisa TTLs (Ajustes -> PigCache > Cache TTL).
