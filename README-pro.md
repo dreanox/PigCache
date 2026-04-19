@@ -17,7 +17,12 @@ The object cache drop-in is based on [Redis Object Cache](https://github.com/rhu
 2. Activate the plugin in **Plugins**.
 3. Go to **Settings → PigCache** and click **Enable object cache (copy drop-in)**.
 4. Enter your **Pro license key** under **Settings → PigCache → License**.
-5. **Optional — SQL Profiler:** install the `db.php` drop-in and start learning from the SQL Profiler panel.
+5. **Self-hosted backend:** add this to `wp-config.php` pointing to your own API server:
+   ```php
+   define( 'PIGCACHE_CLOUD_API_URL', 'https://bluecache.pigworlds.com/api/v1' );
+   ```
+   Without this constant the plugin points to the default `https://bluecache.pigworlds.com/v1`. This is required for license validation, cloud sync, and automatic plugin updates.
+6. **Optional — SQL Profiler:** install the `db.php` drop-in and start learning from the SQL Profiler panel.
 
 > Do not activate **Redis Object Cache** at the same time — PigCache already serves that role.
 

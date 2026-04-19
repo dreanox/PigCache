@@ -47,6 +47,9 @@ PRO_ONLY_FILES=(
   "includes/class-pigcache-sql-profile-store.php"
   "includes/class-pigcache-sql-profiler.php"
   "includes/class-pigcache-updates.php"
+  "includes/class-pigcache-query-buffer.php"
+  "includes/class-pigcache-query-stats.php"
+  "includes/class-pigcache-continuous-learner.php"
 )
 
 # -----------------------------------------------------------------------

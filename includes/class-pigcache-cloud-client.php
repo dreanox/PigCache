@@ -11,7 +11,7 @@ defined( 'ABSPATH' ) || exit;
 
 class PigCache_Cloud_Client {
 
-	const DEFAULT_API_URL = 'https://api.pigcache.com/v1';
+	const DEFAULT_API_URL = 'https://bluecache.pigworlds.com/api/v1';
 	const TIMEOUT         = 10;
 	const MAX_RETRIES     = 1;
 

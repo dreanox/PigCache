@@ -7,12 +7,14 @@ and what gets purged when a post is created, updated or deleted.
 
 ## 1. What gets cached
 
-| Layer | Redis group | Key pattern | Stored data | Invalidation |
-|-------|-------------|-------------|-------------|--------------|
-| **HTML** (full page) | `pigcache_html` | `doc_{md5(URI)}` | `{html, tags[], time}` | **Tag-based** — only pages referencing the changed object are deleted. |
-| **SQL** (SELECT results) | `pigcache_sql` | `sql_{md5(query)}` | `{last_result, num_rows, return_val, table_epochs/epoch}` | **Per-table epochs** (with profiler) or **global epoch** (fallback). |
-| **Fragments** | `pigcache_fragments` | `f_{md5(key)}` | Arbitrary callback output | **Tag-based** when tags are provided; otherwise TTL only. |
-| **Object cache** (core WP) | Various (`options`, `posts`, `terms`, …) | `{prefix}{blog}:{group}:{key}` | Whatever WordPress stores | Managed by WordPress core; PigCache does not touch these. |
+| Layer | Store | Key pattern | Stored data | Invalidation |
+|-------|-------|-------------|-------------|--------------|
+| **HTML** (full page) | Redis `pigcache_html` | `doc_{md5(URI)}` | `{html, tags[], time}` | **Tag-based** — only pages referencing the changed object are deleted. |
+| **SQL** (SELECT results) | Redis `pigcache_sql` | `sql_{md5(query)}` | `{last_result, num_rows, return_val, table_epochs/epoch}` | **Per-table epochs** (with profiler) or **global epoch** (fallback). Adaptive TTL when enabled. |
+| **Fragments** | Redis `pigcache_fragments` | `f_{md5(key)}` | Arbitrary callback output | **Tag-based** when tags are provided; otherwise TTL only. |
+| **Object cache** (core WP) | Redis (various groups) | `{prefix}{blog}:{group}:{key}` | Whatever WordPress stores | Managed by WordPress core; PigCache does not touch these. |
+| **Query buffer** (Pro) | APCu or Redis `pigcache_qbuf:*` | `pigcache_qbuf:{hash}` / `pigcache_qbuf:{window}` | Per-request query aggregates (exec time, hits, memory) | Drained every 15 min by cron → MySQL. |
+| **Query stats** (Pro) | MySQL `wp_pigcache_query_stats` | `(query_hash, period_start)` | Aggregated analytics per 15-min period | Pruned after 30 days (sent rows only). Synced hourly to API. |
 
 ---
 
@@ -291,28 +293,128 @@ is backed up and used as fallback during re-learning.
 | `PIGCACHE_SQL_PROFILE_PATH` | `wp-content/pigcache-sql-profile.php` | Override compiled file location |
 | `PIGCACHE_SQL_PROFILE_AUTO_RELEARN` | `true` | Auto re-learn on plugin/theme change |
 
-### CLI analyzer (optional)
+---
 
-```bash
-# Requires Python 3.6+ and a MySQL driver
-pip3 install mysql-connector-python
+## 8. Continuous Query Learning (PigCache Pro)
 
-# Analyze using wp-config.php for credentials
-python3 cli/pigcache-analyze.py --wp-config /path/to/wp-config.php
+A separate, always-on analytics pipeline that samples live traffic to
+identify slow and expensive queries — independent of the SQL profiler.
 
-# Output to JSON file
-python3 cli/pigcache-analyze.py --wp-config /path/to/wp-config.php -o report.json
+### Goal vs SQL Profiler
+
+| | SQL Profiler | Continuous Learning |
+|---|---|---|
+| Purpose | Map query → tables for per-table invalidation | Identify slow/heavy queries for optimization |
+| Data collected | Fingerprint + table list | Exec time, memory, hit count |
+| Storage | Static PHP file + MySQL fingerprints | MySQL (`wp_pigcache_query_stats`) |
+| Cloud use | Shared profiles across similar stacks | Per-site analytics sent to API |
+| Runtime cost | None after compilation | Negligible (sampled + buffered) |
+
+### Request flow
+
+```
+Every incoming request
+  |
+  ├── Sampling decision (once per request, memoised)
+  │     PigCache_Continuous_Learner::is_request_sampled()
+  │     - Remote config from API: learning_enabled + sample_rate
+  │     - Constant override: PIGCACHE_CONTINUOUS_LEARNING / PIGCACHE_LEARNING_SAMPLE_RATE
+  │     - mt_rand(1,1000) ≤ floor(rate × 1000)   → sampled or not
+  │
+  ├── On sampled request — every SELECT:
+  │     PigCache_WPDB measures exec time (microtime around parent::query)
+  │     → PigCache_Continuous_Learner::record(normalized, tables, exec_ms, mem_kb)
+  │     → PigCache_Query_Buffer::record(...)
+  │          accumulates in static PHP array (max 300 distinct queries)
+  │
+  └── On shutdown (register_shutdown_function):
+        PigCache_Query_Buffer::flush_request()
+        → If APCu enabled: merge into APCu keys  pigcache_qbuf:{hash}
+        → Else if Redis:   merge into Redis HASH  pigcache_qbuf:{15min-window}
+        One external write per request, zero overhead on the hot path.
 ```
 
-The analyzer produces:
-- Frequency-sorted query templates
-- Table dependency graph
-- Cache efficiency estimate (% of queries surviving a wp_posts mutation)
-- Optimization recommendations
+### Cron pipeline
+
+```
+Every 15 min — pigcache_flush_query_stats
+  PigCache_Continuous_Learner::cron_flush()
+  → PigCache_Query_Buffer::read_and_clear()   (drain APCu or Redis)
+  → PigCache_Query_Stats::upsert_batch()
+       INSERT … ON DUPLICATE KEY UPDATE hit_count + n, GREATEST(max_exec_ms)
+       Keyed on (query_hash, period_start) — 15-min windows
+
+Every hour — pigcache_send_query_stats
+  PigCache_Continuous_Learner::cron_send()
+  → PigCache_Query_Stats::get_unsent(200)
+  → POST /api/v1/query-stats          (batch, max 200 rows per call)
+  → PigCache_Query_Stats::mark_sent()
+  → PigCache_Query_Stats::prune()     (delete sent rows older than 30 days)
+```
+
+### Adaptive TTL
+
+When `PIGCACHE_ADAPTIVE_TTL = true` (or enabled via remote config), the
+SQL cache TTL is set based on how long the query took to execute:
+
+| Execution time | TTL |
+|----------------|-----|
+| < 20 ms (fast) | 60 s |
+| 20–200 ms (medium) | 300 s |
+| > 200 ms (slow) | 900 s |
+
+Slow queries stay cached 15× longer, reducing database pressure precisely
+where it matters most.
+
+### Buffer backends
+
+| Backend | How to enable | Notes |
+|---------|--------------|-------|
+| **APCu** (preferred) | `define('PIGCACHE_APCU_BUFFER', true)` | Shared memory, zero network. Requires APCu extension. |
+| **Redis** (fallback) | Always available if `WP_REDIS_HOST` configured | Uses a separate key namespace `pigcache_qbuf:*`, never conflicts with the SQL cache `pigcache_sql:*`. |
+| **None** | Neither available | Buffer silently disabled; stats not collected. |
+
+### Remote config
+
+The API controls learning per site. The plugin fetches config from
+`GET /api/v1/learning-config` every 6 hours (1 hour on error).
+
+```json
+{
+  "data": {
+    "learning_enabled": true,
+    "sample_rate": 0.10,
+    "adaptive_ttl": false
+  }
+}
+```
+
+Local constants always override remote config:
+
+| Constant | Default | Description |
+|----------|---------|-------------|
+| `PIGCACHE_CONTINUOUS_LEARNING` | _(from API)_ | `true`/`false` force-override |
+| `PIGCACHE_LEARNING_SAMPLE_RATE` | _(from API)_ | Float 0.0–1.0 (e.g. `0.10` = 10%) |
+| `PIGCACHE_ADAPTIVE_TTL` | _(from API)_ | Enable adaptive TTL tiers |
+| `PIGCACHE_APCU_BUFFER` | `false` | Opt-in to APCu buffer |
+
+### cPanel / no persistent processes
+
+On shared hosting where WP-Cron is the only scheduler, add this to
+`wp-config.php` to ensure cron fires reliably:
+
+```php
+define( 'DISABLE_WP_CRON', false );
+```
+
+Or trigger WP-Cron externally via cPanel's Cron Jobs:
+```
+*/15 * * * *  curl -s https://your-site.com/wp-cron.php?doing_wp_cron > /dev/null
+```
 
 ---
 
-## 8. Cloud SQL Profiles (PigCache Pro)
+## 9. Cloud SQL Profiles (PigCache Pro)
 
 When a Pro license is active, the SQL profiler gains cloud capabilities:
 
@@ -384,7 +486,7 @@ The site never fails. Cloud is an optimization, not a dependency.
 
 ---
 
-## 9. Glossary
+## 10. Glossary
 
 | Term | Meaning |
 |------|---------|
@@ -401,3 +503,9 @@ The site never fails. Cloud is an optimization, not a dependency.
 | **Environment hash** | md5 of the site's sorted plugin slugs + theme + WP major version. Used to match sites to shared cloud profiles. |
 | **Cloud profile** | A compiled SQL profile downloaded from PigCache Cloud, aggregated from multiple sites with the same environment. |
 | **Cloud sync** | Periodic (twice-daily) upload of local fingerprints and download of compiled profiles via the PigCache Cloud API. |
+| **Continuous learning** | Always-on, sampled query analytics pipeline — separate from the SQL profiler. Collects exec time, memory, and hit count per normalized query. |
+| **Sample rate** | Fraction of requests (0.0–1.0) on which queries are recorded. Controlled per site from the backend; overridable via `PIGCACHE_LEARNING_SAMPLE_RATE`. |
+| **Query buffer** | PHP static array + APCu/Redis accumulator. Aggregates per-request query data in memory so the write to MySQL happens in a cron, not on the hot path. |
+| **Period window** | 15-minute UTC bucket (`floor(time/900)*900`) used to group query stats rows. Allows trend analysis over time. |
+| **Adaptive TTL** | TTL assigned to a cached SQL result based on how long the query took. Slow queries get a longer TTL to maximize cache value. |
+| **Remote config** | Per-site learning settings (`learning_enabled`, `sample_rate`, `adaptive_ttl`) fetched from the API and cached locally for 6 hours. |

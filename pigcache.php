@@ -55,6 +55,9 @@ foreach ( array(
 	'class-pigcache-sql-profile-store.php',
 	'class-pigcache-sql-profiler.php',
 	'class-pigcache-updates.php',
+	'class-pigcache-query-buffer.php',
+	'class-pigcache-query-stats.php',
+	'class-pigcache-continuous-learner.php',
 ) as $_pigcache_pro_file ) {
 	$_pigcache_pro_path = PIGCACHE_DIR . 'includes/' . $_pigcache_pro_file;
 	if ( is_readable( $_pigcache_pro_path ) ) {
@@ -74,8 +77,16 @@ register_activation_hook(
 			PigCache_Sql_Profile_Store::create_table();
 		}
 
+		if ( class_exists( 'PigCache_Query_Stats', false ) ) {
+			PigCache_Query_Stats::create_table();
+		}
+
 		if ( class_exists( 'PigCache_Cloud_Sync', false ) && PigCache_Cloud_Sync::is_enabled() ) {
 			PigCache_Cloud_Sync::schedule();
+		}
+
+		if ( class_exists( 'PigCache_Continuous_Learner', false ) ) {
+			PigCache_Continuous_Learner::schedule();
 		}
 	}
 );
@@ -90,6 +101,23 @@ register_deactivation_hook(
 		if ( class_exists( 'PigCache_Cloud_Sync', false ) ) {
 			PigCache_Cloud_Sync::unschedule();
 		}
+
+		if ( class_exists( 'PigCache_Continuous_Learner', false ) ) {
+			PigCache_Continuous_Learner::unschedule();
+		}
+	}
+);
+
+add_filter(
+	'cron_schedules',
+	static function ( $schedules ) {
+		if ( ! isset( $schedules['pigcache_15min'] ) ) {
+			$schedules['pigcache_15min'] = array(
+				'interval' => 15 * MINUTE_IN_SECONDS,
+				'display'  => __( 'Every 15 minutes (PigCache)', 'pigcache' ),
+			);
+		}
+		return $schedules;
 	}
 );
 
@@ -99,6 +127,9 @@ if ( class_exists( 'PigCache_Updates', false ) ) {
 }
 if ( class_exists( 'PigCache_Cloud_Sync', false ) ) {
 	add_action( 'plugins_loaded', array( 'PigCache_Cloud_Sync', 'init' ), 10 );
+}
+if ( class_exists( 'PigCache_Continuous_Learner', false ) ) {
+	add_action( 'plugins_loaded', array( 'PigCache_Continuous_Learner', 'init' ), 15 );
 }
 add_action( 'plugins_loaded', array( 'PigCache_Plugin', 'instance' ), 20 );
 

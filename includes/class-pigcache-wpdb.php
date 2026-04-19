@@ -98,13 +98,15 @@ class PigCache_WPDB extends wpdb {
 			}
 		}
 
+		$t_start               = microtime( true );
 		$this->pigcache_bypass = true;
 		$out                   = parent::query( $query );
 		$this->pigcache_bypass = false;
+		$exec_ms               = ( microtime( true ) - $t_start ) * 1000;
 
 		if ( false !== $out && '' === $this->last_error && $this->pigcache_is_cacheable_select( ltrim( $this->last_query ) ) ) {
 			$this->pigcache_bypass = true;
-			$this->pigcache_store_select( $this->pigcache_cache_key( $this->last_query ), $out, $this->last_query );
+			$this->pigcache_store_select( $this->pigcache_cache_key( $this->last_query ), $out, $this->last_query, $exec_ms );
 			$this->pigcache_bypass = false;
 		}
 
@@ -114,6 +116,16 @@ class PigCache_WPDB extends wpdb {
 			&& $this->pigcache_is_cacheable_select( $trim )
 		) {
 			PigCache_Sql_Profiler::record( $query, $this->num_rows );
+		}
+
+		if ( false !== $out
+			&& class_exists( 'PigCache_Continuous_Learner', false )
+			&& $this->pigcache_is_cacheable_select( $trim )
+		) {
+			$normalized  = $this->pigcache_normalize( $query );
+			$tables      = $this->pigcache_extract_tables( $trim );
+			$mem_kb      = (int) round( memory_get_usage() / 1024 );
+			PigCache_Continuous_Learner::record( $normalized, $tables, $exec_ms, $mem_kb );
 		}
 
 		return $out;
@@ -252,11 +264,19 @@ class PigCache_WPDB extends wpdb {
 	 * @param string $key
 	 * @param int    $return_val
 	 * @param string $query
+	 * @param float  $exec_ms
 	 */
-	private function pigcache_store_select( $key, $return_val, $query = '' ) {
+	private function pigcache_store_select( $key, $return_val, $query = '', $exec_ms = 0.0 ) {
 		$ttl = 120;
 		if ( class_exists( 'PigCache_Sql_Cache', false ) ) {
 			$ttl = PigCache_Sql_Cache::ttl();
+		}
+
+		if ( class_exists( 'PigCache_Continuous_Learner', false ) ) {
+			$adaptive = PigCache_Continuous_Learner::adaptive_ttl( $exec_ms );
+			if ( null !== $adaptive ) {
+				$ttl = $adaptive;
+			}
 		}
 
 		$pack = array(
@@ -269,8 +289,11 @@ class PigCache_WPDB extends wpdb {
 
 		if ( ! empty( $table_epochs ) ) {
 			$pack['table_epochs'] = $table_epochs;
-		} else {
+		} elseif ( class_exists( 'PigCache_Sql_Cache', false ) ) {
 			$pack['epoch'] = PigCache_Sql_Cache::get_epoch();
+		} else {
+			// Drop-in loaded before plugin — skip caching this query.
+			return;
 		}
 
 		wp_cache_set( $key, $pack, 'pigcache_sql', $ttl );
@@ -320,6 +343,36 @@ class PigCache_WPDB extends wpdb {
 		}
 
 		$this->pigcache_bump_epoch();
+	}
+
+	/**
+	 * Normalize a SQL query for analytics (replace literals with ?).
+	 *
+	 * @param string $query
+	 * @return string
+	 */
+	private function pigcache_normalize( $query ) {
+		// Replace quoted strings.
+		$q = preg_replace( "/'[^'\\\\]*(?:\\\\.[^'\\\\]*)*'/", '?', $query );
+		// Replace numbers.
+		$q = preg_replace( '/\b\d+\b/', '?', $q );
+		// Collapse whitespace.
+		return preg_replace( '/\s+/', ' ', trim( $q ) );
+	}
+
+	/**
+	 * Extract table names from a SELECT for lightweight analytics tagging.
+	 * Not exhaustive — covers simple FROM/JOIN patterns.
+	 *
+	 * @param string $trim Left-trimmed SQL.
+	 * @return string[]
+	 */
+	private function pigcache_extract_tables( $trim ) {
+		$tables = array();
+		if ( preg_match_all( '/(?:FROM|JOIN)\s+`?(\w+)`?/i', $trim, $m ) ) {
+			$tables = array_unique( $m[1] );
+		}
+		return array_values( $tables );
 	}
 
 	/**
