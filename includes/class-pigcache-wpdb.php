@@ -103,7 +103,9 @@ class PigCache_WPDB extends wpdb {
 		$this->pigcache_bypass = false;
 
 		if ( false !== $out && '' === $this->last_error && $this->pigcache_is_cacheable_select( ltrim( $this->last_query ) ) ) {
+			$this->pigcache_bypass = true;
 			$this->pigcache_store_select( $this->pigcache_cache_key( $this->last_query ), $out, $this->last_query );
+			$this->pigcache_bypass = false;
 		}
 
 		if ( false !== $out

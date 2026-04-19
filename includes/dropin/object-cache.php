@@ -277,7 +277,9 @@ function wp_cache_init() {
     }
 
     if ( ! ( $wp_object_cache instanceof WP_Object_Cache ) ) {
-        $fail_gracefully = defined( 'WP_REDIS_GRACEFUL' ) && WP_REDIS_GRACEFUL;
+        // Default: graceful fallback (site stays up when Redis is unavailable).
+        // Set define('WP_REDIS_GRACEFUL', false) to restore the hard-error screen.
+        $fail_gracefully = ! defined( 'WP_REDIS_GRACEFUL' ) || (bool) WP_REDIS_GRACEFUL;
 
         // phpcs:ignore WordPress.WP.GlobalVariablesOverride.Prohibited
         $wp_object_cache = new WP_Object_Cache( $fail_gracefully );
@@ -532,7 +534,7 @@ class WP_Object_Cache {
      *
      * @param bool $fail_gracefully Handles and logs errors if true throws exceptions otherwise.
      */
-    public function __construct( $fail_gracefully = false ) {
+    public function __construct( $fail_gracefully = true ) {
         global $blog_id, $table_prefix;
 
         $this->fail_gracefully = $fail_gracefully;
@@ -555,6 +557,20 @@ class WP_Object_Cache {
 
         $client = $this->determine_client();
         $parameters = $this->build_parameters();
+
+        // Circuit breaker: if Redis recently failed, skip the connection attempt
+        // entirely rather than paying the read_timeout cost on every request.
+        if ( $this->pigcache_circuit_is_open() ) {
+            $this->errors[] = 'Redis circuit breaker open — skipping connection attempt.';
+            $this->ignored_groups = array_unique( array_merge( $this->ignored_groups, $this->global_groups ) );
+
+            if ( function_exists( 'is_multisite' ) ) {
+                $this->global_prefix = is_multisite() ? '' : $table_prefix;
+                $this->blog_prefix   = is_multisite() ? $blog_id : $table_prefix;
+            }
+
+            return;
+        }
 
         try {
             switch ( $client ) {
@@ -2799,11 +2815,69 @@ class WP_Object_Cache {
      * @throws \Exception If `fail_gracefully` flag is set to a falsy value.
      * @return void
      */
+
+    // ── Circuit breaker ──────────────────────────────────────────────────────
+    // After a Redis failure the circuit is "open" for PIGCACHE_REDIS_RETRY_INTERVAL
+    // seconds (default 30). During that window every request skips the connection
+    // attempt entirely instead of blocking for the full read_timeout duration.
+    // After the interval a single probe request attempts to reconnect; if it
+    // succeeds the circuit closes automatically.
+
+    /**
+     * Returns the path of the circuit-breaker flag file for this Redis endpoint.
+     *
+     * @return string
+     */
+    private function pigcache_circuit_path() {
+        $host = defined( 'WP_REDIS_HOST' ) ? WP_REDIS_HOST : '127.0.0.1';
+        $port = defined( 'WP_REDIS_PORT' ) ? (string) WP_REDIS_PORT : '6379';
+        return sys_get_temp_dir() . '/pigcache_cb_' . md5( $host . ':' . $port ) . '.flag';
+    }
+
+    /**
+     * Returns true when the circuit is open (Redis marked as down).
+     *
+     * @return bool
+     */
+    private function pigcache_circuit_is_open() {
+        $path = $this->pigcache_circuit_path();
+        if ( ! file_exists( $path ) ) {
+            return false;
+        }
+
+        $ts  = (int) @file_get_contents( $path ); // phpcs:ignore WordPress.WP.AlternativeFunctions
+        $ttl = defined( 'PIGCACHE_REDIS_RETRY_INTERVAL' ) ? (int) PIGCACHE_REDIS_RETRY_INTERVAL : 30;
+
+        if ( time() - $ts < $ttl ) {
+            return true;
+        }
+
+        // Interval elapsed — delete flag and let this request probe Redis.
+        @unlink( $path ); // phpcs:ignore WordPress.WP.AlternativeFunctions
+
+        return false;
+    }
+
+    /**
+     * Opens the circuit breaker (writes the flag file with the current timestamp).
+     *
+     * @return void
+     */
+    private function pigcache_open_circuit() {
+        @file_put_contents( $this->pigcache_circuit_path(), (string) time() ); // phpcs:ignore WordPress.WP.AlternativeFunctions
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+
     protected function handle_exception( $exception ) {
         $this->redis_connected = false;
 
         // When Redis is unavailable, fall back to the internal cache by forcing all groups to be "no redis" groups.
         $this->ignored_groups = array_unique( array_merge( $this->ignored_groups, $this->global_groups ) );
+
+        // Open the circuit breaker so subsequent requests skip the connection
+        // attempt (and its timeout cost) for PIGCACHE_REDIS_RETRY_INTERVAL seconds.
+        $this->pigcache_open_circuit();
 
         error_log( $exception ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 

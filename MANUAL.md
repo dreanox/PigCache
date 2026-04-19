@@ -498,6 +498,8 @@ El dashboard muestra de un vistazo:
 | `WP_REDIS_PREFIX` | _(auto: `md5(DB_NAME\|table_prefix)`)_ | Prefijo para keys Redis. Se auto-genera si no se define. |
 | `WP_REDIS_SELECTIVE_FLUSH` | _(auto: `true` si hay prefix)_ | Solo borrar keys con el prefijo del sitio al hacer flush. Se activa automáticamente cuando hay un prefix. |
 | `WP_REDIS_CLIENT` | _(auto)_ | Forzar: `phpredis`, `predis`, `relay` |
+| `WP_REDIS_TIMEOUT` | `1` | Timeout de conexión TCP en segundos. Aumentar en redes con latencia alta. |
+| `WP_REDIS_READ_TIMEOUT` | `1` | Timeout de lectura de socket en segundos. Si Redis tarda más de este tiempo en responder (p. ej. durante un `BGSAVE` en servidores con mucha RAM), phpredis lanza "read error on connection". **Recomendado: `3` en sitios de alto tráfico.** |
 
 > **Auto-prefix:** Si no defines `WP_REDIS_PREFIX`, `WP_CACHE_KEY_SALT`,
 > ni estás en Cloudways, PigCache genera un hash de 8 caracteres a partir
@@ -551,6 +553,83 @@ define( 'WP_REDIS_DATABASE', 7 );
 
 Por eso PigCache activa `WP_REDIS_SELECTIVE_FLUSH` automáticamente
 cuando hay un prefix activo.
+
+### Resiliencia — fallback y circuit breaker
+
+Si Redis no está disponible (reinicio, fallo de red, timeout de lectura), PigCache
+puede degradarse silenciosamente en lugar de mostrar una pantalla de error a los
+visitantes. El sitio sigue funcionando con MySQL; simplemente no hay caché esa request.
+
+| Constante | Default | Descripción |
+|-----------|---------|-------------|
+| `WP_REDIS_GRACEFUL` | `true` | **`true`** (default): si Redis falla, PigCache cae en fallback silencioso — el object cache usa solo la memoria PHP de la request, el SQL cache hace miss, el HTML cache se salta. Los visitantes no ven ningún error. **`false`**: muestra la pantalla de error "Error establishing a Redis connection" y detiene la carga de WordPress hasta que Redis vuelva. Solo útil para depuración. |
+| `PIGCACHE_REDIS_RETRY_INTERVAL` | `30` | Segundos que el circuit breaker mantiene Redis "desconectado" tras un fallo. Durante este intervalo **ninguna** request intenta conectarse a Redis (evita acumular N × `WP_REDIS_READ_TIMEOUT` de latencia extra durante una caída). Transcurrido el intervalo, una sola request "sonda" la conexión; si tiene éxito el circuit se cierra automáticamente. |
+
+#### Cómo funciona el circuit breaker
+
+```
+Request 1 → intenta conectar Redis → fallo (read error, 1 s de timeout)
+            → handle_exception() → redis_connected = false
+            → escribe /tmp/pigcache_cb_{hash}.flag con timestamp
+            → fallback: PHP array cache para esta request
+
+Request 2–N (siguientes 30 s) → detecta flag, lo lee, ve que tiene < 30 s
+            → salta el intento de conexión completamente (0 ms de overhead)
+            → fallback: PHP array cache
+
+Request (tras 30 s) → detecta flag, ve que tiene ≥ 30 s → borra flag
+            → intenta conexión → si Redis volvió: éxito → circuit cerrado
+            →                    si Redis sigue caído: flag se crea de nuevo
+```
+
+#### Configuración recomendada para sitios de alto tráfico
+
+```php
+// wp-config.php
+
+// Dar a Redis 3 s para responder — previene "read error" durante BGSAVE
+// en instancias con mucha RAM (854 MB+, 1 GB+).
+define( 'WP_REDIS_READ_TIMEOUT', 3 );
+
+// Fallback silencioso activado por defecto (no necesitas esta línea
+// a menos que quieras DESACTIVARLO para depuración):
+// define( 'WP_REDIS_GRACEFUL', false );
+
+// Extender la ventana del circuit breaker a 60 s en entornos donde
+// los reinicios de Redis tardan más de 30 s:
+// define( 'PIGCACHE_REDIS_RETRY_INTERVAL', 60 );
+```
+
+#### Por qué aparece "read error on connection"
+
+El error `read error on connection to 127.0.0.1:6379` **no significa que Redis
+esté caído** — significa que la conexión TCP se estableció pero la respuesta tardó
+más de `WP_REDIS_READ_TIMEOUT` (default `1 s`). Causas frecuentes:
+
+- **`BGSAVE` / `BGREWRITEAOF`**: Redis hace un `fork()` para guardar en disco.
+  Con 500 MB+ en memoria, el fork tarda decenas o cientos de ms y puede incrementar
+  la latencia de otras operaciones durante ese lapso.
+- **`read_timeout` demasiado corto**: el default de 1 s es apropiado para Redis
+  en la misma máquina bajo carga normal, pero puede ser insuficiente bajo picos.
+- **Conexiones TCP stale**: con conexiones persistentes y reinicios de Redis,
+  el socket puede quedar "muerto" del lado del OS.
+
+Diagnosticar con:
+
+```bash
+# Ver latencia en tiempo real (1 muestra por segundo):
+redis-cli --latency-history -i 1
+
+# Ver los últimos comandos lentos (> 10 ms por defecto):
+redis-cli SLOWLOG GET 25
+
+# Ver configuración actual de saves:
+redis-cli CONFIG GET save
+
+# Deshabilitar BGSAVE periódico si no necesitas RDB snapshots
+# (solo si usas AOF o no necesitas persistencia):
+redis-cli CONFIG SET save ""
+```
 
 ### Invalidación
 
