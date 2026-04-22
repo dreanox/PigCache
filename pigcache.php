@@ -43,6 +43,7 @@ require_once PIGCACHE_DIR . 'includes/class-pigcache-invalidation.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-fragments.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-dropin-db.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-dropin-object-cache.php';
+require_once PIGCACHE_DIR . 'includes/class-pigcache-dropin-html-cache.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-admin.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-metrics.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-plugin.php';
@@ -88,6 +89,14 @@ register_activation_hook(
 		if ( class_exists( 'PigCache_Continuous_Learner', false ) ) {
 			PigCache_Continuous_Learner::schedule();
 		}
+
+		// Create logs/ directory with HTTP deny so pigcache-cron.log is never web-accessible.
+		$logs_dir = PIGCACHE_DIR . 'logs';
+		if ( ! is_dir( $logs_dir ) ) {
+			wp_mkdir_p( $logs_dir );
+			file_put_contents( $logs_dir . '/.htaccess', "Order deny,allow\nDeny from all\n" );
+			file_put_contents( $logs_dir . '/.gitignore', "*\n!.gitignore\n!.htaccess\n" );
+		}
 	}
 );
 
@@ -96,6 +105,10 @@ register_deactivation_hook(
 	static function () {
 		if ( PigCache_Dropin_Object_Cache::validate() ) {
 			PigCache_Dropin_Object_Cache::remove();
+		}
+
+		if ( PigCache_Dropin_Html_Cache::is_our_file() ) {
+			PigCache_Dropin_Html_Cache::remove();
 		}
 
 		if ( class_exists( 'PigCache_Cloud_Sync', false ) ) {
@@ -111,12 +124,16 @@ register_deactivation_hook(
 add_filter(
 	'cron_schedules',
 	static function ( $schedules ) {
-		if ( ! isset( $schedules['pigcache_15min'] ) ) {
-			$schedules['pigcache_15min'] = array(
-				'interval' => 15 * MINUTE_IN_SECONDS,
-				'display'  => __( 'Every 15 minutes (PigCache)', 'pigcache' ),
-			);
-		}
+		$minutes = class_exists( 'PigCache_Continuous_Learner', false )
+			? PigCache_Continuous_Learner::flush_interval_minutes()
+			: ( defined( 'PIGCACHE_FLUSH_INTERVAL' ) ? max( 1, min( 60, (int) PIGCACHE_FLUSH_INTERVAL ) ) : 15 );
+
+		$schedules['pigcache_flush'] = array(
+			'interval' => $minutes * MINUTE_IN_SECONDS,
+			/* translators: %d: number of minutes */
+			'display'  => sprintf( __( 'Every %d minutes (PigCache)', 'pigcache' ), $minutes ),
+		);
+
 		return $schedules;
 	}
 );

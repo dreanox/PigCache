@@ -11,9 +11,11 @@ defined( 'ABSPATH' ) || exit;
 
 class PigCache_Sql_Profiler {
 
-	const OPTION_LEARN_START = 'pigcache_sql_profile_learn_start';
-	const OPTION_LEARN_DAYS  = 'pigcache_sql_profile_learn_days';
-	const DEFAULT_LEARN_DAYS = 7;
+	const OPTION_LEARN_START  = 'pigcache_sql_profile_learn_start';
+	const OPTION_LEARN_DAYS   = 'pigcache_sql_profile_learn_days';
+	const OPTION_AUTO_RELEARN = 'pigcache_sql_auto_relearn';
+	const OPTION_ENV_CHANGE   = 'pigcache_sql_env_last_change';
+	const DEFAULT_LEARN_DAYS  = 7;
 
 	/** @var array|null Cached compiled profile. */
 	private static $profile = null;
@@ -44,25 +46,103 @@ class PigCache_Sql_Profiler {
 
 	/**
 	 * Fired when plugins, themes, or core are changed.
+	 *
+	 * Stores what changed, then auto-relaunches learning if enabled.
 	 */
-	public static function on_environment_change() {
+	public static function on_environment_change( ...$args ) {
 		if ( ! PigCache_License::can_use_profiler() ) {
 			return;
 		}
 
-		$auto = defined( 'PIGCACHE_SQL_PROFILE_AUTO_RELEARN' )
-			? PIGCACHE_SQL_PROFILE_AUTO_RELEARN
-			: true;
+		$current_filter = current_filter();
+		$detail         = self::describe_env_change( $current_filter, $args );
+		$auto           = self::auto_relearn_enabled();
 
-		if ( ! $auto ) {
+		update_option( self::OPTION_ENV_CHANGE, array(
+			'time'           => time(),
+			'filter'         => $current_filter,
+			'detail'         => $detail,
+			'auto_relearned' => false,
+		), false );
+
+		if ( class_exists( 'PigCache_Environment', false ) ) {
+			PigCache_Environment::flush();
+		}
+
+		if ( ! $auto || self::is_learning() ) {
 			return;
 		}
 
-		if ( self::is_learning() ) {
-			return;
-		}
+		update_option( self::OPTION_ENV_CHANGE, array(
+			'time'           => time(),
+			'filter'         => $current_filter,
+			'detail'         => $detail,
+			'auto_relearned' => true,
+		), false );
 
 		self::trigger_relearn();
+	}
+
+	/**
+	 * @return bool
+	 */
+	public static function auto_relearn_enabled(): bool {
+		if ( defined( 'PIGCACHE_SQL_PROFILE_AUTO_RELEARN' ) ) {
+			return (bool) PIGCACHE_SQL_PROFILE_AUTO_RELEARN;
+		}
+
+		return (bool) get_option( self::OPTION_AUTO_RELEARN, true );
+	}
+
+	/**
+	 * @param string $filter
+	 * @param array  $args
+	 * @return string Human-readable description of what changed.
+	 */
+	private static function describe_env_change( string $filter, array $args ): string {
+		if ( 'activated_plugin' === $filter && ! empty( $args[0] ) ) {
+			$slug = dirname( $args[0] );
+			$name = '.' === $slug ? $args[0] : $slug;
+			return sprintf( 'Plugin activated: %s', $name );
+		}
+
+		if ( 'deactivated_plugin' === $filter && ! empty( $args[0] ) ) {
+			$slug = dirname( $args[0] );
+			$name = '.' === $slug ? $args[0] : $slug;
+			return sprintf( 'Plugin deactivated: %s', $name );
+		}
+
+		if ( 'switch_theme' === $filter ) {
+			$name = ! empty( $args[0] ) ? $args[0] : 'unknown';
+			return sprintf( 'Theme switched to: %s', $name );
+		}
+
+		if ( 'upgrader_process_complete' === $filter && isset( $args[1]['type'] ) ) {
+			$type = $args[1]['type'];
+
+			if ( 'core' === $type ) {
+				return sprintf( 'WordPress core updated to %s', get_bloginfo( 'version' ) );
+			}
+
+			if ( 'plugin' === $type ) {
+				$plugins = isset( $args[1]['plugins'] ) ? (array) $args[1]['plugins'] : array();
+				if ( ! empty( $args[1]['plugin'] ) ) {
+					$plugins = array( $args[1]['plugin'] );
+				}
+				$names = array_map( static function ( $p ) {
+					$s = dirname( $p );
+					return '.' === $s ? $p : $s;
+				}, $plugins );
+				return sprintf( 'Plugin(s) updated: %s', implode( ', ', $names ) );
+			}
+
+			if ( 'theme' === $type ) {
+				$themes = isset( $args[1]['themes'] ) ? (array) $args[1]['themes'] : array();
+				return sprintf( 'Theme(s) updated: %s', implode( ', ', $themes ) );
+			}
+		}
+
+		return 'Environment changed';
 	}
 
 	// ------------------------------------------------------------------
@@ -518,14 +598,6 @@ class PigCache_Sql_Profiler {
 	 */
 	public static function trigger_relearn( $days = 0 ) {
 		if ( ! PigCache_License::can_use_profiler() ) {
-			return;
-		}
-
-		$auto = defined( 'PIGCACHE_SQL_PROFILE_AUTO_RELEARN' )
-			? PIGCACHE_SQL_PROFILE_AUTO_RELEARN
-			: true;
-
-		if ( ! $auto ) {
 			return;
 		}
 

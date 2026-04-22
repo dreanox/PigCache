@@ -26,6 +26,63 @@ class PigCache_Html_Cache {
 	}
 
 	/**
+	 * Called from advanced-cache.php before WordPress finishes booting.
+	 * Uses only $_SERVER / $_COOKIE — no WP functions available yet.
+	 * Serves a cached response and exits, or returns if no cache hit.
+	 */
+	public static function serve_early() {
+		if ( ! function_exists( 'wp_cache_get' ) ) {
+			return;
+		}
+
+		// Only serve GET requests.
+		if ( ! isset( $_SERVER['REQUEST_METHOD'] ) || strtoupper( (string) $_SERVER['REQUEST_METHOD'] ) !== 'GET' ) {
+			return;
+		}
+
+		// Skip POST data (form submissions that arrive via GET query string are fine).
+		if ( ! empty( $_POST ) ) { // phpcs:ignore WordPress.Security.NonceVerification.Missing
+			return;
+		}
+
+		// Skip logged-in users (check WordPress session cookies).
+		foreach ( array_keys( $_COOKIE ) as $cookie_name ) {
+			if ( strncmp( (string) $cookie_name, 'wordpress_logged_in_', 20 ) === 0 ) {
+				return;
+			}
+		}
+
+		// Skip WooCommerce cart/checkout (non-empty cart hash means personalised content).
+		if ( ! empty( $_COOKIE['woocommerce_cart_hash'] ) || ! empty( $_COOKIE['woocommerce_items_in_cart'] ) ) {
+			return;
+		}
+
+		$uri = isset( $_SERVER['REQUEST_URI'] ) ? (string) $_SERVER['REQUEST_URI'] : '/';
+
+		// Skip wp-admin and login pages.
+		if ( false !== strpos( $uri, '/wp-admin/' ) || false !== strpos( $uri, '/wp-login.php' ) ) {
+			return;
+		}
+
+		$host = isset( $_SERVER['HTTP_HOST'] ) ? strtolower( (string) $_SERVER['HTTP_HOST'] ) : '';
+		$key  = 'doc_' . md5( $host . $uri );
+
+		$pack = wp_cache_get( $key, self::GROUP_HTML );
+
+		if ( ! is_array( $pack ) || empty( $pack['html'] ) ) {
+			return;
+		}
+
+		if ( ! headers_sent() ) {
+			header( 'Content-Type: text/html; charset=UTF-8' );
+			header( 'X-PigCache: HIT' );
+		}
+
+		echo $pack['html']; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
+		exit;
+	}
+
+	/**
 	 * Start output buffer or serve cached page.
 	 *
 	 * Flow:

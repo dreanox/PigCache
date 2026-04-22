@@ -12,7 +12,7 @@
 dist/
 *.zip
 
-# Dev tooling
+# Dev tooling — entire bin/ excluded; build.sh copies cron script selectively
 bin/
 .distignore
 .gitignore

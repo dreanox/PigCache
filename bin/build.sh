@@ -97,6 +97,14 @@ build_zip() {
     done
   fi
 
+  # ---- Inject Pro-only bin files (bin/ is excluded from rsync via .distignore) ---
+  # pigcache-cron.php is a standalone CLI script shipped only in the Pro build.
+  # build.sh itself never ships.
+  if [[ "${label}" == "pro" ]]; then
+    mkdir -p "${staging}/bin"
+    cp "${PLUGIN_DIR}/bin/pigcache-cron.php" "${staging}/bin/pigcache-cron.php"
+  fi
+
   # ---- Create ZIP (pigcache/ wrapper folder required by wordpress.org) ---
   # Remove any previous ZIP so we never merge stale entries from an old build.
   rm -f "${DIST_DIR}/${zip_name}"

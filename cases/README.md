@@ -71,6 +71,7 @@ No additional drop-in. The `pigcache_fragment()` global function is registered i
 3. [03-sql-cache.md](03-sql-cache.md) — query-level cache with smart per-table invalidation (Pro)
 4. [04-fragment-cache.md](04-fragment-cache.md) — partial page caching for logged-in or dynamic sections
 5. [05-woocommerce.md](05-woocommerce.md) — end-to-end walkthrough combining all four layers
+6. [06-continuous-learning.md](06-continuous-learning.md) — query analytics pipeline, adaptive TTL, and observability (Pro)
 
 ---
 

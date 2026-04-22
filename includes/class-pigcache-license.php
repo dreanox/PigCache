@@ -171,7 +171,13 @@ class PigCache_License {
 
 		$status = self::get_status();
 
-		return ! empty( $status['valid'] ) && ! empty( $status['plan'] ) && 'free' !== $status['plan'];
+		if ( empty( $status['valid'] ) ) {
+			return false;
+		}
+
+		$plan = isset( $status['plan'] ) ? (string) $status['plan'] : 'pro';
+
+		return '' !== $plan && 'free' !== $plan;
 	}
 
 	/**
@@ -374,10 +380,6 @@ class PigCache_License {
 	 * @return bool
 	 */
 	public static function can_use_tag_invalidation() {
-		if ( ! self::has_pro_distribution() ) {
-			return false;
-		}
-
 		return self::is_pro();
 	}
 
@@ -401,6 +403,7 @@ class PigCache_License {
 			return 'trial' === self::get_plan() ? 'trial' : 'pro';
 		}
 
-		return 'expired';
+		// Key set but plan is free — never had a trial, or it was never granted.
+		return 'free';
 	}
 }

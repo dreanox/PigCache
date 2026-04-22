@@ -23,12 +23,14 @@ defined( 'ABSPATH' ) || exit;
 
 class PigCache_Continuous_Learner {
 
-	const CRON_FLUSH       = 'pigcache_flush_query_stats';
-	const CRON_SEND        = 'pigcache_send_query_stats';
-	const REMOTE_CFG_KEY   = 'pigcache_learning_cfg';
-	const REMOTE_CFG_TTL   = 6 * HOUR_IN_SECONDS;
+	const CRON_FLUSH         = 'pigcache_flush_query_stats';
+	const CRON_SEND          = 'pigcache_send_query_stats';
+	const REMOTE_CFG_KEY     = 'pigcache_learning_cfg';
+	const REMOTE_CFG_TTL     = 6 * HOUR_IN_SECONDS;
 	const REMOTE_CFG_ERR_TTL = HOUR_IN_SECONDS;
-	const DEFAULT_RATE     = 0.10;
+	const DEFAULT_RATE       = 0.10;
+	const OPT_FLUSH_LAST     = 'pigcache_cron_flush_last';
+	const OPT_SEND_LAST      = 'pigcache_cron_send_last';
 
 	// Adaptive TTL tiers (ms → seconds)
 	const TTL_FAST   = 60;    // < 20 ms
@@ -128,9 +130,39 @@ class PigCache_Continuous_Learner {
 
 	// ── Cron ─────────────────────────────────────────────────────────────────
 
+	/**
+	 * Flush interval in minutes, configurable via PIGCACHE_FLUSH_INTERVAL in wp-config.php.
+	 * Clamped to 1–60. Defaults to 15.
+	 *
+	 * @return int
+	 */
+	public static function flush_interval_minutes(): int {
+		if ( defined( 'PIGCACHE_FLUSH_INTERVAL' ) ) {
+			return max( 1, min( 60, (int) PIGCACHE_FLUSH_INTERVAL ) );
+		}
+		return 15;
+	}
+
+	/**
+	 * Seconds after which a missing flush timestamp marks cron as not confirmed.
+	 * Grace period is 10 minutes on top of the configured interval.
+	 *
+	 * @return int
+	 */
+	public static function cron_confirm_ttl(): int {
+		return ( self::flush_interval_minutes() + 10 ) * MINUTE_IN_SECONDS;
+	}
+
 	public static function schedule() {
+		// Only register WP-Cron events when the fallback constant is explicitly set.
+		// Default setup uses a real server cron (cPanel) which calls wp-cron.php directly;
+		// registering WP events when a real cron is in place is harmless but unnecessary.
+		if ( ! self::using_wp_cron_fallback() ) {
+			return;
+		}
+
 		if ( ! wp_next_scheduled( self::CRON_FLUSH ) ) {
-			wp_schedule_event( time(), 'pigcache_15min', self::CRON_FLUSH );
+			wp_schedule_event( time(), 'pigcache_flush', self::CRON_FLUSH );
 		}
 
 		if ( ! wp_next_scheduled( self::CRON_SEND ) ) {
@@ -151,10 +183,42 @@ class PigCache_Continuous_Learner {
 	}
 
 	/**
+	 * Whether the cron pipeline is confirmed running (flush ran within CRON_CONFIRM_TTL).
+	 *
+	 * @return bool
+	 */
+	public static function is_cron_confirmed() {
+		// The standalone cron writes directly to MySQL without going through WordPress,
+		// so a persistent object cache (Redis/APCu) may hold a stale value. Delete the
+		// cache key to force a fresh DB read on every admin check.
+		//
+		// Two cache layers must be cleared:
+		//   1. The individual option key — stale value from a previous read.
+		//   2. 'notoptions' — WordPress records missing options here; if the option
+		//      didn't exist on the first get_option() call (before the cron ran),
+		//      this entry makes get_option() return 0 forever without hitting MySQL.
+		wp_cache_delete( self::OPT_FLUSH_LAST, 'options' );
+		wp_cache_delete( 'notoptions', 'options' );
+		$last = (int) get_option( self::OPT_FLUSH_LAST, 0 );
+		return $last > 0 && ( time() - $last ) < self::cron_confirm_ttl();
+	}
+
+	/**
+	 * Whether WP-Cron fallback is explicitly opted into via constant.
+	 *
+	 * @return bool
+	 */
+	public static function using_wp_cron_fallback() {
+		return defined( 'PIGCACHE_USE_WP_CRON' ) && PIGCACHE_USE_WP_CRON;
+	}
+
+	/**
 	 * Flush in-memory/APCu/Redis query buffer into MySQL.
 	 * Runs every 15 minutes.
 	 */
 	public static function cron_flush() {
+		update_option( self::OPT_FLUSH_LAST, time(), false );
+
 		$rows = PigCache_Query_Buffer::read_and_clear();
 
 		if ( empty( $rows ) ) {
@@ -172,6 +236,8 @@ class PigCache_Continuous_Learner {
 	 * Runs every hour.
 	 */
 	public static function cron_send() {
+		update_option( self::OPT_SEND_LAST, time(), false );
+
 		$rows = PigCache_Query_Stats::get_unsent( 200 );
 
 		if ( empty( $rows ) ) {
@@ -189,6 +255,10 @@ class PigCache_Continuous_Learner {
 	}
 
 	// ── Remote config ────────────────────────────────────────────────────────
+
+	public static function flush_config_cache() {
+		delete_transient( self::REMOTE_CFG_KEY );
+	}
 
 	/**
 	 * @return array{learning_enabled: bool, sample_rate: float, adaptive_ttl: bool}

@@ -660,6 +660,16 @@ redis-cli CONFIG SET save ""
 | `PIGCACHE_CLOUD_API_URL` | `https://api.pigcache.com/v1` | URL del backend |
 | `PIGCACHE_CLOUD_SYNC` | `true` (cuando es pro) | Habilitar/deshabilitar sync |
 
+### Continuous Learning (Pro)
+
+| Constante | Default | Descripción |
+|-----------|---------|-------------|
+| `PIGCACHE_CONTINUOUS_LEARNING` | _(desde API)_ | `true`/`false` para forzar on/off independientemente de la config remota |
+| `PIGCACHE_LEARNING_SAMPLE_RATE` | `0.10` | Fracción de requests que registran queries (0.0–1.0) |
+| `PIGCACHE_ADAPTIVE_TTL` | _(desde API)_ | `true` activa TTL adaptivo por tiempo de ejecución |
+| `PIGCACHE_FLUSH_INTERVAL` | `15` | Intervalo del cron en minutos (1–60). Cambia la frecuencia con que el cron standalone y WP-Cron vacían el buffer. Ver [intervalo del cron](#intervalo-del-cron). |
+| `PIGCACHE_USE_WP_CRON` | _(no definido)_ | Usar WP-Cron como fallback en lugar del cron standalone. No recomendado en producción. |
+
 ### Ejemplo wp-config.php — Sitio único
 
 ```php
@@ -736,6 +746,70 @@ add_filter( 'pigcache_sql_cache_is_cacheable', function( $cacheable, $sql ) {
 ---
 
 ## 11. CLI y herramientas externas
+
+### Cron standalone (`bin/pigcache-cron.php`)
+
+Script CLI que ejecuta el pipeline de analytics **sin cargar WordPress**.
+Lee `wp-config.php` por regex, conecta a MySQL directamente y usa `curl` para la API.
+
+#### Tareas que ejecuta (en orden)
+
+| # | Tarea | Condición |
+|---|-------|-----------|
+| 1 | Flush buffer APCu/Redis → `wp_pigcache_query_stats` | Siempre (salvo `--send-only` o `--cloud-only`) |
+| 2 | Enviar query stats pendientes → API | Siempre (salvo `--flush-only` o `--cloud-only`) |
+| 3 | **Cloud sync** — environment + fingerprints + profile | Siempre (salvo `--flush-only`, `--send-only`, o `--no-cloud`) |
+
+#### Tarea 3 — Cloud sync detallado
+
+1. **Environment** — lee plugins activos y tema de `wp_options`, versión WP de `wp-includes/version.php` → `POST /sites/{id}/environment`
+2. **Fingerprints** — vacía `wp_pigcache_sql_fingerprints` (unsynced) en batches de 500 → `POST /sites/{id}/fingerprints`; marca cada batch como `synced_at = NOW()`
+3. **Profile** — `GET /sites/{id}/profile`; si hay perfil compilado lo escribe en `wp-content/pigcache-sql-profile.php`
+
+Esta tarea es la que hace que los **templates de consulta se vean reflejados** sin necesidad de WP-Cron.
+
+#### Flags disponibles
+
+```
+--flush-only    Solo tarea 1. Útil para sites sin API key.
+--send-only     Solo tarea 2. Solo envío de stats.
+--cloud-only    Solo tarea 3 (cloud sync). Útil para diagnóstico.
+--no-cloud      Tareas 1 y 2, sin cloud sync.
+--wp-config /ruta/wp-config.php   Path explícito al wp-config.
+```
+
+#### Intervalo del cron
+
+El intervalo por defecto es **15 minutos**. Puedes cambiarlo con:
+
+```php
+// wp-config.php
+define( 'PIGCACHE_FLUSH_INTERVAL', 5 );  // minutos; rango válido: 1–60
+```
+
+- Afecta al schedule de WP-Cron (cuando `PIGCACHE_USE_WP_CRON` está activo).
+- Para el cron real de servidor (cPanel), ajusta también la expresión crontab para que coincida.
+- El panel de admin considera el cron "activo" si corrió en los últimos `PIGCACHE_FLUSH_INTERVAL + 10` minutos.
+
+**Ejemplo crontab cada 5 minutos:**
+```
+*/5 * * * *  /usr/local/bin/php -q /path/to/pigcache/bin/pigcache-cron.php \
+  > /dev/null 2>> /path/to/pigcache/logs/pigcache-cron.log
+```
+
+#### Diagnóstico con modo verbose (API)
+
+Para verificar qué perfil tiene el backend y qué templates contiene:
+
+```
+GET /api/v1/sites/{siteId}/profile?verbose=1
+```
+
+La respuesta incluye `debug.templates` con la lista de fingerprints, hits y template de cada query, y `debug.fingerprints_stored_in_db` vs `debug.fingerprints_in_profile` para detectar si el cron compiló el perfil correctamente.
+
+#### Por qué el admin no reconocía el cron
+
+El script standalone escribe directamente a MySQL sin pasar por WordPress. Si el site usa un object cache persistente (Redis o APCu), `get_option()` devolvía el valor cacheado anterior. La solución implementada es llamar `wp_cache_delete()` antes de cada `get_option()` en `is_cron_confirmed()` y en la lectura de timestamps del admin.
 
 ### Python analyzer
 

@@ -55,6 +55,19 @@ class PigCache_Cloud_Client {
 	}
 
 	/**
+	 * Perform a PATCH request.
+	 *
+	 * @param string $endpoint  Relative path.
+	 * @param array  $body      JSON body data.
+	 * @return array|WP_Error   Decoded JSON body or error.
+	 */
+	public static function patch( $endpoint, array $body = array() ) {
+		$url = self::build_url( $endpoint );
+
+		return self::request( 'PATCH', $url, $body );
+	}
+
+	/**
 	 * @param string $endpoint
 	 * @param array  $query
 	 * @return string
@@ -107,7 +120,7 @@ class PigCache_Cloud_Client {
 			'timeout' => self::TIMEOUT,
 		);
 
-		if ( null !== $body && 'POST' === $method ) {
+		if ( null !== $body && in_array( $method, array( 'POST', 'PATCH', 'PUT' ), true ) ) {
 			$args['body'] = wp_json_encode( $body );
 		}
 

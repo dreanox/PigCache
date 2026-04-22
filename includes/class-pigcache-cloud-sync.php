@@ -204,6 +204,7 @@ class PigCache_Cloud_Sync {
 	 * @return int Unix timestamp or 0.
 	 */
 	public static function last_sync() {
+		wp_cache_delete( self::OPTION_LAST, 'options' );
 		return (int) get_option( self::OPTION_LAST, 0 );
 	}
 

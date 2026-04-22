@@ -2,323 +2,282 @@
 
 ## What it is and how it loads
 
-The HTML cache captures the **complete rendered HTML of a page** before it is sent to the browser, stores it gzipped in Redis, and on subsequent requests serves it directly — bypassing PHP execution, WordPress boot, and MySQL entirely.
+The HTML cache captures the **complete rendered HTML of a page**, stores it in Redis, and on subsequent requests serves it directly — bypassing PHP execution, WordPress boot, and MySQL entirely.
 
-This is the **biggest single latency win**: a page that takes 820 ms to render (even with object cache warm) takes 2–5 ms when HTML-cached.
+This is the **biggest single latency win**: a page that takes 820 ms to render takes 2–5 ms when HTML-cached.
 
-### How the drop-in loads
+---
 
-When "HTML Cache" is enabled, PigCache:
+## Drop-in management (admin UI)
 
-1. Copies `includes/advanced-cache.php` → `wp-content/advanced-cache.php`
-2. Adds `define('WP_CACHE', true)` to `wp-config.php` (via `PigCache_Config::inject_wp_cache_constant()`)
+Unlike the other two drop-ins, `advanced-cache.php` has its own WordPress requirement (`WP_CACHE = true`). PigCache handles both from Settings → PigCache:
 
-WordPress core in `wp-settings.php` (line ~98):
-```php
-if ( WP_CACHE && file_exists( WP_CONTENT_DIR . '/advanced-cache.php' ) ) {
-    require WP_CONTENT_DIR . '/advanced-cache.php';
-}
+```
+Settings → PigCache → Full-page HTML cache (advanced-cache.php)
+  ├── Status table
+  │     ├── Status                  Active / Not installed / Installed (WP_CACHE not set)
+  │     ├── Drop-in valid (PigCache) ✓ / ✗
+  │     ├── WP_CACHE constant        true / not set
+  │     └── wp-content/advanced-cache.php   Present (PigCache) / Not installed
+  │
+  └── [Install HTML cache drop-in]   copies dropin + injects define('WP_CACHE', true)
+      [Remove PigCache advanced-cache.php]   removes file (does not touch wp-config.php)
 ```
 
-This executes **before** `$wpdb` is initialized, before plugins load, before `functions.php` runs. It is the earliest possible hook into WordPress execution.
+**Install flow** (`PigCache_Dropin_Html_Cache::install()`):
+1. Copies `pigcache/includes/dropin/advanced-cache.php` → `wp-content/advanced-cache.php`
+2. Calls `maybe_inject_wp_cache_constant()`:
+   - Reads wp-config.php (checked at `ABSPATH/wp-config.php` and `dirname(ABSPATH)/wp-config.php`)
+   - Inserts `define( 'WP_CACHE', true );` before the "That's all, stop editing!" marker
+   - Silently skips if the file is read-only or the constant is already defined
 
-`advanced-cache.php` bootstraps the minimum it needs:
-```php
-// wp-content/advanced-cache.php
-require_once WP_CONTENT_DIR . '/plugins/pigcache/includes/class-pigcache-config.php';
-require_once WP_CONTENT_DIR . '/plugins/pigcache/includes/class-pigcache-html-cache.php';
-require_once WP_CONTENT_DIR . '/plugins/pigcache/includes/object-cache.php'; // Redis connection
+If auto-injection fails, the admin shows a yellow warning with the exact line to add manually.
 
-PigCache_Html_Cache::serve();  // Either exits (HIT) or registers ob_start (MISS)
+**Deactivation:** `register_deactivation_hook` removes `advanced-cache.php` when the plugin is deactivated, consistent with the other drop-ins.
+
+---
+
+## WordPress loading order
+
+WordPress loads drop-ins in this exact sequence inside `wp-settings.php`:
+
+```
+1. wp-db.php + wp-content/db.php (database layer)
+2. wp_start_object_cache()        → wp-content/object-cache.php (Redis)
+3. if (WP_CACHE)                  → wp-content/advanced-cache.php  ← HTML cache
+4. require all plugins            → pigcache.php, theme functions.php, etc.
+```
+
+This means:
+- `advanced-cache.php` runs **after** `object-cache.php` — `wp_cache_get` is already available
+- `advanced-cache.php` runs **before** plugins — `is_admin()`, `is_user_logged_in()` etc. are NOT available
+- `advanced-cache.php` runs **before** `$wpdb` is usable for queries
+
+---
+
+## HIT path — serve from cache before WordPress boots
+
+```
+Browser GET /product/red-sneakers/
+    │
+    ├── wp-settings.php: wp_start_object_cache()
+    │       └── $wp_object_cache = new PigCache_Object_Cache()
+    │               └── $this->redis = new Redis(); connect(REDIS_HOST)
+    │
+    ├── wp-settings.php: require wp-content/advanced-cache.php
+    │       └── locate_and_require( 'class-pigcache-html-cache.php' )
+    │       └── PigCache_Html_Cache::serve_early()
+    │               │
+    │               ├── $_SERVER['REQUEST_METHOD'] === 'GET'              ✓
+    │               ├── No wordpress_logged_in_* cookie                    ✓
+    │               ├── No woocommerce_cart_hash cookie                    ✓
+    │               ├── URI does not contain /wp-admin/ or /wp-login.php   ✓
+    │               │
+    │               └── wp_cache_get( 'doc_b7e2a1f...', 'pigcache_html' )
+    │                       └── Redis GET wp:{blog}:pigcache_html:doc_b7e2a1f...
+    │                               HIT → [ 'html' => '<!DOCTYPE html>...', 'tags' => [...], 'time' => 1713000000 ]
+    │
+    ├── headers_sent() === false
+    ├── header('Content-Type: text/html; charset=UTF-8')
+    ├── header('X-PigCache: HIT')
+    ├── echo $pack['html']
+    └── exit()   ← PHP stops; WordPress never boots
+
+[TTFB: 3–5 ms]
 ```
 
 ---
 
-## Full request lifecycle
-
-### HIT path (fast path)
+## MISS path — WordPress renders and stores
 
 ```
-WordPress core: wp-settings.php
-  └── require 'wp-content/advanced-cache.php'
-        └── PigCache_Html_Cache::serve()
-              └── PigCache_Html_Cache::is_cacheable_request()
-                    // Checks: not POST, not admin, no session cookie, not excluded URL
-                    → true
+PigCache_Html_Cache::serve_early()
+    └── wp_cache_get( ... ) → false   MISS, return
 
-              └── PigCache_Html_Cache::build_cache_key()
-                    // Normalizes URL: strips tracking params (?utm_*), trailing slash
-                    // Key: md5( site_url + normalized_path + accept_encoding )
-                    // e.g. 'pc_html:b7e2a1f3c9d8e6a2'
-                    → 'b7e2a1f3c9d8e6a2'
+WordPress continues booting
+    ├── db.php loaded earlier → $wpdb = new PigCache_WPDB(...)
+    └── all plugins + theme load normally
 
-              └── wp_cache_get( 'b7e2a1f3c9d8e6a2', 'pc_html' )
-                    // PigCache_Object_Cache::get() → Redis GET wp:1:pc_html:b7e2a1f3c9d8e6a2
-                    → [ 'body' => <gzipped_html>, 'headers' => [...], 'status' => 200 ]
+pigcache.php → PigCache_Plugin::instance()
+    └── PigCache_Html_Cache::init()
+            └── add_action('template_redirect', [self, 'maybe_start_buffer'], 0)
 
-              └── PigCache_Html_Cache::send_cached_response( $entry )
-                    status_header( $entry['status'] )
-                    header( 'Content-Encoding: gzip' )
-                    header( 'Content-Type: text/html; charset=UTF-8' )
-                    header( 'ETag: "b7e2a1f3c9d8e6a2"' )
-                    header( 'X-PigCache: HIT' )
-                    echo $entry['body']    ← raw bytes from Redis
+template_redirect fires
+    └── PigCache_Html_Cache::maybe_start_buffer()
+            ├── should_cache_request()
+            │       ├── is_user_logged_in()                  → false ✓
+            │       ├── is_admin() / wp_doing_ajax() / etc.  → false ✓
+            │       ├── REQUEST_METHOD === 'GET'              → true  ✓
+            │       └── wp_using_ext_object_cache()          → true  ✓
+            │
+            ├── (Pro) PigCache_Tag_Collector::start()
+            │       └── add_action('the_post', ...)
+            │           add_action('get_term', ...)
+            │
+            └── ob_start( [self, 'ob_callback'] )
 
-              └── exit()   ← PHP process ends here
-                            WordPress never boots
-                            $wpdb never instantiated
-                            No plugins load
-                            No theme runs
-```
+WordPress renders template (all DB queries, theme loops, widget output...)
 
-**TTFB: 2–5 ms** (Redis socket roundtrip + network)
+ob_callback( $html )
+    ├── PigCache_Tag_Collector::stop()  → ['post:88', 'term:14', 'product:88']
+    │
+    ├── $key  = 'doc_' . md5( HTTP_HOST . REQUEST_URI )
+    ├── $pack = [ 'html' => $html, 'tags' => $tags, 'time' => time() ]
+    ├── wp_cache_set( $key, $pack, 'pigcache_html', $ttl )
+    │       └── Redis SET wp:{blog}:pigcache_html:doc_b7e2a1f... EX 3600
+    │
+    ├── (Pro) PigCache_Tag_Index::store_tags( $key, 'pigcache_html', $tags )
+    │       └── INSERT INTO wp_pigcache_tags (cache_key, grp, tag) VALUES (...)
+    │
+    └── return $html  ← original HTML sent to browser as normal
 
----
-
-### MISS path (first request, cache population)
-
-```
-PigCache_Html_Cache::serve()
-  └── wp_cache_get( 'b7e2a1f...', 'pc_html' ) → false
-
-  └── PigCache_Html_Cache::acquire_stampede_lock( 'b7e2a1f...' )
-        // Redis SET pc_lock:b7e2a1f... 1 NX EX 30
-        // NX = only set if not exists → only first visitor wins the lock
-        → true (lock acquired) or false (another process is rendering)
-
-        If false (concurrent request, lock held):
-          PigCache_Html_Cache::wait_for_cache( 'b7e2a1f...', $retries = 6, $sleep_ms = 100 )
-          // Polls wp_cache_get every 100 ms up to 600 ms
-          // If another process populates cache → send_cached_response()
-          // If timeout → continue without lock (renders the page, does not store)
-
-// WordPress continues booting normally...
-// All plugins load, theme renders, $wpdb runs queries...
-
-add_action( 'template_redirect', [ 'PigCache_Html_Cache', 'start_buffer' ], 0 );
-// Priority 0 = before any other plugin's output buffering
-
-PigCache_Html_Cache::start_buffer()
-  └── ob_start( [ 'PigCache_Html_Cache', 'buffer_callback' ] )
-        // Captures ALL output from this point: HTML, whitespace, errors
-
-// ... WordPress renders the full page ...
-
-PigCache_Html_Cache::buffer_callback( $html )    ← called by PHP on ob_end_flush / exit
-  └── PigCache_Html_Cache::should_cache( $html )
-        // Checks: HTTP status = 200, Content-Type = text/html,
-        //         HTML length > 100 bytes, no 'pigcache:no-cache' marker,
-        //         no Set-Cookie header with session data
-        → true
-
-  └── $compressed = gzencode( $html, 6 )
-        // Level 6 = good ratio, fast enough (< 2 ms for a 50 KB page)
-
-  └── $entry = [
-        'body'    => $compressed,
-        'headers' => PigCache_Html_Cache::collect_headers(),
-        //           Captures Content-Type, Last-Modified, Link (preload hints)
-        'created' => time(),
-        'status'  => http_response_code(),
-      ]
-
-  └── wp_cache_set( 'b7e2a1f...', $entry, 'pc_html', PIGCACHE_HTML_TTL )
-        // PigCache_Object_Cache::set() → Redis SET wp:1:pc_html:b7e2a1f... EX 3600
-
-  └── (Pro) PigCache_Tag_Index::link_all( PigCache_Tag_Collector::get_tags(), 'pc_html:b7e2a1f...' )
-        // Stores: Redis SADD pc_tagidx:post:88      'pc_html:b7e2a1f...'
-        //         Redis SADD pc_tagidx:term:14      'pc_html:b7e2a1f...'
-        //         Redis SADD pc_tagidx:product:88   'pc_html:b7e2a1f...'
-
-  └── PigCache_Html_Cache::release_stampede_lock( 'b7e2a1f...' )
-        // Redis DEL pc_lock:b7e2a1f...
-
-  └── return $html  ← original uncompressed HTML sent to browser as normal
+[TTFB: 820 ms — first visitor pays the render cost]
 ```
 
 ---
 
-## What gets cached (and what doesn't)
+## Early-serve checks vs. template_redirect checks
 
-`PigCache_Html_Cache::is_cacheable_request()` runs on every request before checking Redis. It returns `false` (skip cache entirely) when:
+`serve_early()` and `should_cache_request()` both protect against serving stale or sensitive content, but at different stages with different tools available:
 
-| Condition | How detected |
+| Check | `serve_early()` (before WP boots) | `should_cache_request()` (template_redirect) |
+|---|---|---|
+| HTTP method | `$_SERVER['REQUEST_METHOD']` | `$_SERVER['REQUEST_METHOD']` |
+| Logged-in user | `wordpress_logged_in_*` cookie name | `is_user_logged_in()` |
+| Admin URL | String match on `$_SERVER['REQUEST_URI']` | `is_admin()` |
+| WooCommerce cart | `woocommerce_cart_hash` cookie | `is_cart()` / `is_checkout()` |
+| AJAX / REST | Not checked (those set `DOING_AJAX` after boot) | `wp_doing_ajax()`, `REST_REQUEST` constant |
+| Preview | Not checked | `is_preview()` |
+| Custom filter | Not available | `apply_filters('pigcache_skip_html_cache', false)` |
+
+The two checks are complementary: `serve_early()` is intentionally conservative (fewer checks) because it runs before WordPress, and `should_cache_request()` is the authoritative gate for **storing** new entries.
+
+---
+
+## What gets cached (storage gate)
+
+`should_cache_request()` returns `false` (do not store) when:
+
+| Condition | Mechanism |
 |---|---|
-| POST request | `$_SERVER['REQUEST_METHOD'] === 'POST'` |
-| WordPress admin | `is_admin()` or `/wp-admin/` in path |
-| Logged-in user | Cookie named `wordpress_logged_in_*` exists |
-| WooCommerce cart | Cookie `woocommerce_items_in_cart` exists with value > 0 |
-| REST API | Path starts with `/wp-json/` |
-| XML-RPC | Path is `/xmlrpc.php` |
-| Excluded URL pattern | Matches any pattern in `PIGCACHE_HTML_EXCLUDE` constant |
-| Query string (by default) | `$_SERVER['QUERY_STRING']` is non-empty (configurable) |
-
-`PigCache_Html_Cache::should_cache( $html )` runs after rendering to decide whether to **store**. It returns `false` when:
-- HTTP response code is not 200 (404, 301, 500, etc.)
-- Response contains `Set-Cookie` with a session or nonce value
-- HTML body is shorter than a minimum length (prevents caching error pages)
-- Another plugin set `header('Cache-Control: no-store')` or `header('Cache-Control: private')`
-- HTML body contains the marker comment `<!-- pigcache:no-cache -->`
+| Logged-in user | `is_user_logged_in()` |
+| POST request | `$_SERVER['REQUEST_METHOD']` |
+| Admin / AJAX / cron | `is_admin()`, `wp_doing_ajax()`, `wp_doing_cron()` |
+| REST API | `defined('REST_REQUEST') && REST_REQUEST` |
+| POST body not empty | `$_POST` not empty |
+| Preview mode | `is_preview()` |
+| WooCommerce cart/checkout/account | `is_cart()`, `is_checkout()`, `is_account_page()` |
+| Custom exclusion | `apply_filters('pigcache_skip_html_cache', false)` |
+| No external object cache | `wp_using_ext_object_cache()` returns false |
 
 ---
 
-## Example A — Blog homepage
-
-**Site:** news blog, 6 posts per page, sidebar with recent posts widget.
+## Example A — Blog homepage (first visitor vs. warm cache)
 
 ```
-First visitor:
-  GET / HTTP/1.1
-  advanced-cache.php → PigCache_Html_Cache::serve() → cache MISS
-  WordPress boots → 34 DB queries (options, posts, meta, author, terms, widgets)
-  Theme renders → 780 ms total
-  PigCache_Html_Cache::buffer_callback() → gzencode(html, 6) → 18 KB
-  Redis SET wp:1:pc_html:a3f8... <18KB> EX 3600
-  Response sent to browser.
+Request 1:
+  serve_early() → wp_cache_get → MISS → WordPress boots
+  Theme renders 34 queries, 780 ms total
+  ob_callback stores HTML in Redis (key: doc_a3f8..., TTL 3600 s)
+  Browser gets full HTML: 780 ms TTFB
 
-Visitor 2, 3, 4 … N (within the hour):
-  GET / HTTP/1.1
-  advanced-cache.php → Redis GET wp:1:pc_html:a3f8... → 18 KB gzip
+Requests 2 – N (within the hour):
+  serve_early() → wp_cache_get → HIT
   header('X-PigCache: HIT')
-  echo <18 KB>
+  echo $pack['html']
   exit()
   TTFB: 4 ms
 ```
-
-The Redis key holds the entire entry serialized: body (gzipped HTML) + saved headers + timestamp. When the browser sends `Accept-Encoding: gzip`, PigCache serves the compressed bytes directly. No decompression/recompression cycle.
 
 ---
 
 ## Example B — WooCommerce product page
 
-**Site:** shop with 5 000 products. Product URL: `/product/red-sneakers/`
-
 ```
 Cold cache:
-  PigCache_Html_Cache::build_cache_key()
-    → md5('https://shop.example.com/product/red-sneakers/') = 'b7e2a1f...'
-  Redis GET → (nil)  MISS
+  wp_cache_get('doc_b7e2a1f...', 'pigcache_html') → nil
+  WordPress boots → 48 queries, 820 ms
+  ob_callback → wp_cache_set(... EX 3600)
 
-  WordPress renders: 48 queries, 820 ms
-    - WC_Product::get() → 12 meta queries
-    - get_terms() for attributes → 8 term queries
-    - wp_nav_menu() → 6 join queries
-    - Related products WP_Query → 10 queries
-    - ...
-
-  gzencode(~85KB HTML, 6) → 22 KB
-  Redis SET EX 3600
-
-Warm cache (all subsequent visitors):
-  Redis GET → 22 KB gzip → exit()
-  TTFB: 3 ms (vs 820 ms)
-  Saving: 817 ms / request / visitor
+Warm cache:
+  serve_early() → HIT → exit()   3 ms TTFB
+  MySQL: 0 queries
+  PHP: ~2 ms (Redis connection already open from object-cache.php)
 ```
 
 ---
 
-## Example C — Stampede protection on a viral post
-
-A link goes viral. 2 000 visitors hit `/article/breaking-news/` simultaneously on a cold cache.
-
-**Without stampede lock:** 2 000 PHP-FPM workers spawn, each runs 34 queries, MySQL is overwhelmed, server OOMs.
-
-**With `PigCache_Html_Cache::acquire_stampede_lock()`:**
+## Example C — Logged-in editor visits a cached page
 
 ```
-Redis SET pc_lock:f4a9... 1 NX EX 30
-  → Worker #1: NX succeeds → lock acquired → renders page → stores in Redis → releases lock
-  → Workers #2–2000: NX fails → enters PigCache_Html_Cache::wait_for_cache()
-        for ($i = 0; $i < 6; $i++) {
-            usleep(100_000);  // 100 ms
-            $entry = wp_cache_get('f4a9...', 'pc_html');
-            if ($entry) { self::send_cached_response($entry); exit(); }
-        }
+Editor logs in → browser holds wordpress_logged_in_abc123 cookie
+
+GET /product/red-sneakers/
+  serve_early():
+    foreach array_keys($_COOKIE) as $name:
+      strncmp($name, 'wordpress_logged_in_', 20) === 0  → true → return
+
+  WordPress boots normally (no serve_early exit)
+  template_redirect → should_cache_request() → is_user_logged_in() → true → return (no ob_start)
+
+  Page renders from scratch every request for logged-in users.
+  Cache is neither read nor written.
 ```
 
-Worker #1 finishes in ~600 ms. Workers #2–2000 poll every 100 ms; by the 6th poll they all get the cached entry and exit in 3 ms. MySQL handles 1 render instead of 2 000.
+This is correct: logged-in users see live content (draft posts, admin bars, nonces) and their requests never poison the public cache.
 
 ---
 
-## Invalidation: Free vs Pro
+## Invalidation: Free vs. Pro
 
-Invalidation is handled by `PigCache_Invalidation` (`includes/class-pigcache-invalidation.php`), which hooks into WordPress core events:
-
-```php
-// PigCache_Invalidation::init()
-add_action( 'save_post',        [ __CLASS__, 'on_save_post' ] );
-add_action( 'deleted_post',     [ __CLASS__, 'on_delete_post' ] );
-add_action( 'updated_postmeta', [ __CLASS__, 'on_post_meta_updated' ], 10, 3 );
-add_action( 'edited_term',      [ __CLASS__, 'on_term_edited' ], 10, 3 );
-add_action( 'comment_approved_to_spam', [ __CLASS__, 'on_comment_status' ], 10, 2 );
-add_action( 'wp_update_nav_menu', [ __CLASS__, 'on_nav_menu_updated' ] );
-```
-
-### Free — `PigCache_Invalidation::global_flush()`
+### Free — global flush on any content change
 
 ```php
-private static function global_flush() {
-    PigCache_Html_Cache::flush_all();    // wp_cache_flush_group('pc_html')
-    PigCache_Fragments::flush_all();     // wp_cache_flush_group('pc_frag')
-}
+// PigCache_Invalidation::on_save_post() → global_flush()
+PigCache_Html_Cache::flush_all();
+// wp_cache_flush_group('pigcache_html')
+// Increments the group version counter in Redis
+// All existing doc_* keys become unreachable instantly
 ```
 
-`wp_cache_flush_group('pc_html')` increments the `pc_html` group version counter in Redis. All existing HTML cache keys become unreachable. They expire naturally (TTL). No `SCAN` or `DEL` loop needed.
+Every cached page is invalidated when any post/term/menu is saved.
 
-**Effect:** Every cached page (potentially thousands) is invalidated on any content save.
+### Pro — tag-based selective invalidation
 
-### Pro — `PigCache_Invalidation::purge_by_tags()`
-
-```php
-// PigCache_Invalidation::on_save_post( $post_id, $post )
-private static function purge_by_tags( array $tags ) {
-    // PigCache_Tag_Index::purge_by_tags()
-    foreach ( $tags as $tag ) {
-        $members = wp_cache_get( $tag, 'pc_tagidx' );
-        // Redis GET wp:1:pc_tagidx:{tag}  → ['pc_html:b7e2a1f...', 'pc_frag:product_attrs_88:...']
-        if ( ! $members ) continue;
-        foreach ( $members as $cache_key ) {
-            // Parse group and key from the stored string, then:
-            wp_cache_delete( $parsed_key, $parsed_group );
-            // Redis DEL wp:1:{group}:{key}
-        }
-        wp_cache_delete( $tag, 'pc_tagidx' );  // Clean up the tag index entry
-    }
-}
+```
+Post #88 saved → PigCache_Invalidation::on_save_post()
+  purge_by_tags(['post:88', 'product:88'])
+    PigCache_Tag_Index::purge_by_tags(...)
+      SELECT cache_key FROM wp_pigcache_tags WHERE tag IN ('post:88','product:88')
+      → ['pigcache_html:doc_b7e2a1f...']
+      wp_cache_delete('doc_b7e2a1f...', 'pigcache_html')
+      DELETE FROM wp_pigcache_tags WHERE cache_key = 'doc_b7e2a1f...'
 ```
 
-**Effect:** Only pages that contained `post:88` in their tag set are dropped. 4 999 other product pages remain cached.
-
-| WordPress event | Tag purged (Pro) | Result |
-|---|---|---|
-| Post #88 saved | `post:88`, `product:88` | Only /product/red-sneakers/ dropped |
-| Term #14 edited | `term:14` | Only pages showing category #14 dropped |
-| Comment on post #88 approved | `post:88` | Only post #88 page dropped |
-| Menu updated | `nav_menu` | Only pages with cached nav menu fragment dropped |
+4,999 other product pages remain cached. Only `/product/red-sneakers/` is dropped.
 
 ---
 
-## Useful constants (in `wp-config.php`)
+## Verifying the drop-in is active
 
-```php
-// Exclude these URL patterns from HTML caching
-define( 'PIGCACHE_HTML_EXCLUDE', [
-    '/checkout/',
-    '/my-account/',
-    '/cart/',
-    '/api/',
-    '/wp-json/',
-] );
-
-// Cache TTL in seconds (default: 3600)
-define( 'PIGCACHE_HTML_TTL', 7200 );
-
-// Cache pages with query strings (default: false)
-// Useful for pages where ?lang= or ?currency= changes content
-define( 'PIGCACHE_HTML_CACHE_QUERY_STRINGS', false );
-
-// Vary cache by cookie (e.g. currency selector)
-define( 'PIGCACHE_HTML_VARY_COOKIES', ['store_currency'] );
+From the browser dev tools:
+```
+Response headers:
+  X-PigCache: HIT        ← served from cache
+  X-PigCache: (absent)   ← WordPress rendered the page (miss or excluded)
 ```
 
-When `PIGCACHE_HTML_VARY_COOKIES` is set, `PigCache_Html_Cache::build_cache_key()` appends the cookie value to the hash input — each currency gets its own cache entry.
+From wp-admin → Settings → PigCache:
+- Status row shows **Active**
+- WP_CACHE constant row shows **true**
+
+From the CLI:
+```bash
+# Check that the file is ours
+head -3 wp-content/advanced-cache.php
+# Should include: PigCache HTML Cache drop-in
+
+# Check WP_CACHE is defined in wp-config.php
+grep -i WP_CACHE wp-config.php
+# Should show: define( 'WP_CACHE', true );
+```
