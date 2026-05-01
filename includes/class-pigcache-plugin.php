@@ -26,8 +26,6 @@ class PigCache_Plugin {
 	}
 
 	private function __construct() {
-		load_plugin_textdomain( 'pigcache', false, dirname( plugin_basename( PIGCACHE_FILE ) ) . '/languages' );
-
 		PigCache_Sql_Cache::init();
 		if ( class_exists( 'PigCache_Sql_Profiler', false ) ) {
 			PigCache_Sql_Profiler::init();
@@ -37,6 +35,9 @@ class PigCache_Plugin {
 
 		if ( is_admin() ) {
 			PigCache_Admin::init();
+			if ( class_exists( 'PigCache_Admin_Pro', false ) ) {
+				PigCache_Admin_Pro::init();
+			}
 			PigCache_Metrics::init();
 			add_action( 'admin_notices', array( $this, 'maybe_notice_standalone_redis_plugin' ) );
 		}

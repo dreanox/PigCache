@@ -347,7 +347,7 @@ class PigCache_Metrics {
 		echo '<p><strong>' . esc_html__( 'SCAN pattern', 'pigcache' ) . ':</strong> <code>' . esc_html( $pattern ) . '</code> · ';
 		echo '<a href="' . esc_url( $refresh_url ) . '">' . esc_html__( 'Refresh key list', 'pigcache' ) . '</a>';
 		if ( $truncated ) {
-			echo ' — <em>' . esc_html__( 'List capped; refine WP_REDIS_PREFIX or flush old keys.', 'pigcache' ) . '</em>';
+			echo ' — <em>' . esc_html__( 'List capped; refine PIGCACHE_REDIS_PREFIX or flush old keys.', 'pigcache' ) . '</em>';
 		}
 		echo '</p>';
 
@@ -414,8 +414,8 @@ class PigCache_Metrics {
 			}
 		}
 
-		if ( defined( 'WP_REDIS_PREFIX' ) && WP_REDIS_PREFIX !== '' ) {
-			return trim( (string) WP_REDIS_PREFIX ) . '*';
+		if ( defined( 'PIGCACHE_REDIS_PREFIX' ) && PIGCACHE_REDIS_PREFIX !== '' ) {
+			return trim( (string) PIGCACHE_REDIS_PREFIX ) . '*';
 		}
 
 		return '*';

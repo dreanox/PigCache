@@ -364,23 +364,19 @@ class PigCache_License {
 	 * @return bool
 	 */
 	public static function can_use_profiler() {
-		if ( ! self::has_pro_distribution() ) {
-			return false;
-		}
-
-		return self::is_pro();
+		return self::has_pro_distribution();
 	}
 
 	/**
 	 * Whether tag-based selective invalidation is available.
 	 *
-	 * Free tier uses a global flush on any content change. Pro and trial
-	 * get per-tag purging so only the affected pages are evicted.
+	 * Returns true only in the Pro build, where PigCache_Tag_Index is present.
+	 * The Free build omits that class entirely and falls back to global flush.
 	 *
 	 * @return bool
 	 */
 	public static function can_use_tag_invalidation() {
-		return self::is_pro();
+		return class_exists( 'PigCache_Tag_Index', false );
 	}
 
 	/**

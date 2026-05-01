@@ -70,8 +70,8 @@ class PigCache_Dropin_Object_Cache {
 	public static function status_label() {
 		global $wp_object_cache;
 
-		if ( defined( 'WP_REDIS_DISABLED' ) && WP_REDIS_DISABLED ) {
-			return __( 'Disabled (WP_REDIS_DISABLED)', 'pigcache' );
+		if ( defined( 'PIGCACHE_REDIS_DISABLED' ) && PIGCACHE_REDIS_DISABLED ) {
+			return __( 'Disabled (PIGCACHE_REDIS_DISABLED)', 'pigcache' );
 		}
 
 		if ( ! self::dropin_exists() ) {

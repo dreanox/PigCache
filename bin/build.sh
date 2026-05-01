@@ -32,6 +32,25 @@ if [[ -z "${VERSION}" ]]; then
   exit 1
 fi
 
+echo ""
+echo "PigCache ${VERSION} — pre-build checklist"
+echo ""
+echo "  Before exporting, confirm that the version has been updated in:"
+echo "    1. pigcache.php      → Plugin header  (Version: x.x.x)"
+echo "    2. pigcache.php      → PIGCACHE_VERSION constant"
+echo "    3. readme.txt        → Stable tag"
+echo "    4. readme.txt        → Changelog entry"
+echo ""
+read -r -p "  Have you updated the version in all of the above? [Y/n] " _confirm
+case "${_confirm}" in
+  [Yy]|"") ;;
+  *)
+    echo ""
+    echo "  Build cancelled. Update the version and run again."
+    exit 1
+    ;;
+esac
+echo ""
 echo "PigCache ${VERSION} — building..."
 
 mkdir -p "${DIST_DIR}"
@@ -50,6 +69,9 @@ PRO_ONLY_FILES=(
   "includes/class-pigcache-query-buffer.php"
   "includes/class-pigcache-query-stats.php"
   "includes/class-pigcache-continuous-learner.php"
+  "includes/class-pigcache-admin-pro.php"
+  "includes/class-pigcache-tag-index.php"
+  "includes/class-pigcache-tag-collector.php"
 )
 
 # -----------------------------------------------------------------------
@@ -58,7 +80,8 @@ PRO_ONLY_FILES=(
 # -----------------------------------------------------------------------
 build_zip() {
   local label="$1"
-  local zip_name="pigcache-${label}-${VERSION}.zip"
+  local zip_name="pigcache-${VERSION}.zip"
+  [[ "${label}" == "pro" ]] && zip_name="pigcache-pro-${VERSION}.zip"
   local staging_root="${DIST_DIR}/.staging-${label}"
   local staging="${staging_root}/pigcache"
 

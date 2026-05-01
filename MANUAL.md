@@ -44,7 +44,7 @@ HTML cache, SQL cache (con profiler) y fragmentos.
 |---------|-------------|
 | **PhpRedis** | Automático si la extensión `redis` está cargada (recomendado). |
 | **Predis** | Incluido en `vendor/`. Se usa si PhpRedis no está disponible. |
-| **Relay** | Soportado vía constante `WP_REDIS_CLIENT`. |
+| **Relay** | Soportado vía constante `PIGCACHE_REDIS_CLIENT`. |
 
 ---
 
@@ -491,23 +491,23 @@ El dashboard muestra de un vistazo:
 
 | Constante | Default | Descripción |
 |-----------|---------|-------------|
-| `WP_REDIS_HOST` | `127.0.0.1` | Host Redis |
-| `WP_REDIS_PORT` | `6379` | Puerto |
-| `WP_REDIS_DATABASE` | `0` | DB lógica (ver nota abajo) |
-| `WP_REDIS_PASSWORD` | _(vacío)_ | Password |
-| `WP_REDIS_PREFIX` | _(auto: `md5(DB_NAME\|table_prefix)`)_ | Prefijo para keys Redis. Se auto-genera si no se define. |
-| `WP_REDIS_SELECTIVE_FLUSH` | _(auto: `true` si hay prefix)_ | Solo borrar keys con el prefijo del sitio al hacer flush. Se activa automáticamente cuando hay un prefix. |
-| `WP_REDIS_CLIENT` | _(auto)_ | Forzar: `phpredis`, `predis`, `relay` |
-| `WP_REDIS_TIMEOUT` | `1` | Timeout de conexión TCP en segundos. Aumentar en redes con latencia alta. |
-| `WP_REDIS_READ_TIMEOUT` | `1` | Timeout de lectura de socket en segundos. Si Redis tarda más de este tiempo en responder (p. ej. durante un `BGSAVE` en servidores con mucha RAM), phpredis lanza "read error on connection". **Recomendado: `3` en sitios de alto tráfico.** |
+| `PIGCACHE_REDIS_HOST` | `127.0.0.1` | Host Redis |
+| `PIGCACHE_REDIS_PORT` | `6379` | Puerto |
+| `PIGCACHE_REDIS_DATABASE` | `0` | DB lógica (ver nota abajo) |
+| `PIGCACHE_REDIS_PASSWORD` | _(vacío)_ | Password |
+| `PIGCACHE_REDIS_PREFIX` | _(auto: `md5(DB_NAME\|table_prefix)`)_ | Prefijo para keys Redis. Se auto-genera si no se define. |
+| `PIGCACHE_REDIS_SELECTIVE_FLUSH` | _(auto: `true` si hay prefix)_ | Solo borrar keys con el prefijo del sitio al hacer flush. Se activa automáticamente cuando hay un prefix. |
+| `PIGCACHE_REDIS_CLIENT` | _(auto)_ | Forzar: `phpredis`, `predis`, `relay` |
+| `PIGCACHE_REDIS_TIMEOUT` | `1` | Timeout de conexión TCP en segundos. Aumentar en redes con latencia alta. |
+| `PIGCACHE_REDIS_READ_TIMEOUT` | `1` | Timeout de lectura de socket en segundos. Si Redis tarda más de este tiempo en responder (p. ej. durante un `BGSAVE` en servidores con mucha RAM), phpredis lanza "read error on connection". **Recomendado: `3` en sitios de alto tráfico.** |
 
-> **Auto-prefix:** Si no defines `WP_REDIS_PREFIX`, `WP_CACHE_KEY_SALT`,
+> **Auto-prefix:** Si no defines `PIGCACHE_REDIS_PREFIX`, `WP_CACHE_KEY_SALT`,
 > ni estás en Cloudways, PigCache genera un hash de 8 caracteres a partir
 > de `DB_NAME` y `$table_prefix`. Esto garantiza que dos sitios con bases
 > de datos diferentes nunca colisionen en Redis, incluso si comparten la
 > misma instancia y la misma DB lógica.
 
-> **Nota sobre `WP_REDIS_DATABASE`:** Muchos hostings compartidos usan
+> **Nota sobre `PIGCACHE_REDIS_DATABASE`:** Muchos hostings compartidos usan
 > proxies Redis (Twemproxy, Redis Cluster, servicios single-DB) que
 > **ignoran el comando `SELECT`** silenciosamente. No confíes solo en
 > esta constante para aislar sitios. El auto-prefix es la forma segura.
@@ -527,12 +527,12 @@ solo se borran las claves de ese sitio.
 
 ```php
 // wp-config.php — Sitio 1 (tienda.ejemplo.com)
-define( 'WP_REDIS_HOST', '127.0.0.1' );
-define( 'WP_REDIS_PREFIX', 'tienda:' );
+define( 'PIGCACHE_REDIS_HOST', '127.0.0.1' );
+define( 'PIGCACHE_REDIS_PREFIX', 'tienda:' );
 
 // wp-config.php — Sitio 2 (blog.ejemplo.com)
-define( 'WP_REDIS_HOST', '127.0.0.1' );
-define( 'WP_REDIS_PREFIX', 'blog:' );
+define( 'PIGCACHE_REDIS_HOST', '127.0.0.1' );
+define( 'PIGCACHE_REDIS_PREFIX', 'blog:' );
 ```
 
 **Con DB lógicas separadas** (se puede combinar con prefix):
@@ -541,7 +541,7 @@ define( 'WP_REDIS_PREFIX', 'blog:' );
 // wp-config.php — Sitio 1 (usa DB 0 por defecto)
 
 // wp-config.php — Sitio 2
-define( 'WP_REDIS_DATABASE', 7 );
+define( 'PIGCACHE_REDIS_DATABASE', 7 );
 ```
 
 **Qué pasa con el flush:**
@@ -551,7 +551,7 @@ define( 'WP_REDIS_DATABASE', 7 );
 | Con prefix (auto o manual) | Solo keys del sitio actual (selective flush) |
 | Sin prefix + sin selective flush | `FLUSHDB` — borra **todas** las keys del DB lógica actual |
 
-Por eso PigCache activa `WP_REDIS_SELECTIVE_FLUSH` automáticamente
+Por eso PigCache activa `PIGCACHE_REDIS_SELECTIVE_FLUSH` automáticamente
 cuando hay un prefix activo.
 
 ### Resiliencia — fallback y circuit breaker
@@ -562,8 +562,8 @@ visitantes. El sitio sigue funcionando con MySQL; simplemente no hay caché esa 
 
 | Constante | Default | Descripción |
 |-----------|---------|-------------|
-| `WP_REDIS_GRACEFUL` | `true` | **`true`** (default): si Redis falla, PigCache cae en fallback silencioso — el object cache usa solo la memoria PHP de la request, el SQL cache hace miss, el HTML cache se salta. Los visitantes no ven ningún error. **`false`**: muestra la pantalla de error "Error establishing a Redis connection" y detiene la carga de WordPress hasta que Redis vuelva. Solo útil para depuración. |
-| `PIGCACHE_REDIS_RETRY_INTERVAL` | `30` | Segundos que el circuit breaker mantiene Redis "desconectado" tras un fallo. Durante este intervalo **ninguna** request intenta conectarse a Redis (evita acumular N × `WP_REDIS_READ_TIMEOUT` de latencia extra durante una caída). Transcurrido el intervalo, una sola request "sonda" la conexión; si tiene éxito el circuit se cierra automáticamente. |
+| `PIGCACHE_REDIS_GRACEFUL` | `true` | **`true`** (default): si Redis falla, PigCache cae en fallback silencioso — el object cache usa solo la memoria PHP de la request, el SQL cache hace miss, el HTML cache se salta. Los visitantes no ven ningún error. **`false`**: muestra la pantalla de error "Error establishing a Redis connection" y detiene la carga de WordPress hasta que Redis vuelva. Solo útil para depuración. |
+| `PIGCACHE_REDIS_RETRY_INTERVAL` | `30` | Segundos que el circuit breaker mantiene Redis "desconectado" tras un fallo. Durante este intervalo **ninguna** request intenta conectarse a Redis (evita acumular N × `PIGCACHE_REDIS_READ_TIMEOUT` de latencia extra durante una caída). Transcurrido el intervalo, una sola request "sonda" la conexión; si tiene éxito el circuit se cierra automáticamente. |
 
 #### Cómo funciona el circuit breaker
 
@@ -589,11 +589,11 @@ Request (tras 30 s) → detecta flag, ve que tiene ≥ 30 s → borra flag
 
 // Dar a Redis 3 s para responder — previene "read error" durante BGSAVE
 // en instancias con mucha RAM (854 MB+, 1 GB+).
-define( 'WP_REDIS_READ_TIMEOUT', 3 );
+define( 'PIGCACHE_REDIS_READ_TIMEOUT', 3 );
 
 // Fallback silencioso activado por defecto (no necesitas esta línea
 // a menos que quieras DESACTIVARLO para depuración):
-// define( 'WP_REDIS_GRACEFUL', false );
+// define( 'PIGCACHE_REDIS_GRACEFUL', false );
 
 // Extender la ventana del circuit breaker a 60 s en entornos donde
 // los reinicios de Redis tardan más de 30 s:
@@ -604,7 +604,7 @@ define( 'WP_REDIS_READ_TIMEOUT', 3 );
 
 El error `read error on connection to 127.0.0.1:6379` **no significa que Redis
 esté caído** — significa que la conexión TCP se estableció pero la respuesta tardó
-más de `WP_REDIS_READ_TIMEOUT` (default `1 s`). Causas frecuentes:
+más de `PIGCACHE_REDIS_READ_TIMEOUT` (default `1 s`). Causas frecuentes:
 
 - **`BGSAVE` / `BGREWRITEAOF`**: Redis hace un `fork()` para guardar en disco.
   Con 500 MB+ en memoria, el fork tarda decenas o cientos de ms y puede incrementar
@@ -673,8 +673,8 @@ redis-cli CONFIG SET save ""
 ### Ejemplo wp-config.php — Sitio único
 
 ```php
-// Redis (PigCache genera auto-prefix, no necesitas WP_REDIS_PREFIX)
-define( 'WP_REDIS_HOST', '127.0.0.1' );
+// Redis (PigCache genera auto-prefix, no necesitas PIGCACHE_REDIS_PREFIX)
+define( 'PIGCACHE_REDIS_HOST', '127.0.0.1' );
 
 // Invalidación
 define( 'PIGCACHE_INVALIDATE_THROTTLE', 3 );
@@ -692,16 +692,16 @@ define( 'PIGCACHE_LICENSE_KEY', 'a1b2c3d4e5f678901234567890abcdef0123456789abcde
 
 ```php
 // Sitio A (public_html/tienda/) — wp-config.php
-define( 'WP_REDIS_HOST', '127.0.0.1' );
-// Sin WP_REDIS_PREFIX ni WP_REDIS_DATABASE: PigCache aísla
+define( 'PIGCACHE_REDIS_HOST', '127.0.0.1' );
+// Sin PIGCACHE_REDIS_PREFIX ni PIGCACHE_REDIS_DATABASE: PigCache aísla
 // automáticamente usando DB_NAME como semilla del prefix.
 
 // Sitio B (public_html/blog/) — wp-config.php
-define( 'WP_REDIS_HOST', '127.0.0.1' );
+define( 'PIGCACHE_REDIS_HOST', '127.0.0.1' );
 // Mismo Redis, distinta DB MySQL = auto-prefix distinto = aislado.
 
 // Alternativa: prefixes explícitos para mayor claridad en redis-cli
-define( 'WP_REDIS_PREFIX', 'blog:' );
+define( 'PIGCACHE_REDIS_PREFIX', 'blog:' );
 ```
 
 ---
@@ -879,7 +879,7 @@ Comandos planificados para futuras versiones:
    `DB_NAME`, así que DBs diferentes = prefixes diferentes = aislamiento.
 2. Si ambos sitios usan la misma DB MySQL (con distinto `$table_prefix`),
    el auto-prefix también los diferencia.
-3. Si aun así hay contaminación, define `WP_REDIS_PREFIX` explícitamente
+3. Si aun así hay contaminación, define `PIGCACHE_REDIS_PREFIX` explícitamente
    en cada sitio con un valor único.
 4. Después de cualquier cambio de prefix, haz flush de caché en **todos**
    los sitios (o `redis-cli FLUSHALL` una sola vez).
@@ -887,8 +887,8 @@ Comandos planificados para futuras versiones:
 ### Redis no conecta
 
 1. Verifica que Redis esté corriendo: `redis-cli ping`
-2. Revisa las constantes `WP_REDIS_HOST`, `WP_REDIS_PORT`.
-3. Si usas password: `WP_REDIS_PASSWORD`.
+2. Revisa las constantes `PIGCACHE_REDIS_HOST`, `PIGCACHE_REDIS_PORT`.
+3. Si usas password: `PIGCACHE_REDIS_PASSWORD`.
 4. Revisa el log de PHP para errores de conexión.
 
 ### Flush de Redis desde línea de comandos

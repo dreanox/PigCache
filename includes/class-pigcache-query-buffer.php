@@ -234,15 +234,15 @@ class PigCache_Query_Buffer {
 			return null;
 		}
 
-		$host = defined( 'WP_REDIS_HOST' ) ? WP_REDIS_HOST : '127.0.0.1';
-		$port = defined( 'WP_REDIS_PORT' ) ? (int) WP_REDIS_PORT : 6379;
+		$host = defined( 'PIGCACHE_REDIS_HOST' ) ? PIGCACHE_REDIS_HOST : '127.0.0.1';
+		$port = defined( 'PIGCACHE_REDIS_PORT' ) ? (int) PIGCACHE_REDIS_PORT : 6379;
 
 		try {
 			$redis = new Redis();
 			$redis->connect( $host, $port, 2 );
 
-			if ( defined( 'WP_REDIS_PASSWORD' ) && WP_REDIS_PASSWORD ) {
-				$redis->auth( WP_REDIS_PASSWORD );
+			if ( defined( 'PIGCACHE_REDIS_PASSWORD' ) && PIGCACHE_REDIS_PASSWORD ) {
+				$redis->auth( PIGCACHE_REDIS_PASSWORD );
 			}
 
 			return $redis;

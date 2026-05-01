@@ -327,14 +327,14 @@ function _pigcache_cron_redis_connect( array $cfg ): ?Redis {
 		return null;
 	}
 
-	$host = $cfg['WP_REDIS_HOST'] ?? '127.0.0.1';
-	$port = isset( $cfg['WP_REDIS_PORT'] ) ? (int) $cfg['WP_REDIS_PORT'] : 6379;
+	$host = $cfg['PIGCACHE_REDIS_HOST'] ?? '127.0.0.1';
+	$port = isset( $cfg['PIGCACHE_REDIS_PORT'] ) ? (int) $cfg['PIGCACHE_REDIS_PORT'] : 6379;
 
 	try {
 		$redis = new Redis();
 		$redis->connect( $host, $port, 2 );
-		if ( ! empty( $cfg['WP_REDIS_PASSWORD'] ) ) {
-			$redis->auth( $cfg['WP_REDIS_PASSWORD'] );
+		if ( ! empty( $cfg['PIGCACHE_REDIS_PASSWORD'] ) ) {
+			$redis->auth( $cfg['PIGCACHE_REDIS_PASSWORD'] );
 		}
 		return $redis;
 	} catch ( Exception $e ) {

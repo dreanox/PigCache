@@ -51,6 +51,9 @@ package.json
 package-lock.json
 webpack.config.js
 
+# Developer docs (internal reference, not for distribution)
+docs.md
+
 # IDE / OS
 .idea/
 .vscode/

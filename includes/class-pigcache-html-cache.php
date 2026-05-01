@@ -57,14 +57,15 @@ class PigCache_Html_Cache {
 			return;
 		}
 
-		$uri = isset( $_SERVER['REQUEST_URI'] ) ? (string) $_SERVER['REQUEST_URI'] : '/';
+		// WP functions not yet available here — use native filter_var for sanitization.
+		$uri = isset( $_SERVER['REQUEST_URI'] ) ? (string) filter_var( stripslashes( $_SERVER['REQUEST_URI'] ), FILTER_SANITIZE_URL ) : '/';
 
 		// Skip wp-admin and login pages.
 		if ( false !== strpos( $uri, '/wp-admin/' ) || false !== strpos( $uri, '/wp-login.php' ) ) {
 			return;
 		}
 
-		$host = isset( $_SERVER['HTTP_HOST'] ) ? strtolower( (string) $_SERVER['HTTP_HOST'] ) : '';
+		$host = isset( $_SERVER['HTTP_HOST'] ) ? strtolower( (string) filter_var( stripslashes( $_SERVER['HTTP_HOST'] ), FILTER_SANITIZE_URL ) ) : '';
 		$key  = 'doc_' . md5( $host . $uri );
 
 		$pack = wp_cache_get( $key, self::GROUP_HTML );
@@ -209,7 +210,7 @@ class PigCache_Html_Cache {
 	 */
 	private static function host_key() {
 		if ( isset( $_SERVER['HTTP_HOST'] ) && $_SERVER['HTTP_HOST'] !== '' ) {
-			return strtolower( (string) wp_unslash( $_SERVER['HTTP_HOST'] ) );
+			return strtolower( sanitize_text_field( wp_unslash( $_SERVER['HTTP_HOST'] ) ) );
 		}
 
 		if ( function_exists( 'site_url' ) ) {
@@ -288,7 +289,7 @@ class PigCache_Html_Cache {
 			return '/';
 		}
 
-		return (string) wp_unslash( $_SERVER['REQUEST_URI'] );
+		return sanitize_text_field( wp_unslash( $_SERVER['REQUEST_URI'] ) );
 	}
 
 	/**

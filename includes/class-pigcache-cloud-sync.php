@@ -13,11 +13,12 @@ defined( 'ABSPATH' ) || exit;
 
 class PigCache_Cloud_Sync {
 
-	const CRON_HOOK       = 'pigcache_cloud_sync';
-	const CRON_SCHEDULE   = 'twicedaily';
-	const BATCH_SIZE      = 500;
-	const OPTION_LAST     = 'pigcache_cloud_last_sync';
-	const OPTION_PROFILE  = 'pigcache_cloud_profile_source';
+	const CRON_HOOK          = 'pigcache_cloud_sync';
+	const CRON_SCHEDULE      = 'twicedaily';
+	const BATCH_SIZE         = 500;
+	const OPTION_LAST        = 'pigcache_cloud_last_sync';
+	const OPTION_PROFILE     = 'pigcache_cloud_profile_source';
+	const OPTION_PROFILE_HASH = 'pigcache_cloud_profile_hash';
 
 	/**
 	 * Register cron hooks (called during plugin init).
@@ -144,7 +145,7 @@ class PigCache_Cloud_Sync {
 	}
 
 	/**
-	 * Ask the backend for a compiled profile and write it locally.
+	 * Ask the backend for a compiled profile and write it locally only if it changed.
 	 *
 	 * @return bool True if a new profile was downloaded and written.
 	 */
@@ -170,10 +171,20 @@ class PigCache_Cloud_Sync {
 			return false;
 		}
 
+		$incoming_hash = isset( $response['profile_hash'] ) ? (string) $response['profile_hash'] : '';
+		$stored_hash   = (string) get_option( self::OPTION_PROFILE_HASH, '' );
+
+		if ( $incoming_hash && $incoming_hash === $stored_hash && PigCache_Sql_Profiler::has_profile() ) {
+			return false;
+		}
+
 		$written = PigCache_Sql_Profiler::write_cloud_profile( $data );
 
 		if ( $written ) {
 			update_option( self::OPTION_PROFILE, 'cloud', false );
+			if ( $incoming_hash ) {
+				update_option( self::OPTION_PROFILE_HASH, $incoming_hash, false );
+			}
 		}
 
 		return $written;
@@ -222,5 +233,30 @@ class PigCache_Cloud_Sync {
 	 */
 	public static function mark_local_profile() {
 		update_option( self::OPTION_PROFILE, 'local', false );
+		delete_option( self::OPTION_PROFILE_HASH );
+	}
+
+	/**
+	 * Push local compile stats to the backend (fire-and-forget).
+	 *
+	 * @param array $data The compiled profile data array from PigCache_Sql_Profiler::compile().
+	 */
+	public static function push_compile_stats( array $data ) {
+		if ( ! self::is_enabled() ) {
+			return;
+		}
+
+		$site_id = PigCache_License::get_site_id();
+		if ( ! $site_id ) {
+			return;
+		}
+
+		PigCache_Cloud_Client::post( "sites/{$site_id}/profile/compiled", array(
+			'unique_templates' => (int) ( $data['unique_templates'] ?? 0 ),
+			'query_count'      => (int) ( $data['query_count'] ?? 0 ),
+			'tables'           => array_keys( $data['tables'] ?? array() ),
+			'learn_days'       => (int) ( $data['learn_days'] ?? 7 ),
+			'compiled_at'      => (int) ( $data['compiled_at'] ?? time() ),
+		) );
 	}
 }

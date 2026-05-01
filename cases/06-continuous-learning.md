@@ -223,7 +223,7 @@ php /path/to/wp-content/plugins/pigcache/bin/pigcache-cron.php
 - Any theme
 
 **What it DOES:**
-1. Parses `wp-config.php` via regex to extract `DB_*`, `WP_REDIS_*`, and
+1. Parses `wp-config.php` via regex to extract `DB_*`, `PIGCACHE_REDIS_*`, and
    `PIGCACHE_*` constants (~0 ms — no PHP execution of the config file)
 2. Opens a direct `mysqli` connection to MySQL
 3. Reads the APCu or Redis buffer

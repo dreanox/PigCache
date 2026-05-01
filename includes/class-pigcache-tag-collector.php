@@ -164,7 +164,7 @@ class PigCache_Tag_Collector {
 
 	private static function add_implicit_tags() {
 		if ( ! empty( $_SERVER['REQUEST_URI'] ) ) {
-			$uri = (string) $_SERVER['REQUEST_URI'];
+			$uri = sanitize_text_field( wp_unslash( $_SERVER['REQUEST_URI'] ) );
 
 			if ( $uri === '/' || strpos( $uri, '/?p=' ) === 0 ) {
 				self::$tags['home'] = true;

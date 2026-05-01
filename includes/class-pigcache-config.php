@@ -66,13 +66,13 @@ class PigCache_Config {
 	}
 
 	/**
-	 * Index shown in wp-admin: wp-config wins when WP_REDIS_DATABASE is set.
+	 * Index shown in wp-admin: wp-config wins when PIGCACHE_REDIS_DATABASE is set.
 	 *
 	 * @return int
 	 */
 	public static function get_display_redis_database_index() {
-		if ( defined( 'WP_REDIS_DATABASE' ) ) {
-			return (int) WP_REDIS_DATABASE;
+		if ( defined( 'PIGCACHE_REDIS_DATABASE' ) ) {
+			return (int) PIGCACHE_REDIS_DATABASE;
 		}
 
 		return self::get_assigned_db();
@@ -220,8 +220,8 @@ class PigCache_Config {
 			return null;
 		}
 
-		$host = defined( 'WP_REDIS_HOST' ) ? WP_REDIS_HOST : '127.0.0.1';
-		$port = defined( 'WP_REDIS_PORT' ) ? (int) WP_REDIS_PORT : 6379;
+		$host = defined( 'PIGCACHE_REDIS_HOST' ) ? PIGCACHE_REDIS_HOST : '127.0.0.1';
+		$port = defined( 'PIGCACHE_REDIS_PORT' ) ? (int) PIGCACHE_REDIS_PORT : 6379;
 
 		$redis = new Redis();
 		try {
@@ -234,8 +234,8 @@ class PigCache_Config {
 			return null;
 		}
 
-		if ( defined( 'WP_REDIS_PASSWORD' ) && WP_REDIS_PASSWORD !== '' ) {
-			$pass = WP_REDIS_PASSWORD;
+		if ( defined( 'PIGCACHE_REDIS_PASSWORD' ) && PIGCACHE_REDIS_PASSWORD !== '' ) {
+			$pass = PIGCACHE_REDIS_PASSWORD;
 			if ( is_array( $pass ) && isset( $pass[1] ) ) {
 				$redis->auth( $pass );
 			} else {
@@ -243,8 +243,8 @@ class PigCache_Config {
 			}
 		}
 
-		if ( defined( 'WP_REDIS_DATABASE' ) && (int) WP_REDIS_DATABASE > 0 ) {
-			$redis->select( (int) WP_REDIS_DATABASE );
+		if ( defined( 'PIGCACHE_REDIS_DATABASE' ) && (int) PIGCACHE_REDIS_DATABASE > 0 ) {
+			$redis->select( (int) PIGCACHE_REDIS_DATABASE );
 		}
 
 		return $redis;

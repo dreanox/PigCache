@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       PigCache
  * Description:       Redis object-cache drop-in with optional SQL, HTML page, and fragment caching.
- * Version:           1.0.0
+ * Version:           1.0.1
  * Requires at least: 5.8
  * Requires PHP:      7.4
  * Author:            PigCache
@@ -17,7 +17,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'PIGCACHE_VERSION', '1.0.0' );
+define( 'PIGCACHE_VERSION', '1.0.1' );
 define( 'PIGCACHE_FILE', __FILE__ );
 define( 'PIGCACHE_DIR', plugin_dir_path( __FILE__ ) );
 define( 'PIGCACHE_URL', plugin_dir_url( __FILE__ ) );
@@ -28,16 +28,14 @@ if ( is_readable( $pigcache_autoload ) ) {
 }
 
 $oc_meta = get_file_data( PIGCACHE_DIR . 'includes/dropin/object-cache.php', array( 'Version' => 'Version' ) );
-if ( ! defined( 'WP_REDIS_VERSION' ) && ! empty( $oc_meta['Version'] ) ) {
-	define( 'WP_REDIS_VERSION', $oc_meta['Version'] );
+if ( ! defined( 'PIGCACHE_OC_VERSION' ) && ! empty( $oc_meta['Version'] ) ) {
+	define( 'PIGCACHE_OC_VERSION', $oc_meta['Version'] );
 }
 
 // Always loaded (Free + Pro).
 require_once PIGCACHE_DIR . 'includes/class-pigcache-config.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-license.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-sql-cache.php';
-require_once PIGCACHE_DIR . 'includes/class-pigcache-tag-collector.php';
-require_once PIGCACHE_DIR . 'includes/class-pigcache-tag-index.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-html-cache.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-invalidation.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-fragments.php';
@@ -50,6 +48,8 @@ require_once PIGCACHE_DIR . 'includes/class-pigcache-plugin.php';
 
 // Pro-only — present in the Pro build, absent in the Free build.
 foreach ( array(
+	'class-pigcache-tag-collector.php',
+	'class-pigcache-tag-index.php',
 	'class-pigcache-environment.php',
 	'class-pigcache-cloud-client.php',
 	'class-pigcache-cloud-sync.php',
@@ -59,6 +59,7 @@ foreach ( array(
 	'class-pigcache-query-buffer.php',
 	'class-pigcache-query-stats.php',
 	'class-pigcache-continuous-learner.php',
+	'class-pigcache-admin-pro.php',
 ) as $_pigcache_pro_file ) {
 	$_pigcache_pro_path = PIGCACHE_DIR . 'includes/' . $_pigcache_pro_file;
 	if ( is_readable( $_pigcache_pro_path ) ) {
@@ -71,7 +72,9 @@ register_activation_hook(
 	PIGCACHE_FILE,
 	static function () {
 		PigCache_Config::on_activate();
-		PigCache_Tag_Index::create_table();
+		if ( class_exists( 'PigCache_Tag_Index', false ) ) {
+			PigCache_Tag_Index::create_table();
+		}
 		PigCache_License::maybe_start_trial();
 
 		if ( class_exists( 'PigCache_Sql_Profile_Store', false ) ) {

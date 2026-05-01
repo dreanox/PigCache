@@ -29,7 +29,7 @@ if ( defined( 'PIGCACHE_PLUGIN_DIR' ) ) {
 }
 
 // phpcs:disable Generic.WhiteSpace.ScopeIndent.IncorrectExact, Generic.WhiteSpace.ScopeIndent.Incorrect
-if ( ! defined( 'WP_REDIS_DISABLED' ) || ! WP_REDIS_DISABLED ) :
+if ( ! defined( 'PIGCACHE_REDIS_DISABLED' ) || ! PIGCACHE_REDIS_DISABLED ) :
 
 /**
  * Determines whether the object cache implementation supports a particular feature.
@@ -151,8 +151,8 @@ function wp_cache_delete_multiple( array $keys, $group = '' ) {
 }
 
 /**
- * Invalidate all items in the cache. If `WP_REDIS_SELECTIVE_FLUSH` is `true`,
- * only keys prefixed with the `WP_REDIS_PREFIX` are flushed.
+ * Invalidate all items in the cache. If `PIGCACHE_REDIS_SELECTIVE_FLUSH` is `true`,
+ * only keys prefixed with the `PIGCACHE_REDIS_PREFIX` are flushed.
  *
  * @return bool       Returns TRUE on success or FALSE on failure.
  */
@@ -244,42 +244,34 @@ function wp_cache_incr( $key, $offset = 1, $group = '' ) {
 function wp_cache_init() {
     global $wp_object_cache;
 
-    if ( ! defined( 'WP_REDIS_PREFIX' ) && getenv( 'WP_REDIS_PREFIX' ) ) {
-        define( 'WP_REDIS_PREFIX', getenv( 'WP_REDIS_PREFIX' ) );
+    // Resolve PIGCACHE_REDIS_PREFIX from env, WP_CACHE_KEY_SALT, or auto-generated DB_NAME hash.
+    if ( ! defined( 'PIGCACHE_REDIS_PREFIX' ) ) {
+        if ( getenv( 'PIGCACHE_REDIS_PREFIX' ) ) {
+            define( 'PIGCACHE_REDIS_PREFIX', getenv( 'PIGCACHE_REDIS_PREFIX' ) );
+        } elseif ( defined( 'WP_CACHE_KEY_SALT' ) ) {
+            define( 'PIGCACHE_REDIS_PREFIX', WP_CACHE_KEY_SALT );
+        } elseif ( isset( $_SERVER['cw_allowed_ip'] ) ) {
+            define( 'PIGCACHE_REDIS_PREFIX', (string) getenv( 'HTTP_X_APP_USER' ) );
+        } elseif ( defined( 'DB_NAME' ) ) {
+            global $table_prefix;
+            $auto_seed = DB_NAME . '|' . ( isset( $table_prefix ) ? $table_prefix : '' );
+            define( 'PIGCACHE_REDIS_PREFIX', substr( md5( $auto_seed ), 0, 8 ) . ':' );
+        }
     }
 
-    if ( ! defined( 'WP_REDIS_SELECTIVE_FLUSH' ) && getenv( 'WP_REDIS_SELECTIVE_FLUSH' ) ) {
-        define( 'WP_REDIS_SELECTIVE_FLUSH', (bool) getenv( 'WP_REDIS_SELECTIVE_FLUSH' ) );
-    }
-
-    // Backwards compatibility: map `WP_CACHE_KEY_SALT` constant to `WP_REDIS_PREFIX`.
-    if ( defined( 'WP_CACHE_KEY_SALT' ) && ! defined( 'WP_REDIS_PREFIX' ) ) {
-        define( 'WP_REDIS_PREFIX', WP_CACHE_KEY_SALT );
-    }
-
-    // Set unique prefix for sites hosted on Cloudways
-    if ( ! defined( 'WP_REDIS_PREFIX' ) && isset( $_SERVER['cw_allowed_ip'] ) )  {
-        define( 'WP_REDIS_PREFIX', getenv( 'HTTP_X_APP_USER' ) );
-    }
-
-    // Auto-generate a prefix from DB_NAME + table_prefix so sites sharing
-    // the same Redis instance are isolated without any manual configuration.
-    if ( ! defined( 'WP_REDIS_PREFIX' ) && defined( 'DB_NAME' ) ) {
-        global $table_prefix;
-        $auto_seed = DB_NAME . '|' . ( isset( $table_prefix ) ? $table_prefix : '' );
-        define( 'WP_REDIS_PREFIX', substr( md5( $auto_seed ), 0, 8 ) . ':' );
-    }
-
-    // When a prefix is active, default to selective flush so FLUSHDB never
-    // wipes keys belonging to other sites on the same Redis instance.
-    if ( ! defined( 'WP_REDIS_SELECTIVE_FLUSH' ) && defined( 'WP_REDIS_PREFIX' ) && WP_REDIS_PREFIX ) {
-        define( 'WP_REDIS_SELECTIVE_FLUSH', true );
+    // Resolve PIGCACHE_REDIS_SELECTIVE_FLUSH from env or defaults to true when a prefix is active.
+    if ( ! defined( 'PIGCACHE_REDIS_SELECTIVE_FLUSH' ) ) {
+        if ( getenv( 'PIGCACHE_REDIS_SELECTIVE_FLUSH' ) ) {
+            define( 'PIGCACHE_REDIS_SELECTIVE_FLUSH', (bool) getenv( 'PIGCACHE_REDIS_SELECTIVE_FLUSH' ) );
+        } elseif ( defined( 'PIGCACHE_REDIS_PREFIX' ) && PIGCACHE_REDIS_PREFIX ) {
+            define( 'PIGCACHE_REDIS_SELECTIVE_FLUSH', true );
+        }
     }
 
     if ( ! ( $wp_object_cache instanceof WP_Object_Cache ) ) {
         // Default: graceful fallback (site stays up when Redis is unavailable).
-        // Set define('WP_REDIS_GRACEFUL', false) to restore the hard-error screen.
-        $fail_gracefully = ! defined( 'WP_REDIS_GRACEFUL' ) || (bool) WP_REDIS_GRACEFUL;
+        // Set define('PIGCACHE_REDIS_GRACEFUL', false) to restore the hard-error screen.
+        $fail_gracefully = defined( 'PIGCACHE_REDIS_GRACEFUL' ) ? (bool) PIGCACHE_REDIS_GRACEFUL : true;
 
         // phpcs:ignore WordPress.WP.GlobalVariablesOverride.Prohibited
         $wp_object_cache = new WP_Object_Cache( $fail_gracefully );
@@ -539,21 +531,21 @@ class WP_Object_Cache {
 
         $this->fail_gracefully = $fail_gracefully;
 
-        if ( defined( 'WP_REDIS_GLOBAL_GROUPS' ) && is_array( WP_REDIS_GLOBAL_GROUPS ) ) {
-            $this->global_groups = array_map( [ $this, 'sanitize_key_part' ], WP_REDIS_GLOBAL_GROUPS );
+        if ( defined( 'PIGCACHE_REDIS_GLOBAL_GROUPS' ) && is_array( PIGCACHE_REDIS_GLOBAL_GROUPS ) ) {
+            $this->global_groups = array_map( [ $this, 'sanitize_key_part' ], PIGCACHE_REDIS_GLOBAL_GROUPS );
         }
 
-    if ( defined( 'WP_REDIS_IGNORED_GROUPS' ) && is_array( WP_REDIS_IGNORED_GROUPS ) ) {
-            $this->ignored_groups = array_map( [ $this, 'sanitize_key_part' ], WP_REDIS_IGNORED_GROUPS );
+    if ( defined( 'PIGCACHE_REDIS_IGNORED_GROUPS' ) && is_array( PIGCACHE_REDIS_IGNORED_GROUPS ) ) {
+            $this->ignored_groups = array_map( [ $this, 'sanitize_key_part' ], PIGCACHE_REDIS_IGNORED_GROUPS );
         }
 
-        if ( defined( 'WP_REDIS_UNFLUSHABLE_GROUPS' ) && is_array( WP_REDIS_UNFLUSHABLE_GROUPS ) ) {
-            $this->unflushable_groups = array_map( [ $this, 'sanitize_key_part' ], WP_REDIS_UNFLUSHABLE_GROUPS );
+        if ( defined( 'PIGCACHE_REDIS_UNFLUSHABLE_GROUPS' ) && is_array( PIGCACHE_REDIS_UNFLUSHABLE_GROUPS ) ) {
+            $this->unflushable_groups = array_map( [ $this, 'sanitize_key_part' ], PIGCACHE_REDIS_UNFLUSHABLE_GROUPS );
         }
 
         $this->cache_group_types();
 
-        $this->use_igbinary = defined( 'WP_REDIS_IGBINARY' ) && WP_REDIS_IGBINARY && extension_loaded( 'igbinary' );
+        $this->use_igbinary = defined( 'PIGCACHE_REDIS_IGBINARY' ) && PIGCACHE_REDIS_IGBINARY && extension_loaded( 'igbinary' );
 
         $client = $this->determine_client();
         $parameters = $this->build_parameters();
@@ -586,9 +578,9 @@ class WP_Object_Cache {
                     break;
             }
 
-            if ( defined( 'WP_REDIS_CLUSTER' ) ) {
-                $connectionId = is_string( WP_REDIS_CLUSTER )
-                    ? WP_REDIS_CLUSTER
+            if ( defined( 'PIGCACHE_REDIS_CLUSTER' ) ) {
+                $connectionId = is_string( PIGCACHE_REDIS_CLUSTER )
+                    ? PIGCACHE_REDIS_CLUSTER
                     : current( $this->build_cluster_connection_array() );
 
                 $this->diagnostics[ 'ping' ] = $client === 'predis'
@@ -635,7 +627,7 @@ class WP_Object_Cache {
      * Determine the Redis client.
      *
      * PigCache policy: prefer PhpRedis (PECL) when available; otherwise Predis from Composer.
-     * Override with WP_REDIS_CLIENT if needed.
+     * Override with PIGCACHE_REDIS_CLIENT if needed.
      *
      * @return string
      */
@@ -646,15 +638,15 @@ class WP_Object_Cache {
             $client = 'phpredis';
         }
 
-        if ( defined( 'WP_REDIS_CLIENT' ) ) {
-            $client = (string) WP_REDIS_CLIENT;
+        if ( defined( 'PIGCACHE_REDIS_CLIENT' ) ) {
+            $client = (string) PIGCACHE_REDIS_CLIENT;
             $client = str_replace( 'pecl', 'phpredis', $client );
         }
 
         $client = trim( strtolower( $client ) );
 
         /**
-         * Filter the Redis client identifier after defaults and WP_REDIS_CLIENT are applied.
+         * Filter the Redis client identifier after defaults and PIGCACHE_REDIS_CLIENT are applied.
          *
          * @param string $client One of phpredis, predis, relay.
          */
@@ -691,7 +683,7 @@ class WP_Object_Cache {
         ];
 
         foreach ( $settings as $setting ) {
-            $constant = sprintf( 'WP_REDIS_%s', strtoupper( $setting ) );
+            $constant = sprintf( 'PIGCACHE_REDIS_%s', strtoupper( $setting ) );
 
             if ( defined( $constant ) ) {
                 $parameters[ $setting ] = constant( $constant );
@@ -720,13 +712,13 @@ class WP_Object_Cache {
 
         $this->diagnostics[ 'client' ] = sprintf( 'PhpRedis (v%s)', $version );
 
-        if ( defined( 'WP_REDIS_SHARDS' ) ) {
-            $this->redis = new RedisArray( array_values( WP_REDIS_SHARDS ) );
+        if ( defined( 'PIGCACHE_REDIS_SHARDS' ) ) {
+            $this->redis = new RedisArray( array_values( PIGCACHE_REDIS_SHARDS ) );
 
-            $this->diagnostics[ 'shards' ] = WP_REDIS_SHARDS;
-        } elseif ( defined( 'WP_REDIS_CLUSTER' ) ) {
-            if ( is_string( WP_REDIS_CLUSTER ) ) {
-                $this->redis = new RedisCluster( WP_REDIS_CLUSTER );
+            $this->diagnostics[ 'shards' ] = PIGCACHE_REDIS_SHARDS;
+        } elseif ( defined( 'PIGCACHE_REDIS_CLUSTER' ) ) {
+            if ( is_string( PIGCACHE_REDIS_CLUSTER ) ) {
+                $this->redis = new RedisCluster( PIGCACHE_REDIS_CLUSTER );
             } else {
                 $args = [
                     'cluster' => $this->build_cluster_connection_array(),
@@ -739,12 +731,12 @@ class WP_Object_Cache {
                     $args['password'] = $parameters['password'];
                 }
 
-                if ( version_compare( $version, '5.3.0', '>=' ) && defined( 'WP_REDIS_SSL_CONTEXT' ) && ! empty( WP_REDIS_SSL_CONTEXT ) ) {
+                if ( version_compare( $version, '5.3.0', '>=' ) && defined( 'PIGCACHE_REDIS_SSL_CONTEXT' ) && ! empty( PIGCACHE_REDIS_SSL_CONTEXT ) ) {
                     if ( ! array_key_exists( 'password', $args ) ) {
                         $args['password'] = null;
                     }
 
-                    $args['ssl'] = WP_REDIS_SSL_CONTEXT;
+                    $args['ssl'] = PIGCACHE_REDIS_SSL_CONTEXT;
                 }
 
                 $this->redis = new RedisCluster( null, ...array_values( $args ) );
@@ -772,8 +764,8 @@ class WP_Object_Cache {
                     str_replace( 'tls://', '', $parameters['host'] )
                 );
 
-                if ( version_compare( $version, '5.3.0', '>=' ) && defined( 'WP_REDIS_SSL_CONTEXT' ) && ! empty( WP_REDIS_SSL_CONTEXT ) ) {
-                    $args['others']['stream'] = WP_REDIS_SSL_CONTEXT;
+                if ( version_compare( $version, '5.3.0', '>=' ) && defined( 'PIGCACHE_REDIS_SSL_CONTEXT' ) && ! empty( PIGCACHE_REDIS_SSL_CONTEXT ) ) {
+                    $args['others']['stream'] = PIGCACHE_REDIS_SSL_CONTEXT;
                 }
             }
 
@@ -816,9 +808,9 @@ class WP_Object_Cache {
 
         $this->diagnostics[ 'client' ] = sprintf( 'Relay (v%s)', $version );
 
-        if ( defined( 'WP_REDIS_SHARDS' ) ) {
+        if ( defined( 'PIGCACHE_REDIS_SHARDS' ) ) {
             throw new Exception('Relay does not support sharding.');
-        } elseif ( defined( 'WP_REDIS_CLUSTER' ) ) {
+        } elseif ( defined( 'PIGCACHE_REDIS_CLUSTER' ) ) {
             throw new Exception('Relay does not cluster connections.');
         } else {
             $this->redis = new Relay\Relay;
@@ -840,8 +832,8 @@ class WP_Object_Cache {
                     str_replace( 'tls://', '', $parameters['host'] )
                 );
 
-                if ( defined( 'WP_REDIS_SSL_CONTEXT' ) && ! empty( WP_REDIS_SSL_CONTEXT ) ) {
-                    $args['others']['stream'] = WP_REDIS_SSL_CONTEXT;
+                if ( defined( 'PIGCACHE_REDIS_SSL_CONTEXT' ) && ! empty( PIGCACHE_REDIS_SSL_CONTEXT ) ) {
+                    $args['others']['stream'] = PIGCACHE_REDIS_SSL_CONTEXT;
                 }
             }
 
@@ -902,19 +894,19 @@ class WP_Object_Cache {
         $servers = false;
         $options = [];
 
-        if ( defined( 'WP_REDIS_SHARDS' ) ) {
-            $servers = WP_REDIS_SHARDS;
+        if ( defined( 'PIGCACHE_REDIS_SHARDS' ) ) {
+            $servers = PIGCACHE_REDIS_SHARDS;
             $parameters['shards'] = $servers;
-        } elseif ( defined( 'WP_REDIS_SENTINEL' ) ) {
-            $servers = WP_REDIS_SERVERS;
+        } elseif ( defined( 'PIGCACHE_REDIS_SENTINEL' ) ) {
+            $servers = PIGCACHE_REDIS_SERVERS;
             $parameters['servers'] = $servers;
             $options['replication'] = 'sentinel';
-            $options['service'] = WP_REDIS_SENTINEL;
-        } elseif ( defined( 'WP_REDIS_SERVERS' ) ) {
-            $servers = WP_REDIS_SERVERS;
+            $options['service'] = PIGCACHE_REDIS_SENTINEL;
+        } elseif ( defined( 'PIGCACHE_REDIS_SERVERS' ) ) {
+            $servers = PIGCACHE_REDIS_SERVERS;
             $parameters['servers'] = $servers;
             $options['replication'] = 'predis';
-        } elseif ( defined( 'WP_REDIS_CLUSTER' ) ) {
+        } elseif ( defined( 'PIGCACHE_REDIS_CLUSTER' ) ) {
             $servers = $this->build_cluster_connection_array();
             $parameters['cluster'] = $servers;
             $options['cluster'] = 'redis';
@@ -928,7 +920,7 @@ class WP_Object_Cache {
             $parameters['read_write_timeout'] = $parameters['read_timeout'];
         }
 
-        foreach ( [ 'WP_REDIS_SERVERS', 'WP_REDIS_SHARDS', 'WP_REDIS_CLUSTER' ] as $constant ) {
+        foreach ( [ 'PIGCACHE_REDIS_SERVERS', 'PIGCACHE_REDIS_SHARDS', 'PIGCACHE_REDIS_CLUSTER' ] as $constant ) {
             if ( defined( $constant ) ) {
                 if ( $parameters['database'] ) {
                     $options['parameters']['database'] = $parameters['database'];
@@ -936,10 +928,10 @@ class WP_Object_Cache {
 
                 if ( isset( $parameters['password'] ) ) {
                     if ( is_array( $parameters['password'] ) ) {
-                        $options['parameters']['username'] = WP_REDIS_PASSWORD[0];
-                        $options['parameters']['password'] = WP_REDIS_PASSWORD[1];
+                        $options['parameters']['username'] = PIGCACHE_REDIS_PASSWORD[0];
+                        $options['parameters']['password'] = PIGCACHE_REDIS_PASSWORD[1];
                     } else {
-                        $options['parameters']['password'] = WP_REDIS_PASSWORD;
+                        $options['parameters']['password'] = PIGCACHE_REDIS_PASSWORD;
                     }
                 }
             }
@@ -951,13 +943,13 @@ class WP_Object_Cache {
                 $parameters['password'] = implode( '', $parameters['password'] );
             }
 
-            if ( defined( 'WP_REDIS_USERNAME' ) ) {
-                $parameters['username'] = WP_REDIS_USERNAME;
+            if ( defined( 'PIGCACHE_REDIS_USERNAME' ) ) {
+                $parameters['username'] = PIGCACHE_REDIS_USERNAME;
             }
         }
 
-        if ( defined( 'WP_REDIS_SSL_CONTEXT' ) && ! empty( WP_REDIS_SSL_CONTEXT ) ) {
-            $parameters['ssl'] = WP_REDIS_SSL_CONTEXT;
+        if ( defined( 'PIGCACHE_REDIS_SSL_CONTEXT' ) && ! empty( PIGCACHE_REDIS_SSL_CONTEXT ) ) {
+            $parameters['ssl'] = PIGCACHE_REDIS_SSL_CONTEXT;
         }
 
         $this->redis = new Predis\Client( $servers ?: $parameters, $options );
@@ -976,8 +968,8 @@ class WP_Object_Cache {
      * @return void
      */
     public function fetch_info() {
-        if ( defined( 'WP_REDIS_CLUSTER' ) ) {
-            $connectionId = is_string( WP_REDIS_CLUSTER )
+        if ( defined( 'PIGCACHE_REDIS_CLUSTER' ) ) {
+            $connectionId = is_string( PIGCACHE_REDIS_CLUSTER )
                 ? 'SERVER'
                 : current( $this->build_cluster_connection_array() );
 
@@ -1446,11 +1438,11 @@ class WP_Object_Cache {
     protected function execute_lua_script( $script ) {
         $results = [];
 
-        if ( defined( 'WP_REDIS_CLUSTER' ) ) {
+        if ( defined( 'PIGCACHE_REDIS_CLUSTER' ) ) {
             return $this->execute_lua_script_on_cluster( $script );
         }
 
-        $flushTimeout = defined( 'WP_REDIS_FLUSH_TIMEOUT' ) ? WP_REDIS_FLUSH_TIMEOUT : 5;
+        $flushTimeout = defined( 'PIGCACHE_REDIS_FLUSH_TIMEOUT' ) ? PIGCACHE_REDIS_FLUSH_TIMEOUT : 5;
 
         if ( $this->is_predis() ) {
             $connection = $this->redis->getConnection();
@@ -1490,7 +1482,7 @@ class WP_Object_Cache {
     protected function execute_lua_script_on_cluster( $script ) {
         $results = [];
         $redis = $this->redis;
-        $flushTimeout = defined( 'WP_REDIS_FLUSH_TIMEOUT' ) ? WP_REDIS_FLUSH_TIMEOUT : 5;
+        $flushTimeout = defined( 'PIGCACHE_REDIS_FLUSH_TIMEOUT' ) ? PIGCACHE_REDIS_FLUSH_TIMEOUT : 5;
 
         if ( $this->is_predis() ) {
             foreach ( $this->redis->getIterator() as $master ) {
@@ -1524,8 +1516,8 @@ class WP_Object_Cache {
     }
 
     /**
-     * Invalidate all items in the cache. If `WP_REDIS_SELECTIVE_FLUSH` is `true`,
-     * only keys prefixed with the `WP_REDIS_PREFIX` are flushed.
+     * Invalidate all items in the cache. If `PIGCACHE_REDIS_SELECTIVE_FLUSH` is `true`,
+     * only keys prefixed with the `PIGCACHE_REDIS_PREFIX` are flushed.
      *
      * @return bool True on success, false on failure.
      */
@@ -1534,8 +1526,8 @@ class WP_Object_Cache {
         $this->cache = [];
 
         if ( $this->redis_status() ) {
-            $salt = defined( 'WP_REDIS_PREFIX' ) ? trim( WP_REDIS_PREFIX ) : null;
-            $selective = defined( 'WP_REDIS_SELECTIVE_FLUSH' ) ? WP_REDIS_SELECTIVE_FLUSH : null;
+            $salt = defined( 'PIGCACHE_REDIS_PREFIX' ) ? trim( PIGCACHE_REDIS_PREFIX ) : null;
+            $selective = defined( 'PIGCACHE_REDIS_SELECTIVE_FLUSH' ) ? PIGCACHE_REDIS_SELECTIVE_FLUSH : null;
 
             $start_time = microtime( true );
 
@@ -1547,7 +1539,7 @@ class WP_Object_Cache {
                     return false;
                 }
             } else {
-                if ( defined( 'WP_REDIS_CLUSTER' ) ) {
+                if ( defined( 'PIGCACHE_REDIS_CLUSTER' ) ) {
                     try {
                         if ( $this->is_predis() ) {
                             foreach ( $this->redis->getIterator() as $master ) {
@@ -1611,7 +1603,7 @@ class WP_Object_Cache {
 	 * @return bool Returns TRUE on success or FALSE on failure.
 	 */
     public function flush_group( $group ) {
-        if ( defined( 'WP_REDIS_DISABLE_GROUP_FLUSH' ) && WP_REDIS_DISABLE_GROUP_FLUSH ) {
+        if ( defined( 'PIGCACHE_REDIS_DISABLE_GROUP_FLUSH' ) && PIGCACHE_REDIS_DISABLE_GROUP_FLUSH ) {
             return $this->flush();
         }
 
@@ -2392,14 +2384,13 @@ class WP_Object_Cache {
      * @return void
      */
     public function stats() {
-        // phpcs:disable WordPress.Security.EscapeOutput.OutputNotEscaped
     ?>
         <p>
             <strong>Redis Status:</strong>
-            <?php echo $this->redis_status() ? 'Connected' : 'Not connected'; ?>
+            <?php echo esc_html( $this->redis_status() ? 'Connected' : 'Not connected' ); ?>
             <br />
             <strong>Redis Client:</strong>
-            <?php echo $this->diagnostics['client'] ?: 'Unknown'; ?>
+            <?php echo esc_html( $this->diagnostics['client'] ?: 'Unknown' ); ?>
             <br />
             <strong>Cache Hits:</strong>
             <?php echo (int) $this->cache_hits; ?>
@@ -2408,10 +2399,9 @@ class WP_Object_Cache {
             <?php echo (int) $this->cache_misses; ?>
             <br />
             <strong>Cache Size:</strong>
-            <?php echo number_format_i18n( strlen( serialize( $this->cache ) ) / 1024, 2 ); ?> KB
+            <?php echo esc_html( number_format_i18n( strlen( serialize( $this->cache ) ) / 1024, 2 ) ); ?> KB
         </p>
     <?php
-        // phpcs:enable WordPress.Security.EscapeOutput.OutputNotEscaped
     }
 
     /**
@@ -2480,7 +2470,7 @@ class WP_Object_Cache {
             $group = 'default';
         }
 
-        $salt = defined( 'WP_REDIS_PREFIX' ) ? trim( WP_REDIS_PREFIX ) : '';
+        $salt = defined( 'PIGCACHE_REDIS_PREFIX' ) ? trim( PIGCACHE_REDIS_PREFIX ) : '';
 
         $prefix = $this->is_global_group( $group ) ? $this->global_prefix : $this->blog_prefix;
         $prefix = trim( (string) $prefix, '_-:$' );
@@ -2666,8 +2656,8 @@ class WP_Object_Cache {
     protected function validate_expiration( $expiration ) {
         $expiration = is_int( $expiration ) || ctype_digit( (string) $expiration ) ? (int) $expiration : 0;
 
-        if ( defined( 'WP_REDIS_MAXTTL' ) ) {
-            $max = (int) WP_REDIS_MAXTTL;
+        if ( defined( 'PIGCACHE_REDIS_MAXTTL' ) ) {
+            $max = (int) PIGCACHE_REDIS_MAXTTL;
 
             if ( $expiration === 0 || $expiration > $max ) {
                 $expiration = $max;
@@ -2829,8 +2819,8 @@ class WP_Object_Cache {
      * @return string
      */
     private function pigcache_circuit_path() {
-        $host = defined( 'WP_REDIS_HOST' ) ? WP_REDIS_HOST : '127.0.0.1';
-        $port = defined( 'WP_REDIS_PORT' ) ? (string) WP_REDIS_PORT : '6379';
+        $host = defined( 'PIGCACHE_REDIS_HOST' ) ? PIGCACHE_REDIS_HOST : '127.0.0.1';
+        $port = defined( 'PIGCACHE_REDIS_PORT' ) ? (string) PIGCACHE_REDIS_PORT : '6379';
         return sys_get_temp_dir() . '/pigcache_cb_' . md5( $host . ':' . $port ) . '.flag';
     }
 
@@ -2970,7 +2960,7 @@ class WP_Object_Cache {
      * @return  array
      */
     protected function build_cluster_connection_array() {
-        $cluster = array_values( WP_REDIS_CLUSTER );
+        $cluster = array_values( PIGCACHE_REDIS_CLUSTER );
 
         foreach ( $cluster as $key => $server ) {
             // phpcs:ignore WordPress.WP.AlternativeFunctions.parse_url_parse_url
@@ -2978,8 +2968,8 @@ class WP_Object_Cache {
 
             if ( ! empty( $components['scheme'] ) ) {
                 $scheme = $components['scheme'];
-            } elseif ( defined( 'WP_REDIS_SCHEME' ) ) {
-                $scheme = WP_REDIS_SCHEME;
+            } elseif ( defined( 'PIGCACHE_REDIS_SCHEME' ) ) {
+                $scheme = PIGCACHE_REDIS_SCHEME;
             } else {
                 $scheme = null;
             }

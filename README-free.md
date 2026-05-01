@@ -70,8 +70,8 @@ PigCache automatically isolates each site using a prefix derived from `DB_NAME` 
 
 ```php
 // wp-config.php
-define( 'WP_REDIS_PREFIX', 'my-site:' );
-define( 'WP_REDIS_DATABASE', 1 ); // optional logical database
+define( 'PIGCACHE_REDIS_PREFIX', 'my-site:' );
+define( 'PIGCACHE_REDIS_DATABASE', 1 ); // optional logical database
 ```
 
 ---
@@ -80,11 +80,11 @@ define( 'WP_REDIS_DATABASE', 1 ); // optional logical database
 
 | Constant | Effect |
 |----------|--------|
-| `WP_REDIS_HOST` | Redis host (default `127.0.0.1`) |
-| `WP_REDIS_PORT` | Redis port (default `6379`) |
-| `WP_REDIS_PASSWORD` | Redis password (optional) |
-| `WP_REDIS_DATABASE` | Logical database index (default `0`) |
-| `WP_REDIS_PREFIX` | Manual key prefix |
+| `PIGCACHE_REDIS_HOST` | Redis host (default `127.0.0.1`) |
+| `PIGCACHE_REDIS_PORT` | Redis port (default `6379`) |
+| `PIGCACHE_REDIS_PASSWORD` | Redis password (optional) |
+| `PIGCACHE_REDIS_DATABASE` | Logical database index (default `0`) |
+| `PIGCACHE_REDIS_PREFIX` | Manual key prefix |
 | `PIGCACHE_INVALIDATE_THROTTLE` | Minimum seconds between invalidations (default `2`) |
 | `PIGCACHE_INVALIDATE_ON_OPTION` | Invalidate on option add/update/delete |
 | `PIGCACHE_INVALIDATE_ON_TERM` | Invalidate on term create/edit/delete |

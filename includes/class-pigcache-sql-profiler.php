@@ -481,6 +481,7 @@ class PigCache_Sql_Profiler {
 
 		if ( class_exists( 'PigCache_Cloud_Sync', false ) ) {
 			PigCache_Cloud_Sync::mark_local_profile();
+			PigCache_Cloud_Sync::push_compile_stats( $data );
 		}
 
 		return true;
