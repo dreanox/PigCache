@@ -179,9 +179,9 @@ class PigCache_Admin_Pro {
 
 		echo '<div class="pigcache-header pigcache-header--pro">';
 		echo '<div class="pigcache-header__left">';
-		echo '<span class="pigcache-header__logo">🐷</span>';
+		echo '<img src="' . esc_url( PIGCACHE_URL . 'assets/pig.svg' ) . '" class="pigcache-header__logo" width="48" height="48" alt="" aria-hidden="true">';
 		echo '<div class="pigcache-header__titles">';
-		echo '<h1 class="pigcache-header__name">PigCache <span class="pigcache-header__plan-badge">' . esc_html( $plan ) . '</span></h1>';
+		echo '<p class="pigcache-header__name">PigCache <span class="pigcache-header__plan-badge">' . esc_html( $plan ) . '</span></p>';
 		echo '<p class="pigcache-header__tagline">' . esc_html__( 'Redis cache · SQL profiler · Continuous learning · Cloud sync', 'pigcache' ) . '</p>';
 		echo '</div>';
 		echo '</div>';

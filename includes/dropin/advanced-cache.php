@@ -1,6 +1,12 @@
 <?php
-// PigCache HTML Cache drop-in — do not edit by hand without a backup.
-// Installed and managed by the PigCache plugin.
+/**
+ * PigCache HTML Cache drop-in — do not edit by hand without a backup.
+ * Installed and managed by the PigCache plugin.
+ *
+ * Version: 1.0.1
+ *
+ * @package PigCache
+ */
 
 defined( 'ABSPATH' ) || exit;
 

@@ -15,6 +15,40 @@ class PigCache_Dropin_Html_Cache {
 	const MARKER = 'PigCache HTML Cache drop-in';
 
 	/**
+	 * @return string
+	 */
+	public static function source_path() {
+		return PIGCACHE_DIR . 'includes/dropin/advanced-cache.php';
+	}
+
+	/**
+	 * @return string
+	 */
+	public static function dropin_path() {
+		return WP_CONTENT_DIR . '/advanced-cache.php';
+	}
+
+	/**
+	 * @return bool
+	 */
+	public static function is_outdated() {
+		if ( ! self::is_our_file() || ! is_readable( self::source_path() ) ) {
+			return false;
+		}
+		$dropin = get_file_data( self::dropin_path(), array( 'Version' => 'Version' ) );
+		$source = get_file_data( self::source_path(), array( 'Version' => 'Version' ) );
+		return ! empty( $dropin['Version'] ) && ! empty( $source['Version'] )
+			&& version_compare( $dropin['Version'], $source['Version'], '<' );
+	}
+
+	/**
+	 * @return true|WP_Error
+	 */
+	public static function update_dropin() {
+		return self::install();
+	}
+
+	/**
 	 * @return bool
 	 */
 	public static function file_exists() {

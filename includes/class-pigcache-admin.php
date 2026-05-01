@@ -153,6 +153,8 @@ class PigCache_Admin {
 			$action = sanitize_key( wp_unslash( $_POST['pigcache_html_action'] ) );
 			if ( 'install' === $action ) {
 				$result = PigCache_Dropin_Html_Cache::install();
+			} elseif ( 'update' === $action ) {
+				$result = PigCache_Dropin_Html_Cache::update_dropin();
 			} elseif ( 'remove' === $action ) {
 				$result = PigCache_Dropin_Html_Cache::remove();
 			} else {
@@ -179,6 +181,8 @@ class PigCache_Admin {
 		$action = sanitize_key( wp_unslash( $_POST['pigcache_db_action'] ) );
 		if ( 'install' === $action ) {
 			$result = PigCache_Dropin_DB::install();
+		} elseif ( 'update' === $action ) {
+			$result = PigCache_Dropin_DB::update_dropin();
 		} elseif ( 'remove' === $action ) {
 			$result = PigCache_Dropin_DB::remove();
 		} else {
@@ -376,10 +380,11 @@ class PigCache_Admin {
 	 * Live group lists + optional extra groups that skip Redis persistence.
 	 */
 	public static function render_html_cache_dropin_section() {
-		$ac_file   = PigCache_Dropin_Html_Cache::file_exists();
-		$ac_ours   = PigCache_Dropin_Html_Cache::is_our_file();
-		$ac_active = PigCache_Dropin_Html_Cache::is_active();
-		$wp_cache  = PigCache_Dropin_Html_Cache::wp_cache_constant_active();
+		$ac_file     = PigCache_Dropin_Html_Cache::file_exists();
+		$ac_ours     = PigCache_Dropin_Html_Cache::is_our_file();
+		$ac_active   = PigCache_Dropin_Html_Cache::is_active();
+		$ac_outdated = PigCache_Dropin_Html_Cache::is_outdated();
+		$wp_cache    = PigCache_Dropin_Html_Cache::wp_cache_constant_active();
 
 		echo '<h2>' . esc_html__( 'Full-page HTML cache (advanced-cache.php)', 'pigcache' ) . '</h2>';
 
@@ -409,6 +414,9 @@ class PigCache_Admin {
 			echo esc_html__( 'Not installed', 'pigcache' );
 		}
 		echo '</td></tr>';
+		if ( $ac_ours && $ac_outdated ) {
+			echo '<tr><th>' . esc_html__( 'Version', 'pigcache' ) . '</th><td>' . esc_html__( 'Plugin ships a newer drop-in — use Update.', 'pigcache' ) . '</td></tr>';
+		}
 
 		echo '</tbody></table>';
 
@@ -422,7 +430,11 @@ class PigCache_Admin {
 		}
 
 		if ( $ac_ours ) {
-			echo '<p><button type="submit" name="pigcache_html_action" value="remove" class="button">';
+			echo '<p>';
+			if ( $ac_outdated ) {
+				echo '<button type="submit" name="pigcache_html_action" value="update" class="button">' . esc_html__( 'Update drop-in', 'pigcache' ) . '</button> ';
+			}
+			echo '<button type="submit" name="pigcache_html_action" value="remove" class="button">';
 			echo esc_html__( 'Remove PigCache advanced-cache.php', 'pigcache' );
 			echo '</button></p>';
 		}
@@ -590,6 +602,7 @@ class PigCache_Admin {
 		$oc          = wp_using_ext_object_cache();
 
 		echo '<div class="wrap">';
+		echo '<h1 class="screen-reader-text">' . esc_html__( 'PigCache', 'pigcache' ) . '</h1>';
 
 		self::render_page_header();
 
@@ -650,9 +663,10 @@ class PigCache_Admin {
 
 		self::render_html_cache_dropin_section();
 
-		$sql_active = PigCache_Dropin_DB::is_active();
-		$db_file    = PigCache_Dropin_DB::file_exists();
-		$db_ours    = PigCache_Dropin_DB::is_our_file();
+		$sql_active  = PigCache_Dropin_DB::is_active();
+		$db_file     = PigCache_Dropin_DB::file_exists();
+		$db_ours     = PigCache_Dropin_DB::is_our_file();
+		$db_outdated = PigCache_Dropin_DB::is_outdated();
 
 		echo '<h2>' . esc_html__( 'SQL result cache (db.php)', 'pigcache' ) . '</h2>';
 
@@ -670,6 +684,9 @@ class PigCache_Admin {
 			echo esc_html__( 'Not installed', 'pigcache' );
 		}
 		echo '</td></tr>';
+		if ( $db_ours && $db_outdated ) {
+			echo '<tr><th>' . esc_html__( 'Version', 'pigcache' ) . '</th><td>' . esc_html__( 'Plugin ships a newer drop-in — use Update.', 'pigcache' ) . '</td></tr>';
+		}
 		echo '</tbody></table>';
 
 		echo '<form method="post" class="pigcache-form">';
@@ -680,7 +697,12 @@ class PigCache_Admin {
 			echo '<p><button type="submit" name="pigcache_db_action" value="install" class="button button-primary">' . esc_html__( 'Install db.php drop-in', 'pigcache' ) . '</button></p>';
 		}
 		if ( $db_ours ) {
-			echo '<p><button type="submit" name="pigcache_db_action" value="remove" class="button">' . esc_html__( 'Remove PigCache db.php', 'pigcache' ) . '</button></p>';
+			echo '<p>';
+			if ( $db_outdated ) {
+				echo '<button type="submit" name="pigcache_db_action" value="update" class="button">' . esc_html__( 'Update drop-in', 'pigcache' ) . '</button> ';
+			}
+			echo '<button type="submit" name="pigcache_db_action" value="remove" class="button">' . esc_html__( 'Remove PigCache db.php', 'pigcache' ) . '</button>';
+			echo '</p>';
 		}
 		echo '</form>';
 

@@ -23,7 +23,7 @@ set -euo pipefail
 PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST_DIR="${PLUGIN_DIR}/dist"
 
-# Read version from plugin header
+# Read current version from plugin header
 VERSION=$(grep -m1 "Version:" "${PLUGIN_DIR}/pigcache.php" \
   | sed 's/.*Version:[[:space:]]*//' | tr -d '[:space:]')
 
@@ -32,24 +32,73 @@ if [[ -z "${VERSION}" ]]; then
   exit 1
 fi
 
+# -----------------------------------------------------------------------
+# Version bump
+# -----------------------------------------------------------------------
+IFS='.' read -r _V_MAJOR _V_MINOR _V_PATCH <<< "${VERSION}"
+
 echo ""
-echo "PigCache ${VERSION} — pre-build checklist"
+echo "PigCache — current version: ${VERSION}"
 echo ""
-echo "  Before exporting, confirm that the version has been updated in:"
-echo "    1. pigcache.php      → Plugin header  (Version: x.x.x)"
-echo "    2. pigcache.php      → PIGCACHE_VERSION constant"
-echo "    3. readme.txt        → Stable tag"
-echo "    4. readme.txt        → Changelog entry"
+echo "  Release type:"
+echo "    1) patch  → ${_V_MAJOR}.${_V_MINOR}.$((_V_PATCH + 1))   (bug fix / maintenance)"
+echo "    2) minor  → ${_V_MAJOR}.$((_V_MINOR + 1)).0              (new feature)"
+echo "    3) major  → $((_V_MAJOR + 1)).0.0                        (breaking change)"
+echo "    4) manual → enter version yourself"
+echo "    5) skip   → keep ${VERSION} as-is (files already updated)"
 echo ""
-read -r -p "  Have you updated the version in all of the above? [Y/n] " _confirm
-case "${_confirm}" in
-  [Yy]|"") ;;
-  *)
-    echo ""
-    echo "  Build cancelled. Update the version and run again."
-    exit 1
+read -r -p "  Choose [1-5]: " _bump_type
+
+case "${_bump_type}" in
+  1|"") NEW_VERSION="${_V_MAJOR}.${_V_MINOR}.$((_V_PATCH + 1))" ;;
+  2)    NEW_VERSION="${_V_MAJOR}.$((_V_MINOR + 1)).0" ;;
+  3)    NEW_VERSION="$((_V_MAJOR + 1)).0.0" ;;
+  4)
+    read -r -p "  Enter new version (e.g. 1.2.0): " NEW_VERSION
+    NEW_VERSION="${NEW_VERSION//[[:space:]]/}"
+    if [[ -z "${NEW_VERSION}" ]]; then
+      echo "  No version entered. Aborting." >&2; exit 1
+    fi
     ;;
+  5)    NEW_VERSION="${VERSION}" ;;
+  *)    echo "  Invalid choice. Aborting." >&2; exit 1 ;;
 esac
+
+if [[ "${NEW_VERSION}" != "${VERSION}" ]]; then
+  echo ""
+  read -r -p "  Changelog summary for ${NEW_VERSION} (one line): " _changelog_summary
+
+  echo ""
+  echo "  About to update:"
+  echo "    pigcache.php  →  Version: ${NEW_VERSION}"
+  echo "    pigcache.php  →  PIGCACHE_VERSION '${NEW_VERSION}'"
+  echo "    readme.txt    →  Stable tag: ${NEW_VERSION}"
+  echo "    readme.txt    →  Changelog entry"
+  echo ""
+  read -r -p "  Apply? [Y/n] " _confirm_bump
+  case "${_confirm_bump}" in
+    [Yy]|"") ;;
+    *) echo "  Aborted."; exit 1 ;;
+  esac
+
+  # 1. Plugin header  (` * Version: x.x.x`)
+  sed -i "s|^ \* Version: .*| \* Version: ${NEW_VERSION}|" "${PLUGIN_DIR}/pigcache.php"
+
+  # 2. PIGCACHE_VERSION constant
+  sed -i "s|define( 'PIGCACHE_VERSION', '[^']*' )|define( 'PIGCACHE_VERSION', '${NEW_VERSION}' )|" \
+    "${PLUGIN_DIR}/pigcache.php"
+
+  # 3. Stable tag in readme.txt
+  sed -i "s|^Stable tag: .*|Stable tag: ${NEW_VERSION}|" "${PLUGIN_DIR}/readme.txt"
+
+  # 4. Changelog entry — inserted right after == Changelog == heading
+  sed -i "s|^== Changelog ==\$|== Changelog ==\n\n= ${NEW_VERSION} =\n* ${_changelog_summary}|" \
+    "${PLUGIN_DIR}/readme.txt"
+
+  VERSION="${NEW_VERSION}"
+  echo "  Version bumped to ${VERSION}."
+fi
+
 echo ""
 echo "PigCache ${VERSION} — building..."
 

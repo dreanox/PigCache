@@ -4,6 +4,8 @@
  *
  * Install: copy this file to wp-content/db.php (use the button on Settings → PigCache).
  *
+ * Version: 1.0.1
+ *
  * @package PigCache
  */
 

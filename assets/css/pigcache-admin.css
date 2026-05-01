@@ -204,7 +204,7 @@
 
 .pigcache-header--pro {
 	display: flex;
-	align-items: center;
+	align-items: flex-start;
 	justify-content: space-between;
 	flex-wrap: wrap;
 	gap: 12px;
@@ -220,11 +220,13 @@
 	display: flex;
 	align-items: center;
 	gap: 14px;
+	align-self: center;
 }
 
 .pigcache-header__logo {
-	font-size: 36px;
-	line-height: 1;
+	width: 48px;
+	height: 48px;
+	flex-shrink: 0;
 	filter: drop-shadow(0 2px 4px rgba(0,0,0,.4));
 }
 
@@ -242,6 +244,7 @@
 	color: #fff;
 	line-height: 1.2;
 	border: none;
+	font-family: inherit;
 }
 
 .pigcache-header__plan-badge {
@@ -268,9 +271,11 @@
 
 .pigcache-header__right {
 	display: flex;
-	flex-direction: column;
-	align-items: flex-end;
-	gap: 8px;
+	flex-direction: row;
+	align-items: center;
+	flex-wrap: wrap;
+	gap: 10px;
+	justify-content: flex-end;
 }
 
 .pigcache-header__meta {
@@ -297,6 +302,7 @@
 
 .pigcache-header__pills {
 	display: flex;
+	align-items: center;
 	gap: 6px;
 	flex-wrap: wrap;
 	justify-content: flex-end;
