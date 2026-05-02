@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       PigCache
  * Description:       Redis object-cache drop-in with optional SQL, HTML page, and fragment caching.
- * Version: 1.0.2
+ * Version: 1.0.3
  * Requires at least: 5.8
  * Requires PHP:      7.4
  * Author:            PigCache
@@ -17,7 +17,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'PIGCACHE_VERSION', '1.0.2' );
+define( 'PIGCACHE_VERSION', '1.0.3' );
 define( 'PIGCACHE_FILE', __FILE__ );
 define( 'PIGCACHE_DIR', plugin_dir_path( __FILE__ ) );
 define( 'PIGCACHE_URL', plugin_dir_url( __FILE__ ) );
@@ -35,6 +35,7 @@ if ( ! defined( 'PIGCACHE_OC_VERSION' ) && ! empty( $oc_meta['Version'] ) ) {
 // Always loaded (Free + Pro).
 require_once PIGCACHE_DIR . 'includes/class-pigcache-config.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-license.php';
+require_once PIGCACHE_DIR . 'includes/class-pigcache-kv.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-sql-cache.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-html-cache.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-invalidation.php';
@@ -59,6 +60,9 @@ foreach ( array(
 	'class-pigcache-query-buffer.php',
 	'class-pigcache-query-stats.php',
 	'class-pigcache-continuous-learner.php',
+	'class-pigcache-mutation-tracker.php',
+	'class-pigcache-traffic-reader.php',
+	'class-pigcache-adaptive-ttl.php',
 	'class-pigcache-admin-pro.php',
 ) as $_pigcache_pro_file ) {
 	$_pigcache_pro_path = PIGCACHE_DIR . 'includes/' . $_pigcache_pro_file;

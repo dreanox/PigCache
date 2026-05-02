@@ -118,9 +118,13 @@ PRO_ONLY_FILES=(
   "includes/class-pigcache-query-buffer.php"
   "includes/class-pigcache-query-stats.php"
   "includes/class-pigcache-continuous-learner.php"
+  "includes/class-pigcache-mutation-tracker.php"
+  "includes/class-pigcache-traffic-reader.php"
+  "includes/class-pigcache-adaptive-ttl.php"
   "includes/class-pigcache-admin-pro.php"
   "includes/class-pigcache-tag-index.php"
   "includes/class-pigcache-tag-collector.php"
+  # class-pigcache-kv.php ships in BOTH builds (always-loaded, no Pro dependency)
 )
 
 # -----------------------------------------------------------------------

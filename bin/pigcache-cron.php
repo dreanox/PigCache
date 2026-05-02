@@ -61,18 +61,23 @@ if ( ! $db ) {
 $table_prefix  = $cfg['table_prefix'] ?? 'wp_';
 $stats_table   = $table_prefix . 'pigcache_query_stats';
 $options_table = $table_prefix . 'options';
+$kv_table      = $table_prefix . 'pigcache_kv';
+$kv_ready      = _pigcache_cron_table_exists( $db, $kv_table );
 
 // ── Determine which tasks to run ─────────────────────────────────────────────
 
-$run_flush = true;
-$run_send  = true;
-$run_cloud = true;
+$run_flush           = true;
+$run_send            = true;
+$run_cloud           = true;
+$run_mutation_harvest = true;
+$run_traffic_harvest  = true;
 
 foreach ( $argv ?? array() as $arg ) {
-	if ( $arg === '--flush-only' ) { $run_send = false; $run_cloud = false; }
-	if ( $arg === '--send-only'  ) { $run_flush = false; $run_cloud = false; }
-	if ( $arg === '--no-cloud'   ) { $run_cloud = false; }
-	if ( $arg === '--cloud-only' ) { $run_flush = false; $run_send = false; }
+	if ( $arg === '--flush-only'  ) { $run_send = false; $run_cloud = false; $run_mutation_harvest = false; $run_traffic_harvest = false; }
+	if ( $arg === '--send-only'   ) { $run_flush = false; $run_cloud = false; $run_mutation_harvest = false; $run_traffic_harvest = false; }
+	if ( $arg === '--no-cloud'    ) { $run_cloud = false; }
+	if ( $arg === '--cloud-only'  ) { $run_flush = false; $run_send = false; $run_mutation_harvest = false; $run_traffic_harvest = false; }
+	if ( $arg === '--no-adaptive' ) { $run_mutation_harvest = false; $run_traffic_harvest = false; }
 }
 
 // ── TASK 1: Flush APCu/Redis buffer → MySQL ───────────────────────────────────
@@ -86,8 +91,10 @@ if ( $run_flush ) {
 		_pigcache_cron_upsert_batch( $db, $stats_table, $rows, $period_start );
 	}
 
-	// Record last flush timestamp in wp_options so the admin panel can confirm.
-	_pigcache_cron_update_option( $db, $options_table, 'pigcache_cron_flush_last', (string) time() );
+	// Record heartbeat in wp_pigcache_kv (bypasses object cache — always visible to admin).
+	if ( $kv_ready ) {
+		_pigcache_cron_kv_set( $db, $kv_table, 'cron_flush_last', time() );
+	}
 
 	_pigcache_cron_log( 'flush done — ' . count( $rows ) . ' unique queries' );
 }
@@ -114,7 +121,9 @@ if ( $run_send ) {
 		}
 	}
 
-	_pigcache_cron_update_option( $db, $options_table, 'pigcache_cron_send_last', (string) time() );
+	if ( $kv_ready ) {
+		_pigcache_cron_kv_set( $db, $kv_table, 'cron_send_last', time() );
+	}
 
 	// Prune sent rows older than 30 days.
 	$db->query( "DELETE FROM `{$stats_table}` WHERE sent_at IS NOT NULL AND period_start < DATE_SUB(NOW(), INTERVAL 30 DAY)" );
@@ -194,6 +203,127 @@ if ( $run_cloud ) {
 		}
 
 		_pigcache_cron_update_option( $db, $options_table, 'pigcache_cloud_last_sync', (string) time() );
+	}
+}
+
+// ── TASK 4: Harvest mutation window → MySQL → stability map ──────────────────
+
+if ( $run_mutation_harvest ) {
+	$mut_window_raw = _pigcache_cron_get_option( $db, $options_table, 'pigcache_mut_window' );
+	$mut_window     = $mut_window_raw ? json_decode( $mut_window_raw, true ) : array();
+
+	if ( is_array( $mut_window ) && ! empty( $mut_window ) ) {
+		$stability_table = $table_prefix . 'pigcache_table_stability';
+		$window_start    = gmdate( 'Y-m-d H:i:s', (int) floor( time() / 900 ) * 900 );
+
+		if ( _pigcache_cron_table_exists( $db, $stability_table ) ) {
+			foreach ( $mut_window as $table_name => $count ) {
+				$stmt = $db->prepare(
+					"INSERT INTO `{$stability_table}` (table_name, window_start, mutation_count)
+					 VALUES (?, ?, ?)
+					 ON DUPLICATE KEY UPDATE mutation_count = mutation_count + VALUES(mutation_count)"
+				);
+				if ( $stmt ) {
+					$stmt->bind_param( 'ssi', $table_name, $window_start, $count );
+					$stmt->execute();
+					$stmt->close();
+				}
+			}
+
+			// Reset the window accumulator.
+			_pigcache_cron_update_option( $db, $options_table, 'pigcache_mut_window', '{}' );
+
+			// Prune old rows.
+			$db->query( "DELETE FROM `{$stability_table}` WHERE window_start < DATE_SUB(NOW(), INTERVAL 30 DAY)" );
+
+			// Build stability map (mutations per table in last 24h) and store as transient.
+			$stability_map = _pigcache_cron_build_stability_map( $db, $stability_table );
+			_pigcache_cron_set_transient( $db, $options_table, 'pigcache_stability_map', serialize( $stability_map ), 25 * 60 );
+
+			_pigcache_cron_log( 'mutation harvest done — ' . count( $mut_window ) . ' tables' );
+		} else {
+			_pigcache_cron_log( 'mutation harvest skipped — table not found (run plugin activate)' );
+		}
+	} else {
+		_pigcache_cron_log( 'mutation harvest — no pending mutations' );
+	}
+}
+
+// ── TASK 5: Harvest traffic data → MySQL → traffic map ───────────────────────
+
+if ( $run_traffic_harvest ) {
+	$last_traffic = $kv_ready
+		? (int) _pigcache_cron_kv_get( $db, $kv_table, 'cron_traffic_harvest_last' )
+		: (int) _pigcache_cron_get_option( $db, $options_table, 'pigcache_traffic_harvest_last' );
+	$harvest_due  = ( time() - $last_traffic ) >= ( 23 * 3600 );
+
+	if ( $harvest_due ) {
+		$traffic_table = $table_prefix . 'pigcache_url_traffic';
+
+		if ( _pigcache_cron_table_exists( $db, $traffic_table ) ) {
+			// Try AWStats first.
+			$traffic_data = _pigcache_cron_read_awstats( $cfg, $wp_config_path );
+			$source       = 'awstats';
+
+			// Fallback to own hit counters.
+			if ( empty( $traffic_data ) ) {
+				$hits_raw     = _pigcache_cron_get_option( $db, $options_table, 'pigcache_url_hits_window' );
+				$hits_raw_arr = $hits_raw ? json_decode( $hits_raw, true ) : array();
+
+				if ( is_array( $hits_raw_arr ) && ! empty( $hits_raw_arr ) ) {
+					foreach ( $hits_raw_arr as $entry ) {
+						if ( ! empty( $entry['uri'] ) && isset( $entry['hits'] ) ) {
+							$uri                      = $entry['uri'];
+							$traffic_data[ $uri ]     = ( isset( $traffic_data[ $uri ] ) ? $traffic_data[ $uri ] : 0 ) + (int) $entry['hits'];
+						}
+					}
+					_pigcache_cron_update_option( $db, $options_table, 'pigcache_url_hits_window', '{}' );
+				}
+
+				$source = 'self';
+			}
+
+			if ( ! empty( $traffic_data ) ) {
+				$period_start = gmdate( 'Y-m-d H:i:s', (int) floor( time() / 86400 ) * 86400 );
+
+				foreach ( array_chunk( $traffic_data, 100, true ) as $chunk ) {
+					foreach ( $chunk as $uri => $hits ) {
+						$url_hash = md5( $uri );
+						$uri_str  = substr( (string) $uri, 0, 2083 );
+						$stmt     = $db->prepare(
+							"INSERT INTO `{$traffic_table}` (url_hash, url, hit_count, period_start)
+							 VALUES (?, ?, ?, ?)
+							 ON DUPLICATE KEY UPDATE hit_count = hit_count + VALUES(hit_count)"
+						);
+						if ( $stmt ) {
+							$stmt->bind_param( 'ssis', $url_hash, $uri_str, $hits, $period_start );
+							$stmt->execute();
+							$stmt->close();
+						}
+					}
+				}
+
+				$db->query( "DELETE FROM `{$traffic_table}` WHERE period_start < DATE_SUB(NOW(), INTERVAL 30 DAY)" );
+			}
+
+			// Build traffic map (top 1000 URLs by 30-day hits) and store as transient.
+			$traffic_map = _pigcache_cron_build_traffic_map( $db, $traffic_table );
+			_pigcache_cron_set_transient( $db, $options_table, 'pigcache_traffic_map', serialize( $traffic_map ), 25 * 3600 );
+
+			if ( $kv_ready ) {
+				_pigcache_cron_kv_set( $db, $kv_table, 'cron_traffic_harvest_last', time() );
+				_pigcache_cron_kv_set( $db, $kv_table, 'cron_traffic_source_used', $source );
+			} else {
+				_pigcache_cron_update_option( $db, $options_table, 'pigcache_traffic_harvest_last', (string) time() );
+				_pigcache_cron_update_option( $db, $options_table, 'pigcache_traffic_source_used', $source );
+			}
+
+			_pigcache_cron_log( 'traffic harvest done — ' . count( $traffic_data ) . ' URLs (source: ' . $source . ')' );
+		} else {
+			_pigcache_cron_log( 'traffic harvest skipped — table not found (run plugin activate)' );
+		}
+	} else {
+		_pigcache_cron_log( 'traffic harvest — skipped (last run ' . round( ( time() - $last_traffic ) / 3600, 1 ) . 'h ago)' );
 	}
 }
 
@@ -632,6 +762,236 @@ function _pigcache_cron_mark_synced_fingerprints( mysqli $db, string $table, arr
 	$stmt->bind_param( $types, ...$hashes );
 	$stmt->execute();
 	$stmt->close();
+}
+
+// ── KV store helpers (mirrors PigCache_KV for standalone cron) ───────────────
+
+/**
+ * Write a scalar value to wp_pigcache_kv.
+ * Scalar values are stored as plain strings (matching maybe_serialize behaviour).
+ *
+ * @param mixed $value  Scalar only — arrays not needed from the cron.
+ */
+function _pigcache_cron_kv_set( mysqli $db, string $table, string $key, $value ): void {
+	$val  = (string) $value;
+	$now  = gmdate( 'Y-m-d H:i:s' );
+	$stmt = $db->prepare(
+		"INSERT INTO `{$table}` (`key`, value, updated_at, expires_at)
+		 VALUES (?, ?, ?, NULL)
+		 ON DUPLICATE KEY UPDATE value = VALUES(value), updated_at = VALUES(updated_at), expires_at = NULL"
+	);
+	if ( $stmt ) {
+		$stmt->bind_param( 'sss', $key, $val, $now );
+		$stmt->execute();
+		$stmt->close();
+	}
+}
+
+/**
+ * Read a scalar value from wp_pigcache_kv.
+ * Returns $default when the key is absent or expired.
+ *
+ * @return string
+ */
+function _pigcache_cron_kv_get( mysqli $db, string $table, string $key, string $default = '' ): string {
+	$stmt = $db->prepare(
+		"SELECT value FROM `{$table}`
+		  WHERE `key` = ? AND (expires_at IS NULL OR expires_at > NOW())
+		  LIMIT 1"
+	);
+	if ( ! $stmt ) {
+		return $default;
+	}
+	$stmt->bind_param( 's', $key );
+	$stmt->execute();
+	$result = $stmt->get_result();
+	$row    = $result ? $result->fetch_assoc() : null;
+	$stmt->close();
+	return $row ? (string) $row['value'] : $default;
+}
+
+// ── Adaptive TTL helpers ──────────────────────────────────────────────────────
+
+/**
+ * Write a WordPress transient directly to MySQL.
+ * Mirrors what set_transient() does internally.
+ *
+ * @param int $ttl  Seconds until expiry.
+ */
+function _pigcache_cron_set_transient( mysqli $db, string $options_table, string $key, string $value, int $ttl ): void {
+	$timeout_key   = '_transient_timeout_' . $key;
+	$transient_key = '_transient_' . $key;
+	$expires       = time() + $ttl;
+
+	// Write the timeout first, then the value.
+	$stmt = $db->prepare(
+		"INSERT INTO `{$options_table}` (option_name, option_value, autoload) VALUES (?, ?, 'no')
+		 ON DUPLICATE KEY UPDATE option_value = VALUES(option_value)"
+	);
+	if ( $stmt ) {
+		$exp_str = (string) $expires;
+		$stmt->bind_param( 'ss', $timeout_key, $exp_str );
+		$stmt->execute();
+		$stmt->bind_param( 'ss', $transient_key, $value );
+		$stmt->execute();
+		$stmt->close();
+	}
+}
+
+/**
+ * Build the stability map: table_name → mutations in last 24h.
+ *
+ * @return array<string,int>
+ */
+function _pigcache_cron_build_stability_map( mysqli $db, string $stability_table ): array {
+	$result = $db->query(
+		"SELECT table_name, SUM(mutation_count) AS total
+		   FROM `{$stability_table}`
+		  WHERE window_start >= DATE_SUB(NOW(), INTERVAL 1 DAY)
+		  GROUP BY table_name"
+	);
+
+	$map = array();
+	if ( $result ) {
+		while ( $row = $result->fetch_assoc() ) {
+			$map[ $row['table_name'] ] = (int) $row['total'];
+		}
+		$result->free();
+	}
+
+	return $map;
+}
+
+/**
+ * Build the traffic map: url → total hits over last 30 days (top 1000).
+ *
+ * @return array<string,int>
+ */
+function _pigcache_cron_build_traffic_map( mysqli $db, string $traffic_table ): array {
+	$result = $db->query(
+		"SELECT url, SUM(hit_count) AS total_hits
+		   FROM `{$traffic_table}`
+		  WHERE period_start >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+		  GROUP BY url
+		  ORDER BY total_hits DESC
+		  LIMIT 1000"
+	);
+
+	$map = array();
+	if ( $result ) {
+		while ( $row = $result->fetch_assoc() ) {
+			$map[ $row['url'] ] = (int) $row['total_hits'];
+		}
+		$result->free();
+	}
+
+	return $map;
+}
+
+/**
+ * Find and parse AWStats data files, returning uri → hits map.
+ * Mirrors PigCache_Traffic_Reader::read_awstats() for standalone use.
+ *
+ * @return array<string,int>
+ */
+function _pigcache_cron_read_awstats( array $cfg, string $wp_config_path ): array {
+	// Resolve AWStats directory.
+	$dir = '';
+
+	if ( ! empty( $cfg['PIGCACHE_AWSTATS_DIR'] ) ) {
+		$dir = rtrim( $cfg['PIGCACHE_AWSTATS_DIR'], '/\\' );
+	}
+
+	if ( ! $dir || ! is_dir( $dir ) ) {
+		$base         = rtrim( dirname( $wp_config_path ), '/\\' );
+		$candidates   = array(
+			dirname( dirname( $base ) ) . '/tmp/awstats',
+			dirname( $base ) . '/tmp/awstats',
+			$base . '/tmp/awstats',
+			'/tmp/awstats',
+		);
+		foreach ( $candidates as $path ) {
+			if ( is_dir( $path ) ) {
+				$dir = $path;
+				break;
+			}
+		}
+	}
+
+	if ( ! $dir || ! is_dir( $dir ) ) {
+		return array();
+	}
+
+	$files = glob( $dir . '/awstats*.txt' );
+	if ( empty( $files ) ) {
+		return array();
+	}
+
+	usort( $files, static function ( $a, $b ) {
+		return filemtime( $b ) - filemtime( $a );
+	} );
+
+	return _pigcache_cron_parse_awstats_file( $files[0] );
+}
+
+/**
+ * Parse BEGIN_URLS section of an AWStats data file.
+ *
+ * @return array<string,int>
+ */
+function _pigcache_cron_parse_awstats_file( string $path ): array {
+	$handle = @fopen( $path, 'r' );
+	if ( ! $handle ) {
+		return array();
+	}
+
+	$result     = array();
+	$in_section = false;
+	$static_ext = array(
+		'jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'ico',
+		'css', 'js', 'woff', 'woff2', 'ttf', 'eot', 'otf',
+		'mp4', 'mp3', 'pdf', 'zip', 'gz', 'map',
+	);
+
+	while ( ( $line = fgets( $handle ) ) !== false ) {
+		$line = rtrim( $line );
+
+		if ( 'BEGIN_URLS' === substr( $line, 0, 10 ) ) {
+			$in_section = true;
+			continue;
+		}
+
+		if ( 'END_URLS' === $line ) {
+			break;
+		}
+
+		if ( ! $in_section || '' === $line || '#' === $line[0] ) {
+			continue;
+		}
+
+		$parts = preg_split( '/\s+/', $line );
+		if ( ! isset( $parts[2] ) ) {
+			continue;
+		}
+
+		$uri  = $parts[0];
+		$hits = (int) $parts[2];
+
+		if ( $hits < 1 || '' === $uri ) {
+			continue;
+		}
+
+		$ext = strtolower( pathinfo( $uri, PATHINFO_EXTENSION ) );
+		if ( in_array( $ext, $static_ext, true ) ) {
+			continue;
+		}
+
+		$result[ $uri ] = isset( $result[ $uri ] ) ? $result[ $uri ] + $hits : $hits;
+	}
+
+	fclose( $handle );
+
+	return $result;
 }
 
 /**

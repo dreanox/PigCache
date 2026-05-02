@@ -28,6 +28,10 @@ composer.lock
 
 # Tests
 tests/
+.phpunit.result.cache
+
+# Planning / internal docs (not for end users)
+plans.md
 
 # Internal docs (not for end users)
 CHANGELOG.md

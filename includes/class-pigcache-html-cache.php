@@ -102,6 +102,11 @@ class PigCache_Html_Cache {
 		$pack = self::get_pack();
 
 		if ( is_array( $pack ) && ! empty( $pack['html'] ) ) {
+			// Record this HIT for Adaptive TTL traffic tracking (own-counter fallback).
+			if ( class_exists( 'PigCache_Traffic_Reader', false ) ) {
+				PigCache_Traffic_Reader::record_hit( self::cache_key(), self::request_uri() );
+			}
+
 			echo $pack['html']; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
 			exit;
 		}
@@ -144,6 +149,23 @@ class PigCache_Html_Cache {
 		$ttl = (int) apply_filters( 'pigcache_html_ttl', $base, self::request_uri() );
 		if ( $ttl < 1 ) {
 			$ttl = $base > 0 ? $base : 60;
+		}
+
+		// Adaptive TTL v2 — overrides static TTL when enabled and data is available.
+		if ( class_exists( 'PigCache_Adaptive_Ttl', false ) ) {
+			$adaptive = PigCache_Adaptive_Ttl::decide( self::request_uri(), $tags );
+
+			if ( 0 === $adaptive ) {
+				// ❄️ Cold — skip caching entirely.
+				self::release_lock();
+				return $html;
+			}
+
+			if ( $adaptive > 0 ) {
+				// Hot + Stable or Hot + Dynamic tier.
+				$ttl = $adaptive;
+			}
+			// $adaptive === -1 → no data yet or disabled → keep static $ttl.
 		}
 
 		$key = self::cache_key();

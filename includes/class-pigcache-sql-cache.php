@@ -77,6 +77,11 @@ class PigCache_Sql_Cache {
 		if ( false === $new || 0 === $new ) {
 			wp_cache_set( $key, 2, self::GROUP_META, self::long_ttl() );
 		}
+
+		// Record mutation for Adaptive TTL v2 stability tracking.
+		if ( class_exists( 'PigCache_Mutation_Tracker', false ) ) {
+			PigCache_Mutation_Tracker::record_mutation( $table );
+		}
 	}
 
 	/**

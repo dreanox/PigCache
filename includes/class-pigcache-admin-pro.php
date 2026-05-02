@@ -17,9 +17,11 @@ class PigCache_Admin_Pro {
 		add_action( 'admin_init', array( __CLASS__, 'handle_license_post' ) );
 		add_action( 'admin_init', array( __CLASS__, 'handle_profiler_post' ) );
 		add_action( 'admin_init', array( __CLASS__, 'handle_learning_post' ) );
+		add_action( 'admin_init', array( __CLASS__, 'handle_adaptive_ttl_post' ) );
 		add_action( 'pigcache_admin_pro_header',            array( __CLASS__, 'render_page_header_pro' ) );
 		add_action( 'pigcache_admin_pro_sections',          array( __CLASS__, 'render_sql_profiler_section' ) );
 		add_action( 'pigcache_admin_pro_sections',          array( __CLASS__, 'maybe_render_continuous_learning' ) );
+		add_action( 'pigcache_admin_pro_sections',          array( __CLASS__, 'render_adaptive_ttl_section' ) );
 		add_action( 'pigcache_admin_pro_license_section',   array( __CLASS__, 'render_license_section_pro' ) );
 		add_action( 'pigcache_admin_cache_dashboard_extra', array( __CLASS__, 'render_query_analytics_card' ) );
 	}
@@ -607,10 +609,8 @@ class PigCache_Admin_Pro {
 			echo '<td>' . esc_html( number_format( $unsent_rows ) ) . '</td></tr>';
 		}
 
-		wp_cache_delete( PigCache_Continuous_Learner::OPT_FLUSH_LAST, 'options' );
-		wp_cache_delete( PigCache_Continuous_Learner::OPT_SEND_LAST,  'options' );
-		$flush_ts = (int) get_option( PigCache_Continuous_Learner::OPT_FLUSH_LAST, 0 );
-		$send_ts  = (int) get_option( PigCache_Continuous_Learner::OPT_SEND_LAST,  0 );
+		$flush_ts = (int) PigCache_KV::get( PigCache_KV::KEY_CRON_FLUSH_LAST, 0 );
+		$send_ts  = (int) PigCache_KV::get( PigCache_KV::KEY_CRON_SEND_LAST, 0 );
 
 		echo '<tr><th>' . esc_html__( 'Last buffer flush', 'pigcache' ) . '</th><td>';
 		echo $flush_ts
@@ -708,7 +708,7 @@ class PigCache_Admin_Pro {
 
 		$cron_confirmed = PigCache_Continuous_Learner::is_cron_confirmed();
 		$using_wp_cron  = PigCache_Continuous_Learner::using_wp_cron_fallback();
-		$flush_last     = (int) get_option( PigCache_Continuous_Learner::OPT_FLUSH_LAST, 0 );
+		$flush_last     = (int) PigCache_KV::get( PigCache_KV::KEY_CRON_FLUSH_LAST, 0 );
 
 		if ( $cron_confirmed ) {
 			echo '<div class="notice notice-success inline" style="margin:12px 0">';
@@ -792,6 +792,280 @@ class PigCache_Admin_Pro {
 		echo '<pre class="pigcache-code-block">define( \'PIGCACHE_USE_WP_CRON\', true );</pre>';
 
 		echo '</div></details>';
+	}
+
+	// ------------------------------------------------------------------
+	// Adaptive TTL v2
+	// ------------------------------------------------------------------
+
+	/**
+	 * Handle the Adaptive TTL settings form.
+	 */
+	public static function handle_adaptive_ttl_post() {
+		if ( ! current_user_can( 'manage_options' ) || ! isset( $_POST['pigcache_adaptive_ttl_action'] ) ) {
+			return;
+		}
+
+		check_admin_referer( 'pigcache_adaptive_ttl' );
+
+		$action = sanitize_key( wp_unslash( $_POST['pigcache_adaptive_ttl_action'] ) );
+		$url    = admin_url( 'options-general.php?page=pigcache' );
+
+		if ( 'save' === $action ) {
+			$enabled = ! empty( $_POST['pigcache_adaptive_ttl_enabled'] );
+			update_option( 'pigcache_adaptive_ttl_enabled', $enabled, false );
+
+			if ( isset( $_POST['pigcache_ttl_hot_stable'] ) ) {
+				update_option( 'pigcache_ttl_hot_stable', max( 1, (int) $_POST['pigcache_ttl_hot_stable'] ), false );
+			}
+			if ( isset( $_POST['pigcache_ttl_hot_dynamic'] ) ) {
+				update_option( 'pigcache_ttl_hot_dynamic', max( 1, (int) $_POST['pigcache_ttl_hot_dynamic'] ), false );
+			}
+			if ( isset( $_POST['pigcache_traffic_cold_threshold'] ) ) {
+				update_option( 'pigcache_traffic_cold_threshold', max( 0, (int) $_POST['pigcache_traffic_cold_threshold'] ), false );
+			}
+			if ( isset( $_POST['pigcache_mutation_dynamic_threshold'] ) ) {
+				update_option( 'pigcache_mutation_dynamic_threshold', max( 0, (int) $_POST['pigcache_mutation_dynamic_threshold'] ), false );
+			}
+
+			$url = add_query_arg( 'pigcache_adaptive', 'saved', $url );
+		} elseif ( 'force_traffic_harvest' === $action ) {
+			// Reset last harvest timestamp so it runs on next cron tick.
+			PigCache_KV::delete( PigCache_KV::KEY_CRON_TRAFFIC_HARVEST_LAST );
+			$url = add_query_arg( 'pigcache_adaptive', 'harvest_reset', $url );
+		}
+
+		wp_safe_redirect( $url );
+		exit;
+	}
+
+	/**
+	 * Render the Adaptive TTL v2 section (hooked onto pigcache_admin_pro_sections).
+	 */
+	public static function render_adaptive_ttl_section() {
+		if (
+			! class_exists( 'PigCache_Adaptive_Ttl', false ) ||
+			! class_exists( 'PigCache_Traffic_Reader', false ) ||
+			! class_exists( 'PigCache_Mutation_Tracker', false )
+		) {
+			return;
+		}
+
+		// Resolve effective values: constant overrides wp_options.
+		$enabled = PigCache_Adaptive_Ttl::is_enabled();
+
+		$ttl_stable  = defined( 'PIGCACHE_TTL_HOT_STABLE' )
+			? (int) PIGCACHE_TTL_HOT_STABLE
+			: (int) get_option( 'pigcache_ttl_hot_stable', PigCache_Adaptive_Ttl::DEFAULT_TTL_HOT_STABLE );
+
+		$ttl_dynamic = defined( 'PIGCACHE_TTL_HOT_DYNAMIC' )
+			? (int) PIGCACHE_TTL_HOT_DYNAMIC
+			: (int) get_option( 'pigcache_ttl_hot_dynamic', PigCache_Adaptive_Ttl::DEFAULT_TTL_HOT_DYNAMIC );
+
+		$cold_threshold = defined( 'PIGCACHE_TRAFFIC_COLD_THRESHOLD' )
+			? (int) PIGCACHE_TRAFFIC_COLD_THRESHOLD
+			: (int) get_option( 'pigcache_traffic_cold_threshold', PigCache_Adaptive_Ttl::DEFAULT_COLD_THRESHOLD );
+
+		$dyn_threshold = defined( 'PIGCACHE_MUTATION_DYNAMIC_THRESHOLD' )
+			? (int) PIGCACHE_MUTATION_DYNAMIC_THRESHOLD
+			: (int) get_option( 'pigcache_mutation_dynamic_threshold', PigCache_Adaptive_Ttl::DEFAULT_DYN_THRESHOLD );
+
+		$const_override = defined( 'PIGCACHE_ADAPTIVE_TTL' );
+		$traffic_source = PigCache_Traffic_Reader::detect_source();
+		$awstats_dir    = PigCache_Traffic_Reader::awstats_dir();
+		$source_label   = PigCache_Traffic_Reader::last_source_label();
+		$last_harvest   = (int) PigCache_KV::get( PigCache_KV::KEY_CRON_TRAFFIC_HARVEST_LAST, 0 );
+		$stability_map  = PigCache_Mutation_Tracker::get_stability_map();
+		$traffic_map    = PigCache_Traffic_Reader::get_traffic_map();
+
+		echo '<h2>' . esc_html__( 'Adaptive TTL', 'pigcache' );
+		echo ' <span class="pigcache-pro-badge">PRO</span>';
+		echo '</h2>';
+
+		// Flash notices.
+		if ( isset( $_GET['pigcache_adaptive'] ) ) {
+			$msg_key = sanitize_key( $_GET['pigcache_adaptive'] );
+			$msgs    = array(
+				'saved'         => __( 'Adaptive TTL settings saved.', 'pigcache' ),
+				'harvest_reset' => __( 'Traffic harvest will run on the next cron tick.', 'pigcache' ),
+			);
+			if ( isset( $msgs[ $msg_key ] ) ) {
+				echo '<div class="notice notice-success inline"><p>' . esc_html( $msgs[ $msg_key ] ) . '</p></div>';
+			}
+		}
+
+		// Status table.
+		echo '<table class="widefat striped pigcache-table"><tbody>';
+
+		echo '<tr><th>' . esc_html__( 'Status', 'pigcache' ) . '</th><td>';
+		if ( $enabled ) {
+			echo '<span style="color:green">&#10003; <strong>' . esc_html__( 'Enabled', 'pigcache' ) . '</strong></span>';
+		} else {
+			echo '<span style="color:#b32d2e">&#10007; ' . esc_html__( 'Disabled', 'pigcache' ) . '</span>';
+		}
+		if ( $const_override ) {
+			echo ' <span class="description">(' . esc_html__( 'constant override', 'pigcache' ) . ')</span>';
+		}
+		echo '</td></tr>';
+
+		echo '<tr><th>' . esc_html__( 'Traffic source', 'pigcache' ) . '</th><td>';
+		echo esc_html( $source_label );
+		if ( 'awstats' === $traffic_source && $awstats_dir ) {
+			echo ' <span class="description">(<code>' . esc_html( $awstats_dir ) . '</code>)</span>';
+		}
+		echo '</td></tr>';
+
+		echo '<tr><th>' . esc_html__( 'Last traffic harvest', 'pigcache' ) . '</th><td>';
+		echo $last_harvest
+			? esc_html( human_time_diff( $last_harvest ) . ' ' . __( 'ago', 'pigcache' ) )
+			: '<span style="color:#b32d2e">' . esc_html__( 'Never', 'pigcache' ) . '</span>';
+		echo '</td></tr>';
+
+		echo '<tr><th>' . esc_html__( 'Tables in stability map', 'pigcache' ) . '</th>';
+		echo '<td>' . esc_html( (string) count( $stability_map ) ) . '</td></tr>';
+
+		echo '<tr><th>' . esc_html__( 'URLs in traffic map', 'pigcache' ) . '</th>';
+		echo '<td>' . esc_html( number_format( count( $traffic_map ) ) ) . '</td></tr>';
+
+		echo '<tr><th>' . esc_html__( 'TTL — Hot + Stable', 'pigcache' ) . '</th>';
+		echo '<td><strong>' . esc_html( human_time_diff( 0, $ttl_stable ) ) . '</strong>';
+		if ( defined( 'PIGCACHE_TTL_HOT_STABLE' ) ) {
+			echo ' <span class="description">(' . esc_html__( 'constant', 'pigcache' ) . ')</span>';
+		}
+		echo '</td></tr>';
+
+		echo '<tr><th>' . esc_html__( 'TTL — Hot + Dynamic', 'pigcache' ) . '</th>';
+		echo '<td><strong>' . esc_html( human_time_diff( 0, $ttl_dynamic ) ) . '</strong>';
+		if ( defined( 'PIGCACHE_TTL_HOT_DYNAMIC' ) ) {
+			echo ' <span class="description">(' . esc_html__( 'constant', 'pigcache' ) . ')</span>';
+		}
+		echo '</td></tr>';
+
+		echo '<tr><th>' . esc_html__( 'Cold threshold', 'pigcache' ) . '</th>';
+		echo '<td>' . esc_html( number_format( $cold_threshold ) . ' ' . __( 'hits/30 days', 'pigcache' ) ) . '</td></tr>';
+
+		echo '<tr><th>' . esc_html__( 'Dynamic threshold', 'pigcache' ) . '</th>';
+		echo '<td>' . esc_html( number_format( $dyn_threshold ) . ' ' . __( 'mutations/day', 'pigcache' ) ) . '</td></tr>';
+
+		echo '</tbody></table>';
+
+		// Settings form (hidden when all overridden by constants).
+		if ( ! $const_override ) {
+			echo '<form method="post" class="pigcache-form" style="margin-top:12px">';
+			wp_nonce_field( 'pigcache_adaptive_ttl' );
+
+			echo '<p>';
+			echo '<label>';
+			echo '<input type="checkbox" name="pigcache_adaptive_ttl_enabled" value="1"' . checked( $enabled, true, false ) . '> ';
+			echo esc_html__( 'Enable Adaptive TTL', 'pigcache' );
+			echo '</label>';
+			echo '</p>';
+
+			echo '<table class="form-table" style="max-width:500px"><tbody>';
+
+			echo '<tr><th style="width:220px"><label for="pigcache_ttl_hot_stable">' . esc_html__( 'Hot + Stable TTL (seconds)', 'pigcache' ) . '</label></th>';
+			echo '<td><input type="number" id="pigcache_ttl_hot_stable" name="pigcache_ttl_hot_stable" value="' . esc_attr( (string) $ttl_stable ) . '" min="1" step="1" style="width:100px"></td></tr>';
+
+			echo '<tr><th><label for="pigcache_ttl_hot_dynamic">' . esc_html__( 'Hot + Dynamic TTL (seconds)', 'pigcache' ) . '</label></th>';
+			echo '<td><input type="number" id="pigcache_ttl_hot_dynamic" name="pigcache_ttl_hot_dynamic" value="' . esc_attr( (string) $ttl_dynamic ) . '" min="1" step="1" style="width:100px"></td></tr>';
+
+			echo '<tr><th><label for="pigcache_traffic_cold_threshold">' . esc_html__( 'Cold threshold (hits/30d)', 'pigcache' ) . '</label></th>';
+			echo '<td><input type="number" id="pigcache_traffic_cold_threshold" name="pigcache_traffic_cold_threshold" value="' . esc_attr( (string) $cold_threshold ) . '" min="0" step="1" style="width:100px"></td></tr>';
+
+			echo '<tr><th><label for="pigcache_mutation_dynamic_threshold">' . esc_html__( 'Dynamic threshold (mutations/day)', 'pigcache' ) . '</label></th>';
+			echo '<td><input type="number" id="pigcache_mutation_dynamic_threshold" name="pigcache_mutation_dynamic_threshold" value="' . esc_attr( (string) $dyn_threshold ) . '" min="0" step="1" style="width:100px"></td></tr>';
+
+			echo '</tbody></table>';
+
+			echo '<p>';
+			echo '<button type="submit" name="pigcache_adaptive_ttl_action" value="save" class="button button-primary">';
+			echo esc_html__( 'Save', 'pigcache' );
+			echo '</button> ';
+			echo '<button type="submit" name="pigcache_adaptive_ttl_action" value="force_traffic_harvest" class="button">';
+			echo esc_html__( 'Force Traffic Harvest Now', 'pigcache' );
+			echo '</button>';
+			echo '</p>';
+
+			echo '</form>';
+		} else {
+			echo '<p class="description">';
+			echo esc_html__( 'Settings are controlled via wp-config.php constants. Remove PIGCACHE_ADAPTIVE_TTL to manage from here.', 'pigcache' );
+			echo '</p>';
+		}
+
+		// Top URLs classification table.
+		if ( ! empty( $traffic_map ) && $enabled ) {
+			$tier_colors = array(
+				'hot_stable'  => '#1a7f1a',
+				'hot_dynamic' => '#b36b00',
+				'cold'        => '#2c5f8a',
+				'unknown'     => '#646970',
+			);
+
+			arsort( $traffic_map );
+			$top_urls = array_slice( $traffic_map, 0, 30, true );
+
+			echo '<details class="pigcache-dashboard-details" open><summary><strong>';
+			echo esc_html__( 'URL tier classification (top 30 by traffic)', 'pigcache' );
+			echo '</strong></summary>';
+			echo '<table class="widefat striped"><thead><tr>';
+			echo '<th>' . esc_html__( 'URL', 'pigcache' ) . '</th>';
+			echo '<th style="white-space:nowrap">' . esc_html__( 'Hits/30d', 'pigcache' ) . '</th>';
+			echo '<th style="white-space:nowrap">' . esc_html__( 'Mutations/day', 'pigcache' ) . '</th>';
+			echo '<th>' . esc_html__( 'Tier', 'pigcache' ) . '</th>';
+			echo '<th style="white-space:nowrap">' . esc_html__( 'TTL', 'pigcache' ) . '</th>';
+			echo '</tr></thead><tbody>';
+
+			foreach ( $top_urls as $uri => $hits ) {
+				$info  = PigCache_Adaptive_Ttl::classify( $uri );
+				$color = isset( $tier_colors[ $info['tier'] ] ) ? $tier_colors[ $info['tier'] ] : '#646970';
+				$ttl_display = $info['ttl'] > 0
+					? human_time_diff( 0, $info['ttl'] )
+					: ( 0 === $info['ttl'] ? __( 'Not cached', 'pigcache' ) : '—' );
+
+				echo '<tr>';
+				echo '<td><code style="font-size:11px">' . esc_html( mb_strimwidth( (string) $uri, 0, 80, '…' ) ) . '</code></td>';
+				echo '<td>' . esc_html( number_format( $hits ) ) . '</td>';
+				echo '<td>' . esc_html( (string) $info['max_mutations'] ) . '</td>';
+				echo '<td><strong style="color:' . esc_attr( $color ) . '">'
+					. esc_html( PigCache_Adaptive_Ttl::tier_label( $info['tier'] ) )
+					. '</strong></td>';
+				echo '<td>' . esc_html( $ttl_display ) . '</td>';
+				echo '</tr>';
+			}
+
+			echo '</tbody></table></details>';
+		}
+
+		// Stability map — table mutation rates.
+		if ( ! empty( $stability_map ) ) {
+			arsort( $stability_map );
+			echo '<details class="pigcache-dashboard-details"><summary><strong>';
+			echo esc_html__( 'Table mutation rates (last 24h)', 'pigcache' );
+			echo '</strong></summary>';
+			echo '<table class="widefat striped"><thead><tr>';
+			echo '<th>' . esc_html__( 'Table', 'pigcache' ) . '</th>';
+			echo '<th>' . esc_html__( 'Mutations / 24h', 'pigcache' ) . '</th>';
+			echo '<th>' . esc_html__( 'Stability', 'pigcache' ) . '</th>';
+			echo '</tr></thead><tbody>';
+
+			foreach ( $stability_map as $table => $muts ) {
+				$is_dynamic = $muts > $dyn_threshold;
+				echo '<tr>';
+				echo '<td><code>' . esc_html( (string) $table ) . '</code></td>';
+				echo '<td>' . esc_html( number_format( (int) $muts ) ) . '</td>';
+				echo '<td>';
+				if ( $is_dynamic ) {
+					echo '<span style="color:#b36b00">⚡ ' . esc_html__( 'Dynamic', 'pigcache' ) . '</span>';
+				} else {
+					echo '<span style="color:#1a7f1a">🔥 ' . esc_html__( 'Stable', 'pigcache' ) . '</span>';
+				}
+				echo '</td>';
+				echo '</tr>';
+			}
+
+			echo '</tbody></table></details>';
+		}
 	}
 
 	// ------------------------------------------------------------------

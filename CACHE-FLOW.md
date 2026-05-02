@@ -490,6 +490,218 @@ WHERE grp = 'pigcache_html';
 
 ---
 
+## 15. Adaptive TTL v2 — HTML Cache Segmentation
+
+> Aplica **solo al HTML cache**. El SQL cache usa epochs para invalidación (TTL es safety net).
+> El object cache no es controlado por PigCache.
+
+### Filosofía
+
+El TTL v1 usaba `exec_ms` del query como proxy de estabilidad. Es un proxy pobre: un
+query lento puede estar en una página que casi nadie visita, y un query rápido puede estar
+en la homepage que cambia cada hora. El TTL v2 cruza dos señales reales:
+
+```
+Señal 1 — Tráfico (¿vale la pena cachear?)
+  Fuente: AWStats data files  →  hits por URL por mes
+  Fallback: contadores propios de cache HITs (Redis → cron → MySQL)
+
+Señal 2 — Estabilidad (¿cuánto tiempo es válido el cache?)
+  Fuente: frecuencia de mutación por tabla (Redis counters → cron → MySQL)
+  Base: SQL Profiler ya mapea URL tags → tablas dependientes
+```
+
+### Tiers de TTL
+
+| Tier | Condición | TTL por defecto | Constante override |
+|------|-----------|-----------------|-------------------|
+| 🔥 Hot + Stable | hits ≥ umbral Y mutaciones/día ≤ umbral | 86 400 s (1 día) | `PIGCACHE_TTL_HOT_STABLE` |
+| ⚡ Hot + Dynamic | hits ≥ umbral Y mutaciones/día > umbral | 60 s | `PIGCACHE_TTL_HOT_DYNAMIC` |
+| ❄️ Cold | hits < umbral | 0 (no cachear) | `PIGCACHE_TTL_COLD` |
+
+Umbrales por defecto configurables:
+
+| Constante | Default | Significado |
+|-----------|---------|-------------|
+| `PIGCACHE_TRAFFIC_COLD_THRESHOLD` | `100` | hits/mes por debajo = Cold |
+| `PIGCACHE_MUTATION_DYNAMIC_THRESHOLD` | `10` | mutaciones/día por encima = Dynamic |
+
+### Árbol de decisión
+
+```
+HTML cache MISS — ob_callback va a llamar wp_cache_set()
+
+1. ¿Está PIGCACHE_ADAPTIVE_TTL activo?
+   No → usar TTL estático configurado (DEFAULT_TTL)
+
+2. Obtener hits de esta URL (del store de tráfico)
+   < PIGCACHE_TRAFFIC_COLD_THRESHOLD
+     → ❄️ Cold: TTL = PIGCACHE_TTL_COLD (0) → NO llamar wp_cache_set() → salir
+
+3. Obtener tablas que toca esta página
+   (tag collector ya las acumuló durante el render:
+    post:123 → wp_posts, term:10 → wp_terms, etc.)
+
+4. Para cada tabla, leer mutation_rate (mutaciones/día) del store de estabilidad
+   Tomar el máximo entre todas las tablas de la página
+
+5. max_mutation_rate > PIGCACHE_MUTATION_DYNAMIC_THRESHOLD
+     → ⚡ Hot + Dynamic: TTL = PIGCACHE_TTL_HOT_DYNAMIC
+   else
+     → 🔥 Hot + Stable:  TTL = PIGCACHE_TTL_HOT_STABLE
+
+6. Llamar wp_cache_set("doc_abc", pack, "pigcache_html", TTL)
+```
+
+### Señal 1 — Tráfico por URL
+
+#### Opción A: AWStats (preferida cuando está disponible)
+
+cPanel genera archivos de datos en `~/tmp/awstats/`:
+```
+awstats052026.tudominio.com.txt
+awstats042026.tudominio.com.txt
+...
+```
+
+Formato de la sección relevante:
+```
+BEGIN_URLS 2583
+# URL               Páginas  Hits   Bandwidth  Fecha       Hora
+/                     5432   12000  45678900   20260501    235900
+/about/               2341    4500  12345600   20260430    180000
+/blog/                1234    3200   8900000   20260501    120000
+/2024/01/post-viejo/    12      20     45000   20260301    100000
+END_URLS
+```
+
+El cron lee el archivo más reciente, extrae la sección `BEGIN_URLS`, y guarda los hits
+en MySQL. Se ejecuta una vez por día (o al principio del cron diario).
+
+Auto-detección del path (en orden):
+1. Constante `PIGCACHE_AWSTATS_DIR` si está definida
+2. `~/tmp/awstats/` (relativo al `dirname` del `wp-config.php`)
+3. `/tmp/awstats/`
+4. No encontrado → usar Opción B
+
+#### Opción B: Contadores propios (fallback automático)
+
+Cuando no hay AWStats disponible, PigCache incrementa un contador Redis en cada HIT
+del HTML cache:
+
+```
+Visitor → HTML cache HIT
+  → wp_cache_incr('pigcache_html_hits:{doc_key}', 1, 'pigcache')
+     (doc_key = md5(host + uri))
+```
+
+Cron (cada 15 min) cosecha estos contadores y los acumula en MySQL,
+igual que hace con `query_stats`. La ventana es de 30 días deslizantes.
+
+Limitación: no captura tráfico que bypaseó el cache (primera visita a cada URL).
+Para sitios con buen hit rate, es suficientemente representativo.
+
+### Señal 2 — Estabilidad por tabla (mutation tracker)
+
+`PigCache_Sql_Cache::bump_table_epoch()` ya incrementa un epoch en Redis cada vez
+que una tabla muta. El mutation tracker añade un segundo contador paralelo:
+
+```
+bump_table_epoch('wp_posts') — flujo actual:
+  wp_cache_incr('pigcache_sql_epoch:wp_posts', 1, 'pigcache')
+
+bump_table_epoch('wp_posts') — flujo nuevo (adicional):
+  wp_cache_incr('pigcache_mut_window:wp_posts', 1, 'pigcache')  [TTL: 86400s]
+```
+
+El cron (cada 15 min) lee todos los contadores `pigcache_mut_window:*` y los
+persiste en MySQL como `mutations_per_day` por tabla. El dato en Redis es el
+acumulador de la ventana actual; MySQL guarda el histórico.
+
+Ejemplo de lo que queda en MySQL tras el harvest:
+```
+table_name    mutations_last_24h   stability
+wp_posts      3                    stable
+wp_options    180                  dynamic
+wp_comments   0                    stable
+wp_wc_orders  45                   dynamic
+```
+
+### Pipeline completo del cron
+
+```
+pigcache-cron.php — ejecución cada 15 min
+
+TASK 1 — flush buffer → MySQL  (ya existe)
+TASK 2 — send stats → API      (ya existe)
+TASK 3 — cloud sync            (ya existe)
+
+TASK 4 — mutation harvest      (nuevo)
+  → leer Redis: pigcache_mut_window:*
+  → upsert en MySQL: wp_pigcache_table_stability
+     (table_name, mutations_count, window_start)
+  → calcular mutations_per_day por tabla
+  → escribir resumen en wp_options o wp_pigcache_meta:
+     pigcache_stability_map = {wp_posts:3, wp_options:180, ...}
+
+TASK 5 — traffic harvest       (nuevo, corre cada 24h)
+  → Opción A: parsear AWStats → leer URL hits del último archivo disponible
+  → Opción B: leer Redis pigcache_html_hits:* → upsert MySQL
+  → escribir resumen: top N URLs con hit_count
+```
+
+### Integración en el HTML cache (punto de escritura)
+
+En `PigCache_Html_Cache` (o donde se llama `wp_cache_set` al final del buffer),
+se añade la llamada al decision engine antes de persistir:
+
+```php
+// Pseudocódigo — ob_callback al final del render
+$ttl = PigCache_Adaptive_Ttl::decide( $uri, $tags );
+
+if ( 0 === $ttl ) {
+    // Cold — no cachear, solo devolver el HTML al visitor
+    return $buffer;
+}
+
+wp_cache_set( $doc_key, $pack, 'pigcache_html', $ttl );
+PigCache_Tag_Index::store_tags( $doc_key, 'pigcache_html', $tags );
+```
+
+`PigCache_Adaptive_Ttl::decide()` es stateless — lee de caches en memoria
+(wp_cache_get del stability_map y traffic_map) que el cron mantiene frescos.
+Costo en el hot path: dos lecturas de Redis (o cero si ya están en memoria del request).
+
+### Nuevos archivos
+
+| Archivo | Responsabilidad |
+|---------|-----------------|
+| `includes/class-pigcache-adaptive-ttl.php` | Decision engine: `decide($uri, $tags) → int` |
+| `includes/class-pigcache-mutation-tracker.php` | Lectura/escritura del stability map |
+| `includes/class-pigcache-traffic-reader.php` | AWStats parser + contador de HITs propios |
+
+### Constantes de configuración
+
+| Constante | Default | Descripción |
+|-----------|---------|-------------|
+| `PIGCACHE_ADAPTIVE_TTL` | `false` | Activa el sistema v2 |
+| `PIGCACHE_TTL_HOT_STABLE` | `86400` | TTL en segundos para Hot+Stable |
+| `PIGCACHE_TTL_HOT_DYNAMIC` | `60` | TTL en segundos para Hot+Dynamic |
+| `PIGCACHE_TTL_COLD` | `0` | TTL para Cold (0 = no cachear) |
+| `PIGCACHE_TRAFFIC_COLD_THRESHOLD` | `100` | Hits/mes mínimos para no ser Cold |
+| `PIGCACHE_MUTATION_DYNAMIC_THRESHOLD` | `10` | Mutaciones/día máximas para ser Stable |
+| `PIGCACHE_AWSTATS_DIR` | *(auto)* | Path al directorio de AWStats |
+| `PIGCACHE_TRAFFIC_SOURCE` | `'auto'` | `'awstats'`, `'self'`, o `'auto'` |
+
+### Relación con el Adaptive TTL v1 (exec_ms)
+
+El TTL v1 basado en `exec_ms` del Continuous Learner queda **deprecado** cuando
+el v2 está activo. Si `PIGCACHE_ADAPTIVE_TTL` = true, el decision engine v2 toma
+precedencia. El v1 solo aplica a SQL cache entries, no a HTML — así que no hay
+conflicto directo, pero conceptualmente el v2 es el sistema canónico going forward.
+
+---
+
 ## 14. Glossary
 
 | Term | Meaning |
@@ -506,6 +718,14 @@ WHERE grp = 'pigcache_html';
 | **Stampede lock** | Short-lived Redis key preventing multiple processes from regenerating the same URI simultaneously. |
 | **Environment hash** | md5 of sorted plugin slugs + theme slug + WP major. Used to match sites to shared cloud profiles. |
 | **Continuous learning** | Always-on sampled pipeline collecting query exec time and memory. Does not affect invalidation. |
-| **Adaptive TTL** | TTL assigned to a SQL cache entry based on query execution time. Slow queries cached longer. |
+| **Adaptive TTL v1** | TTL assigned to a SQL cache entry based on query execution time (`exec_ms`). Deprecated in favor of v2 for HTML cache. |
+| **Adaptive TTL v2** | TTL assigned to an HTML cache entry based on two signals: URL traffic (hot/cold) and table mutation frequency (stable/dynamic). |
+| **Traffic tier** | Classification of a URL as Hot (hits ≥ threshold) or Cold (hits < threshold). Sourced from AWStats or own hit counters. |
+| **Stability tier** | Classification of a page's tables as Stable (low mutation rate) or Dynamic (high mutation rate). |
+| **Mutation tracker** | Redis counters (`pigcache_mut_window:{table}`) incremented on every `bump_table_epoch()`, harvested by cron to MySQL. |
+| **AWStats reader** | Cron task that parses `~/tmp/awstats/awstats*.txt` files to extract per-URL hit counts. |
+| **Traffic reader** | Fallback to own Redis hit counters when AWStats is not available. Incremented on every HTML cache HIT. |
+| **Stability map** | Cached summary of mutations_per_day per table. Stored in Redis/wp_options by cron, read by the decision engine on cache write. |
+| **Decision engine** | `PigCache_Adaptive_Ttl::decide($uri, $tags)` — combines traffic and stability signals to return a TTL in seconds (0 = skip cache). |
 | **Query buffer** | APCu or Redis accumulator aggregating per-request query data so the MySQL write happens in cron. |
 | **Period window** | 15-minute UTC bucket (`floor(time/900)*900`) grouping query stats rows. |

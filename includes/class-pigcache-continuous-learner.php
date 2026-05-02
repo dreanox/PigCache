@@ -23,8 +23,10 @@ defined( 'ABSPATH' ) || exit;
 
 class PigCache_Continuous_Learner {
 
-	const CRON_FLUSH         = 'pigcache_flush_query_stats';
-	const CRON_SEND          = 'pigcache_send_query_stats';
+	const CRON_FLUSH            = 'pigcache_flush_query_stats';
+	const CRON_SEND             = 'pigcache_send_query_stats';
+	const CRON_MUTATION_HARVEST = 'pigcache_mutation_harvest';
+	const CRON_TRAFFIC_HARVEST  = 'pigcache_traffic_harvest';
 	const REMOTE_CFG_KEY     = 'pigcache_learning_cfg';
 	const REMOTE_CFG_TTL     = 6 * HOUR_IN_SECONDS;
 	const REMOTE_CFG_ERR_TTL = HOUR_IN_SECONDS;
@@ -43,8 +45,10 @@ class PigCache_Continuous_Learner {
 	// ── Init ────────────────────────────────────────────────────────────────
 
 	public static function init() {
-		add_action( self::CRON_FLUSH, array( __CLASS__, 'cron_flush' ) );
-		add_action( self::CRON_SEND,  array( __CLASS__, 'cron_send' ) );
+		add_action( self::CRON_FLUSH,            array( __CLASS__, 'cron_flush' ) );
+		add_action( self::CRON_SEND,             array( __CLASS__, 'cron_send' ) );
+		add_action( self::CRON_MUTATION_HARVEST, array( __CLASS__, 'cron_mutation_harvest' ) );
+		add_action( self::CRON_TRAFFIC_HARVEST,  array( __CLASS__, 'cron_traffic_harvest' ) );
 	}
 
 	// ── Sampling ─────────────────────────────────────────────────────────────
@@ -168,38 +172,40 @@ class PigCache_Continuous_Learner {
 		if ( ! wp_next_scheduled( self::CRON_SEND ) ) {
 			wp_schedule_event( time(), 'hourly', self::CRON_SEND );
 		}
+
+		if ( ! wp_next_scheduled( self::CRON_MUTATION_HARVEST ) ) {
+			wp_schedule_event( time(), 'pigcache_flush', self::CRON_MUTATION_HARVEST );
+		}
+
+		if ( ! wp_next_scheduled( self::CRON_TRAFFIC_HARVEST ) ) {
+			wp_schedule_event( time(), 'daily', self::CRON_TRAFFIC_HARVEST );
+		}
 	}
 
 	public static function unschedule() {
-		$ts = wp_next_scheduled( self::CRON_FLUSH );
-		if ( $ts ) {
-			wp_unschedule_event( $ts, self::CRON_FLUSH );
-		}
-
-		$ts = wp_next_scheduled( self::CRON_SEND );
-		if ( $ts ) {
-			wp_unschedule_event( $ts, self::CRON_SEND );
+		foreach ( array(
+			self::CRON_FLUSH,
+			self::CRON_SEND,
+			self::CRON_MUTATION_HARVEST,
+			self::CRON_TRAFFIC_HARVEST,
+		) as $hook ) {
+			$ts = wp_next_scheduled( $hook );
+			if ( $ts ) {
+				wp_unschedule_event( $ts, $hook );
+			}
 		}
 	}
 
 	/**
 	 * Whether the cron pipeline is confirmed running (flush ran within CRON_CONFIRM_TTL).
 	 *
+	 * Reads from wp_pigcache_kv, which goes directly to MySQL — no object
+	 * cache involved, no stale-read risk.
+	 *
 	 * @return bool
 	 */
 	public static function is_cron_confirmed() {
-		// The standalone cron writes directly to MySQL without going through WordPress,
-		// so a persistent object cache (Redis/APCu) may hold a stale value. Delete the
-		// cache key to force a fresh DB read on every admin check.
-		//
-		// Two cache layers must be cleared:
-		//   1. The individual option key — stale value from a previous read.
-		//   2. 'notoptions' — WordPress records missing options here; if the option
-		//      didn't exist on the first get_option() call (before the cron ran),
-		//      this entry makes get_option() return 0 forever without hitting MySQL.
-		wp_cache_delete( self::OPT_FLUSH_LAST, 'options' );
-		wp_cache_delete( 'notoptions', 'options' );
-		$last = (int) get_option( self::OPT_FLUSH_LAST, 0 );
+		$last = (int) PigCache_KV::get( PigCache_KV::KEY_CRON_FLUSH_LAST, 0 );
 		return $last > 0 && ( time() - $last ) < self::cron_confirm_ttl();
 	}
 
@@ -217,7 +223,7 @@ class PigCache_Continuous_Learner {
 	 * Runs every 15 minutes.
 	 */
 	public static function cron_flush() {
-		update_option( self::OPT_FLUSH_LAST, time(), false );
+		PigCache_KV::set( PigCache_KV::KEY_CRON_FLUSH_LAST, time() );
 
 		$rows = PigCache_Query_Buffer::read_and_clear();
 
@@ -236,7 +242,8 @@ class PigCache_Continuous_Learner {
 	 * Runs every hour.
 	 */
 	public static function cron_send() {
-		update_option( self::OPT_SEND_LAST, time(), false );
+		PigCache_KV::set( PigCache_KV::KEY_CRON_SEND_LAST, time() );
+		PigCache_KV::purge_expired();
 
 		$rows = PigCache_Query_Stats::get_unsent( 200 );
 
@@ -305,6 +312,28 @@ class PigCache_Continuous_Learner {
 			'sample_rate'      => (float) ( $data['sample_rate'] ?? self::DEFAULT_RATE ),
 			'adaptive_ttl'     => (bool) ( $data['adaptive_ttl'] ?? false ),
 		);
+	}
+
+	// ── Adaptive TTL cron tasks ───────────────────────────────────────────────
+
+	/**
+	 * Harvest mutation window → MySQL → stability map transient.
+	 * Runs every 15 min (pigcache_flush interval), WP-Cron fallback only.
+	 */
+	public static function cron_mutation_harvest() {
+		if ( class_exists( 'PigCache_Mutation_Tracker', false ) ) {
+			PigCache_Mutation_Tracker::harvest();
+		}
+	}
+
+	/**
+	 * Harvest traffic data → MySQL → traffic map transient.
+	 * Runs daily (WP-Cron fallback only); internally throttled to once per 23 h.
+	 */
+	public static function cron_traffic_harvest() {
+		if ( class_exists( 'PigCache_Traffic_Reader', false ) ) {
+			PigCache_Traffic_Reader::harvest();
+		}
 	}
 
 	// ── API push ─────────────────────────────────────────────────────────────

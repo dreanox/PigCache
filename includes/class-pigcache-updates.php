@@ -17,7 +17,8 @@ defined( 'ABSPATH' ) || exit;
 class PigCache_Updates {
 
 	const TRANSIENT_KEY   = 'pigcache_update_info';
-	const TRANSIENT_TTL   = 12 * HOUR_IN_SECONDS;
+	const TRANSIENT_TTL   = HOUR_IN_SECONDS;        // intentionally short — WP's own 12-h interval is the real throttle
+	const TRANSIENT_ERR   = 5 * MINUTE_IN_SECONDS;  // back-off on API errors, not a full hour
 	const UPDATE_ENDPOINT = 'plugin/version';
 
 	/**
@@ -31,6 +32,10 @@ class PigCache_Updates {
 		add_filter( 'pre_set_site_transient_update_plugins', array( __CLASS__, 'inject_update_info' ), 20 );
 		add_filter( 'plugins_api', array( __CLASS__, 'plugin_info' ), 20, 3 );
 		add_action( 'upgrader_process_complete', array( __CLASS__, 'clear_transient' ), 10, 2 );
+
+		// When WP forces a fresh check (admin "Check Again"), clear our own cache too
+		// so we don't return stale data into a deliberately fresh update cycle.
+		add_action( 'delete_site_transient_update_plugins', array( __CLASS__, 'clear_transient_on_force_check' ) );
 	}
 
 	/**
@@ -142,7 +147,23 @@ class PigCache_Updates {
 	}
 
 	/**
-	 * Fetch version info from the Cloud API, cached for 12 hours.
+	 * Clear our cached update response when WordPress forces a fresh update check
+	 * (admin "Check Again" button, or wp_update_plugins() called explicitly).
+	 *
+	 * Without this, clicking "Check Again" in the admin still returns our stale
+	 * cached data, making the button useless for detecting a just-released version.
+	 */
+	public static function clear_transient_on_force_check() {
+		delete_transient( self::TRANSIENT_KEY );
+	}
+
+	/**
+	 * Fetch version info from the Cloud API.
+	 *
+	 * Cached for TRANSIENT_TTL (1 h) on success so we don't call the API on
+	 * every single page load, but short enough that a new release is visible
+	 * on the next WordPress update check after the hour expires.
+	 * API errors back off for TRANSIENT_ERR (5 min) only.
 	 *
 	 * @return array|null Decoded response or null on failure / error sentinel.
 	 */
@@ -160,8 +181,7 @@ class PigCache_Updates {
 		$response = PigCache_Cloud_Client::get( self::UPDATE_ENDPOINT );
 
 		if ( is_wp_error( $response ) || ! is_array( $response ) ) {
-			// Cache a short sentinel so we don't hammer the API on every page load.
-			set_transient( self::TRANSIENT_KEY, 'error', HOUR_IN_SECONDS );
+			set_transient( self::TRANSIENT_KEY, 'error', self::TRANSIENT_ERR );
 			return null;
 		}
 
