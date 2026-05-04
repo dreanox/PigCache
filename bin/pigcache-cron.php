@@ -19,12 +19,39 @@
 
 // ── Safety ───────────────────────────────────────────────────────────────────
 
-if ( php_sapi_name() !== 'cli' ) {
+if ( isset( $_SERVER['HTTP_HOST'] ) || isset( $_SERVER['REQUEST_METHOD'] ) ) {
 	http_response_code( 403 );
 	exit( 'CLI only.' );
 }
 
 define( 'PIGCACHE_CRON_START', microtime( true ) );
+
+// ── Error handlers ───────────────────────────────────────────────────────────
+// $pigcache_error_sink is populated after DB credentials are resolved.
+// Both handlers reference it via closure so they pick up the value set later.
+
+$pigcache_error_sink = null;
+
+set_exception_handler( static function ( Throwable $e ) use ( &$pigcache_error_sink ): void {
+	$msg = get_class( $e ) . ': ' . $e->getMessage() . ' [' . $e->getFile() . ':' . $e->getLine() . ']';
+	fwrite( STDERR, "[pigcache-cron] EXCEPTION: {$msg}\n" );
+	if ( $pigcache_error_sink ) {
+		( $pigcache_error_sink )( $msg, 'exception' );
+	}
+	exit( 1 );
+} );
+
+register_shutdown_function( static function () use ( &$pigcache_error_sink ): void {
+	$err = error_get_last();
+	if ( ! $err || ! in_array( $err['type'], [ E_ERROR, E_CORE_ERROR, E_COMPILE_ERROR, E_PARSE ], true ) ) {
+		return;
+	}
+	$msg = 'Fatal error: ' . $err['message'] . ' [' . $err['file'] . ':' . $err['line'] . ']';
+	fwrite( STDERR, "[pigcache-cron] FATAL: {$msg}\n" );
+	if ( $pigcache_error_sink ) {
+		( $pigcache_error_sink )( $msg, 'fatal' );
+	}
+} );
 
 // ── Find wp-config.php ───────────────────────────────────────────────────────
 
@@ -43,6 +70,11 @@ $cfg = _pigcache_cron_parse_config( $wp_config_path );
 // The cron command discards stdout (> /dev/null) but appends stderr to the log,
 // so no crontab change is needed — just set the constant and the log fills up.
 define( 'PIGCACHE_CRON_VERBOSE', ! empty( $cfg['PIGCACHE_CRON_VERBOSE'] ) );
+
+if ( PIGCACHE_CRON_VERBOSE ) {
+	error_reporting( E_ALL );
+	ini_set( 'display_errors', '1' );  // PHP CLI sends display_errors to STDERR → lands in the cron log
+}
 
 if ( ! isset( $cfg['DB_NAME'], $cfg['DB_USER'], $cfg['DB_PASSWORD'], $cfg['DB_HOST'] ) ) {
 	fwrite( STDERR, "[pigcache-cron] ERROR: Could not read DB credentials from wp-config.php\n" );
@@ -64,11 +96,52 @@ $options_table = $table_prefix . 'options';
 $kv_table      = $table_prefix . 'pigcache_kv';
 $kv_ready      = _pigcache_cron_table_exists( $db, $kv_table );
 
+// ── PRO_START ─────────────────────────────────────────────────────────────────
+// ── Resolve API credentials (reused by tasks + error sink) ───────────────────
+
+$api_url = rtrim( $cfg['PIGCACHE_CLOUD_API_URL'] ?? 'https://bluecache.pigworlds.com/api/v1', '/' );
+$api_key = $cfg['PIGCACHE_API_KEY']
+	?: _pigcache_cron_get_option( $db, $options_table, 'pigcache_license_key' );
+$site_id = _pigcache_cron_get_option( $db, $options_table, 'pigcache_cloud_site_id' );
+// ── PRO_END ───────────────────────────────────────────────────────────────────
+
+// ── Error sink — records last error to the KV table ──────────────────────────
+
+$pigcache_error_sink = static function ( string $msg, string $context = '' ) use ( $db, $kv_table, $kv_ready ): void {
+	if ( $kv_ready ) {
+		_pigcache_cron_kv_set( $db, $kv_table, 'cron_last_error', json_encode( [
+			'msg'     => $msg,
+			'context' => $context,
+			'ts'      => time(),
+		] ) );
+	}
+};
+// ── PRO_START ─────────────────────────────────────────────────────────────────
+// Augment the error sink to also push errors to the cloud API.
+$pigcache_error_sink = static function ( string $msg, string $context = '' ) use ( $db, $kv_table, $kv_ready, $api_url, $api_key, $site_id ): void {
+	if ( $kv_ready ) {
+		_pigcache_cron_kv_set( $db, $kv_table, 'cron_last_error', json_encode( [
+			'msg'     => $msg,
+			'context' => $context,
+			'ts'      => time(),
+		] ) );
+	}
+	if ( $api_url && $api_key && $site_id ) {
+		_pigcache_cron_api_request( 'POST', $api_url . '/cron-error', $api_key, $site_id, [
+			'message'     => $msg,
+			'context'     => $context,
+			'occurred_at' => time(),
+		] );
+	}
+};
+// ── PRO_END ───────────────────────────────────────────────────────────────────
+
 // ── Determine which tasks to run ─────────────────────────────────────────────
 
-$run_flush           = true;
-$run_send            = true;
-$run_cloud           = true;
+$run_flush = true;
+// ── PRO_START ─────────────────────────────────────────────────────────────────
+$run_send             = true;
+$run_cloud            = true;
 $run_mutation_harvest = true;
 $run_traffic_harvest  = true;
 
@@ -79,6 +152,7 @@ foreach ( $argv ?? array() as $arg ) {
 	if ( $arg === '--cloud-only'  ) { $run_flush = false; $run_send = false; $run_mutation_harvest = false; $run_traffic_harvest = false; }
 	if ( $arg === '--no-adaptive' ) { $run_mutation_harvest = false; $run_traffic_harvest = false; }
 }
+// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 // ── TASK 1: Flush APCu/Redis buffer → MySQL ───────────────────────────────────
 
@@ -99,17 +173,13 @@ if ( $run_flush ) {
 	_pigcache_cron_log( 'flush done — ' . count( $rows ) . ' unique queries' );
 }
 
+// ── PRO_START ─────────────────────────────────────────────────────────────────
 // ── TASK 2: Send unsent rows → API ───────────────────────────────────────────
 
 if ( $run_send ) {
 	$unsent = _pigcache_cron_get_unsent( $db, $stats_table, 200 );
 
 	if ( ! empty( $unsent ) ) {
-		$api_url  = rtrim( $cfg['PIGCACHE_CLOUD_API_URL'] ?? 'https://bluecache.pigworlds.com/api/v1', '/' );
-		$api_key  = $cfg['PIGCACHE_API_KEY']
-			?: _pigcache_cron_get_option( $db, $options_table, 'pigcache_license_key' );
-		$site_id  = _pigcache_cron_get_option( $db, $options_table, 'pigcache_cloud_site_id' );
-
 		if ( $api_key && $site_id ) {
 			$accepted = _pigcache_cron_push_to_api( $api_url, $api_key, $site_id, $unsent );
 			if ( ! empty( $accepted ) ) {
@@ -132,12 +202,6 @@ if ( $run_send ) {
 // ── TASK 3: Cloud sync (environment + fingerprints → API, profile download) ───
 
 if ( $run_cloud ) {
-	$api_url = rtrim( $cfg['PIGCACHE_CLOUD_API_URL'] ?? 'https://bluecache.pigworlds.com/api/v1', '/' );
-	// Prefer wp-config constant; fall back to the key stored by the plugin in wp_options.
-	$api_key = $cfg['PIGCACHE_API_KEY']
-		?: _pigcache_cron_get_option( $db, $options_table, 'pigcache_license_key' );
-	$site_id = _pigcache_cron_get_option( $db, $options_table, 'pigcache_cloud_site_id' );
-
 	if ( ! $api_key || ! $site_id ) {
 		_pigcache_cron_log( 'cloud sync skipped — no API key or site ID (activate license from wp-admin first)' );
 	} else {
@@ -147,8 +211,8 @@ if ( $run_cloud ) {
 		_pigcache_cron_log( 'cloud env sent' );
 
 		// 3b. Upload unsynced SQL fingerprints in batches of 500.
-		$fp_table    = $table_prefix . 'pigcache_sql_fingerprints';
-		$fp_total    = 0;
+		$fp_table     = $table_prefix . 'pigcache_sql_fingerprints';
+		$fp_total     = 0;
 		$fp_has_table = _pigcache_cron_table_exists( $db, $fp_table );
 
 		if ( $fp_has_table ) {
@@ -273,8 +337,8 @@ if ( $run_traffic_harvest ) {
 				if ( is_array( $hits_raw_arr ) && ! empty( $hits_raw_arr ) ) {
 					foreach ( $hits_raw_arr as $entry ) {
 						if ( ! empty( $entry['uri'] ) && isset( $entry['hits'] ) ) {
-							$uri                      = $entry['uri'];
-							$traffic_data[ $uri ]     = ( isset( $traffic_data[ $uri ] ) ? $traffic_data[ $uri ] : 0 ) + (int) $entry['hits'];
+							$uri                  = $entry['uri'];
+							$traffic_data[ $uri ] = ( isset( $traffic_data[ $uri ] ) ? $traffic_data[ $uri ] : 0 ) + (int) $entry['hits'];
 						}
 					}
 					_pigcache_cron_update_option( $db, $options_table, 'pigcache_url_hits_window', '{}' );
@@ -326,6 +390,7 @@ if ( $run_traffic_harvest ) {
 		_pigcache_cron_log( 'traffic harvest — skipped (last run ' . round( ( time() - $last_traffic ) / 3600, 1 ) . 'h ago)' );
 	}
 }
+// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 $elapsed = round( ( microtime( true ) - PIGCACHE_CRON_START ) * 1000 );
 _pigcache_cron_log( "finished in {$elapsed}ms" );
@@ -513,6 +578,7 @@ function _pigcache_cron_upsert_batch( mysqli $db, string $table, array $rows, st
 	}
 }
 
+// ── PRO_START ─────────────────────────────────────────────────────────────────
 function _pigcache_cron_get_unsent( mysqli $db, string $table, int $limit ): array {
 	$stmt = $db->prepare( "SELECT * FROM `{$table}` WHERE sent_at IS NULL ORDER BY period_start ASC LIMIT ?" );
 	if ( ! $stmt ) {
@@ -600,15 +666,17 @@ function _pigcache_cron_update_option( mysqli $db, string $table, string $option
 	$stmt->execute();
 	$stmt->close();
 }
+// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 function _pigcache_cron_log( string $msg ): void {
-	$ts     = gmdate( 'Y-m-d H:i:s' );
-	$line   = "[pigcache-cron {$ts}] {$msg}\n";
+	$ts   = gmdate( 'Y-m-d H:i:s' );
+	$line = "[pigcache-cron {$ts}] {$msg}\n";
 	// Verbose mode → STDERR so the line lands in the cron log file.
 	// Normal mode  → STDOUT, which the cron command discards (> /dev/null).
 	fwrite( defined( 'PIGCACHE_CRON_VERBOSE' ) && PIGCACHE_CRON_VERBOSE ? STDERR : STDOUT, $line );
 }
 
+// ── PRO_START ─────────────────────────────────────────────────────────────────
 // ── Cloud sync helpers ────────────────────────────────────────────────────────
 
 /**
@@ -677,7 +745,7 @@ function _pigcache_cron_build_environment( mysqli $db, string $options_table, st
 	$theme = _pigcache_cron_get_option( $db, $options_table, 'stylesheet' );
 
 	// WP version — read from wp-includes/version.php without executing WordPress.
-	$wp_version = '';
+	$wp_version   = '';
 	$version_file = rtrim( dirname( $wp_config_path ), '/\\' ) . '/wp-includes/version.php';
 	if ( ! file_exists( $version_file ) ) {
 		// wp-config.php may live one level above ABSPATH.
@@ -701,23 +769,18 @@ function _pigcache_cron_build_environment( mysqli $db, string $options_table, st
 		'php_version' => PHP_MAJOR_VERSION . '.' . PHP_MINOR_VERSION,
 	);
 }
+// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 /**
  * Whether a MySQL table exists.
  */
 function _pigcache_cron_table_exists( mysqli $db, string $table ): bool {
-	$stmt = $db->prepare( 'SHOW TABLES LIKE ?' );
-	if ( ! $stmt ) {
-		return false;
-	}
-	$stmt->bind_param( 's', $table );
-	$stmt->execute();
-	$result = $stmt->get_result();
-	$exists = $result && $result->num_rows > 0;
-	$stmt->close();
-	return $exists;
+	$escaped = $db->real_escape_string( $table );
+	$result  = $db->query( "SHOW TABLES LIKE '{$escaped}'" );
+	return $result && $result->num_rows > 0;
 }
 
+// ── PRO_START ─────────────────────────────────────────────────────────────────
 /**
  * Get unsynced fingerprints from pigcache_sql_fingerprints.
  *
@@ -763,6 +826,7 @@ function _pigcache_cron_mark_synced_fingerprints( mysqli $db, string $table, arr
 	$stmt->execute();
 	$stmt->close();
 }
+// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 // ── KV store helpers (mirrors PigCache_KV for standalone cron) ───────────────
 
@@ -787,6 +851,7 @@ function _pigcache_cron_kv_set( mysqli $db, string $table, string $key, $value )
 	}
 }
 
+// ── PRO_START ─────────────────────────────────────────────────────────────────
 /**
  * Read a scalar value from wp_pigcache_kv.
  * Returns $default when the key is absent or expired.
@@ -903,8 +968,8 @@ function _pigcache_cron_read_awstats( array $cfg, string $wp_config_path ): arra
 	}
 
 	if ( ! $dir || ! is_dir( $dir ) ) {
-		$base         = rtrim( dirname( $wp_config_path ), '/\\' );
-		$candidates   = array(
+		$base       = rtrim( dirname( $wp_config_path ), '/\\' );
+		$candidates = array(
 			dirname( dirname( $base ) ) . '/tmp/awstats',
 			dirname( $base ) . '/tmp/awstats',
 			$base . '/tmp/awstats',
@@ -1090,3 +1155,4 @@ function _pigcache_cron_download_profile( string $api_url, string $api_key, stri
 
 	return file_put_contents( $profile_path, $content, LOCK_EX ) !== false;
 }
+// ── PRO_END ───────────────────────────────────────────────────────────────────

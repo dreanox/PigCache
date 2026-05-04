@@ -3,7 +3,7 @@ Contributors: aixeiger
 Tags: cache, redis, object-cache, performance, html-cache
 Requires at least: 5.8
 Tested up to: 6.9
-Stable tag: 1.0.3
+Stable tag: 1.0.5
 Requires PHP: 7.4
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
@@ -48,7 +48,7 @@ PigCache includes its own drop-in and must not be used together with the separat
 = 1.0.1 =
 * Security: sanitize $_SERVER inputs in early-boot path and admin handlers.
 * Security: escape all outputs in object cache stats view.
-* Free build: global HTML/fragment flush on post changes (tag-based invalidation is Pro only).
+* HTML and fragment caches use tag-based selective invalidation when available, with global flush fallback.
 
 = 1.0.0 =
 * Initial release on WordPress.org.

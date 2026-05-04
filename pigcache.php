@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       PigCache
  * Description:       Redis object-cache drop-in with optional SQL, HTML page, and fragment caching.
- * Version: 1.0.3
+ * Version: 1.0.5
  * Requires at least: 5.8
  * Requires PHP:      7.4
  * Author:            PigCache
@@ -17,7 +17,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'PIGCACHE_VERSION', '1.0.3' );
+define( 'PIGCACHE_VERSION', '1.0.5' );
 define( 'PIGCACHE_FILE', __FILE__ );
 define( 'PIGCACHE_DIR', plugin_dir_path( __FILE__ ) );
 define( 'PIGCACHE_URL', plugin_dir_url( __FILE__ ) );
@@ -63,9 +63,8 @@ foreach ( array(
 	'class-pigcache-mutation-tracker.php',
 	'class-pigcache-traffic-reader.php',
 	'class-pigcache-adaptive-ttl.php',
-	'class-pigcache-admin-pro.php',
 ) as $_pigcache_pro_file ) {
-	$_pigcache_pro_path = PIGCACHE_DIR . 'includes/' . $_pigcache_pro_file;
+	$_pigcache_pro_path = PIGCACHE_DIR . 'includes/pro/' . $_pigcache_pro_file;
 	if ( is_readable( $_pigcache_pro_path ) ) {
 		require_once $_pigcache_pro_path;
 	}
@@ -95,14 +94,6 @@ register_activation_hook(
 
 		if ( class_exists( 'PigCache_Continuous_Learner', false ) ) {
 			PigCache_Continuous_Learner::schedule();
-		}
-
-		// Create logs/ directory with HTTP deny so pigcache-cron.log is never web-accessible.
-		$logs_dir = PIGCACHE_DIR . 'logs';
-		if ( ! is_dir( $logs_dir ) ) {
-			wp_mkdir_p( $logs_dir );
-			file_put_contents( $logs_dir . '/.htaccess', "Order deny,allow\nDeny from all\n" );
-			file_put_contents( $logs_dir . '/.gitignore', "*\n!.gitignore\n!.htaccess\n" );
 		}
 	}
 );

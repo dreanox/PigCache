@@ -36,7 +36,8 @@ class PigCache_Html_Cache {
 		}
 
 		// Only serve GET requests.
-		if ( ! isset( $_SERVER['REQUEST_METHOD'] ) || strtoupper( (string) $_SERVER['REQUEST_METHOD'] ) !== 'GET' ) {
+		// WP functions not yet available here — use filter_var (same as REQUEST_URI/HTTP_HOST below).
+		if ( ! isset( $_SERVER['REQUEST_METHOD'] ) || strtoupper( (string) filter_var( $_SERVER['REQUEST_METHOD'], FILTER_SANITIZE_SPECIAL_CHARS ) ) !== 'GET' ) {
 			return;
 		}
 
@@ -52,8 +53,9 @@ class PigCache_Html_Cache {
 			}
 		}
 
-		// Skip WooCommerce cart/checkout (non-empty cart hash means personalised content).
-		if ( ! empty( $_COOKIE['woocommerce_cart_hash'] ) || ! empty( $_COOKIE['woocommerce_items_in_cart'] ) ) {
+		// Skip WooCommerce cart/checkout (presence of cookie means personalised content).
+		// isset() avoids reading cookie values — WooCommerce never sets an empty hash.
+		if ( isset( $_COOKIE['woocommerce_cart_hash'] ) || isset( $_COOKIE['woocommerce_items_in_cart'] ) ) {
 			return;
 		}
 
@@ -118,7 +120,7 @@ class PigCache_Html_Cache {
 			return;
 		}
 
-		$tag_inv = class_exists( 'PigCache_License', false ) && PigCache_License::can_use_tag_invalidation();
+		$tag_inv = class_exists( 'PigCache_Tag_Index', false );
 
 		if ( $tag_inv && class_exists( 'PigCache_Tag_Collector', false ) ) {
 			PigCache_Tag_Collector::start();
@@ -178,9 +180,9 @@ class PigCache_Html_Cache {
 
 		wp_cache_set( $key, $pack, self::GROUP_HTML, $ttl );
 
-		$tag_inv = class_exists( 'PigCache_License', false ) && PigCache_License::can_use_tag_invalidation();
+		$tag_inv = class_exists( 'PigCache_Tag_Index', false );
 
-		if ( $tag_inv && class_exists( 'PigCache_Tag_Index', false ) && ! empty( $tags ) ) {
+		if ( $tag_inv && ! empty( $tags ) ) {
 			PigCache_Tag_Index::store_tags( $key, self::GROUP_HTML, $tags );
 		}
 
@@ -277,7 +279,7 @@ class PigCache_Html_Cache {
 			return false;
 		}
 
-		if ( ! isset( $_SERVER['REQUEST_METHOD'] ) || strtoupper( (string) $_SERVER['REQUEST_METHOD'] ) !== 'GET' ) {
+		if ( ! isset( $_SERVER['REQUEST_METHOD'] ) || strtoupper( sanitize_text_field( wp_unslash( $_SERVER['REQUEST_METHOD'] ) ) ) !== 'GET' ) {
 			return false;
 		}
 

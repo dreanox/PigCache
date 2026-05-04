@@ -17,8 +17,24 @@
 
 defined( 'ABSPATH' ) || exit;
 
-if ( ! defined( 'PIGCACHE_PLUGIN_DIR' ) && defined( 'WP_CONTENT_DIR' ) ) {
-	define( 'PIGCACHE_PLUGIN_DIR', WP_CONTENT_DIR . '/plugins/pigcache' );
+// This dropin runs from wp-content/object-cache.php — plugin_dir_path() is unavailable.
+// Prefer PIGCACHE_DIR already set by pigcache.php via plugin_dir_path(__FILE__), then
+// fall back to scanning common locations when the dropin loads before the plugin does.
+if ( ! defined( 'PIGCACHE_PLUGIN_DIR' ) ) {
+	if ( defined( 'PIGCACHE_DIR' ) ) {
+		define( 'PIGCACHE_PLUGIN_DIR', untrailingslashit( PIGCACHE_DIR ) );
+	} elseif ( defined( 'WP_CONTENT_DIR' ) ) {
+		foreach ( array(
+			WP_CONTENT_DIR . '/plugins/pigcache',
+			WP_CONTENT_DIR . '/mu-plugins/pigcache',
+		) as $_pigcache_dir ) {
+			if ( is_dir( $_pigcache_dir ) ) {
+				define( 'PIGCACHE_PLUGIN_DIR', $_pigcache_dir );
+				break;
+			}
+		}
+		unset( $_pigcache_dir );
+	}
 }
 
 if ( defined( 'PIGCACHE_PLUGIN_DIR' ) ) {
@@ -1104,7 +1120,7 @@ class WP_Object_Cache {
              * @param string $group      The cache group.
              * @param mixed  $orig_exp   The original expiration value before validation.
              */
-            $expire = apply_filters( 'redis_cache_expiration', $expire, $key, $group, $orig_exp );
+            $expire = apply_filters( 'pigcache_cache_expiration', $expire, $key, $group, $orig_exp );
 
             $san_key = $this->sanitize_key_part( $key );
             $derived_key = $derived_keys[ $key ] = $this->fast_build_key( $san_key, $san_group );
@@ -1222,7 +1238,7 @@ class WP_Object_Cache {
                  * @param string $group      The cache group.
                  * @param mixed  $orig_exp   The original expiration value before validation.
                  */
-                $expiration = apply_filters( 'redis_cache_expiration', $expiration, $key, $group, $orig_exp );
+                $expiration = apply_filters( 'pigcache_cache_expiration', $expiration, $key, $group, $orig_exp );
                 $start_time = microtime( true );
 
                 if ( $add ) {
@@ -1329,7 +1345,7 @@ class WP_Object_Cache {
              * @param string $group        The group value appended to the $key.
              * @param float  $execute_time Execution time for the request in seconds.
              */
-            do_action( 'redis_object_cache_delete', $key, $group, $execute_time );
+            do_action( 'pigcache_object_cache_delete', $key, $group, $execute_time );
         }
 
         return (bool) $result;
@@ -1412,7 +1428,7 @@ class WP_Object_Cache {
                  * @param string $group        The group value appended to the $key.
                  * @param float  $execute_time Execution time for the request in seconds.
                  */
-                do_action( 'redis_object_cache_delete', $key, $group, $execute_time );
+                do_action( 'pigcache_object_cache_delete', $key, $group, $execute_time );
             }
         }
 
@@ -1579,7 +1595,7 @@ class WP_Object_Cache {
                  * @param string     $salt         The defined key prefix.
                  * @param float      $execute_time Execution time for the request in seconds.
                  */
-                do_action( 'redis_object_cache_flush', $results, 0, $selective, $salt, $execute_time );
+                do_action( 'pigcache_object_cache_flush', $results, 0, $selective, $salt, $execute_time );
             }
         }
 
@@ -1648,7 +1664,7 @@ class WP_Object_Cache {
              * @param float $execute_time Execution time for the request in seconds.
              * @since 2.2.3
              */
-            do_action( 'redis_object_cache_flush_group', $results, $salt, $execute_time );
+            do_action( 'pigcache_object_cache_flush_group', $results, $salt, $execute_time );
         }
 
         foreach ( $results as $result ) {
@@ -1865,11 +1881,11 @@ class WP_Object_Cache {
              * @param bool   $found        Whether the key was found in the cache.
              * @param float  $execute_time Execution time for the request in seconds.
              */
-            do_action( 'redis_object_cache_get', $key, $value, $group, $force, $found, $execute_time );
+            do_action( 'pigcache_object_cache_get', $key, $value, $group, $force, $found, $execute_time );
         }
 
         if ( function_exists( 'apply_filters' ) && function_exists( 'has_filter' ) ) {
-            if ( has_filter( 'redis_object_cache_get_value' ) ) {
+            if ( has_filter( 'pigcache_object_cache_get_value' ) ) {
                 /**
                  * Filters the return value
                  *
@@ -1880,7 +1896,7 @@ class WP_Object_Cache {
                  * @param bool   $force Whether a forced refetch has taken place rather than relying on the local cache.
                  * @param bool   $found Whether the key was found in the cache.
                  */
-                return apply_filters( 'redis_object_cache_get_value', $value, $key, $group, $force, $found );
+                return apply_filters( 'pigcache_object_cache_get_value', $value, $key, $group, $force, $found );
             }
         }
 
@@ -2004,11 +2020,11 @@ class WP_Object_Cache {
              * @param bool   $force        Whether a forced refetch has taken place rather than relying on the local cache.
              * @param float  $execute_time Execution time for the request in seconds.
              */
-            do_action( 'redis_object_cache_get_multiple', $keys, $cache, $group, $force, $execute_time );
+            do_action( 'pigcache_object_cache_get_multiple', $keys, $cache, $group, $force, $execute_time );
         }
 
         if ( function_exists( 'apply_filters' ) && function_exists( 'has_filter' ) ) {
-            if ( has_filter( 'redis_object_cache_get_value' ) ) {
+            if ( has_filter( 'pigcache_object_cache_get_value' ) ) {
                 foreach ( $cache as $key => $value ) {
                     /**
                      * Filters the return value
@@ -2019,7 +2035,7 @@ class WP_Object_Cache {
                      * @param string $group The group value appended to the $key.
                      * @param bool   $force Whether a forced refetch has taken place rather than relying on the local cache.
                      */
-                    $cache[ $key ] = apply_filters( 'redis_object_cache_get_value', $value, $key, $group, $force );
+                    $cache[ $key ] = apply_filters( 'pigcache_object_cache_get_value', $value, $key, $group, $force );
                 }
             }
         }
@@ -2061,7 +2077,7 @@ class WP_Object_Cache {
              * @param string $group      The cache group.
              * @param mixed  $orig_exp   The original expiration value before validation.
              */
-            $expiration = apply_filters( 'redis_cache_expiration', $expiration, $key, $group, $orig_exp );
+            $expiration = apply_filters( 'pigcache_cache_expiration', $expiration, $key, $group, $orig_exp );
 
             try {
                 if ( $expiration ) {
@@ -2098,7 +2114,7 @@ class WP_Object_Cache {
              * @param int    $expiration   The time in seconds the entry expires. 0 for no expiry.
              * @param float  $execute_time Execution time for the request in seconds.
              */
-            do_action( 'redis_object_cache_set', $key, $value, $group, $expiration, $execute_time );
+            do_action( 'pigcache_object_cache_set', $key, $value, $group, $expiration, $execute_time );
         }
 
         return $result;
@@ -2165,7 +2181,7 @@ class WP_Object_Cache {
              * @param string $group      The cache group.
              * @param mixed  $orig_exp   The original expiration value before validation.
              */
-            $expiration = $expirations[ $key ] = apply_filters( 'redis_cache_expiration', $expiration, $key, $group, $orig_exp );
+            $expiration = $expirations[ $key ] = apply_filters( 'pigcache_cache_expiration', $expiration, $key, $group, $orig_exp );
 
             if ( $expiration ) {
                 $tx->setex( $derived_key, $expiration, $this->maybe_serialize( $value ) );
@@ -2216,7 +2232,7 @@ class WP_Object_Cache {
                  * @param int    $expiration   The time in seconds the entry expires. 0 for no expiry.
                  * @param float  $execute_time Execution time for the request in seconds.
                  */
-                do_action( 'redis_object_cache_set', $key, $value, $group, $expirations[ $key ], $execute_time );
+                do_action( 'pigcache_object_cache_set', $key, $value, $group, $expirations[ $key ], $execute_time );
             }
         }
 
@@ -2630,7 +2646,7 @@ class WP_Object_Cache {
          * @since 2.1.7
          * @param string[] $groups List of groups to be ignored.
          */
-        $groups = apply_filters( 'redis_cache_add_non_persistent_groups', (array) $groups );
+        $groups = apply_filters( 'pigcache_cache_add_non_persistent_groups', (array) $groups );
 
         $this->ignored_groups = array_unique( array_merge( $this->ignored_groups, $groups ) );
         $this->cache_group_types();
@@ -2816,6 +2832,19 @@ class WP_Object_Cache {
     /**
      * Returns the path of the circuit-breaker flag file for this Redis endpoint.
      *
+     * sys_get_temp_dir() is intentional and the only viable location for this file.
+     * The circuit breaker must work when Redis is DOWN and WordPress may not be fully
+     * loaded — which means:
+     *   • wp_upload_dir() is unavailable (calls get_option(), which hits the object cache
+     *     we are currently initialising — circular dependency).
+     *   • WP_CONTENT_DIR/cache/ is not guaranteed to exist or be writable at this point.
+     *   • The WordPress DB transient API is unavailable for the same reason.
+     *   • The plugin folder (PIGCACHE_DIR) is not a writable runtime-data location
+     *     and would violate WP.org guidelines.
+     * The system temp directory is the standard PHP location for ephemeral flag files;
+     * it does not persist across reboots (correct behaviour — a stale flag after a
+     * server restart should clear so Redis gets a fresh connection attempt).
+     *
      * @return string
      */
     private function pigcache_circuit_path() {
@@ -2879,7 +2908,7 @@ class WP_Object_Cache {
              * @param \Exception $exception The exception.
              * @param string     $message   The exception message.
              */
-            do_action( 'redis_object_cache_error', $exception, $exception->getMessage() );
+            do_action( 'pigcache_object_cache_error', $exception, $exception->getMessage() );
         }
 
         if ( ! $this->fail_gracefully ) {
@@ -2899,6 +2928,7 @@ class WP_Object_Cache {
 
         $domain = 'pigcache';
         $locale = defined( 'WPLANG' ) ? WPLANG : 'en_US';
+        // WP_LANG_DIR is the correct WordPress constant for plugin .mo files — no alternative API exists.
         $mofile = WP_LANG_DIR . "/plugins/{$domain}-{$locale}.mo";
 
         if ( load_textdomain( $domain, $mofile, $locale ) === false ) {

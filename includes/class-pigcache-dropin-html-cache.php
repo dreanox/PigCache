@@ -200,14 +200,16 @@ class PigCache_Dropin_Html_Cache {
 	}
 
 	/**
-	 * Locate wp-config.php. WordPress core always finds it one of two places.
+	 * Locate wp-config.php. WordPress core always finds it in one of two places.
+	 * This mirrors the exact check in wp-load.php — no WordPress function exists
+	 * to retrieve the wp-config.php path directly, so dirname(ABSPATH) is correct.
 	 *
 	 * @return string|null Absolute path or null if not found.
 	 */
 	private static function locate_wp_config() {
 		$candidates = array(
 			ABSPATH . 'wp-config.php',
-			dirname( ABSPATH ) . '/wp-config.php',
+			dirname( ABSPATH ) . '/wp-config.php', // standard location when wp-config.php is one level above ABSPATH
 		);
 
 		foreach ( $candidates as $path ) {

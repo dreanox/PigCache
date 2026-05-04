@@ -49,9 +49,6 @@ class PigCache_Plugin {
 
 		if ( is_admin() ) {
 			PigCache_Admin::init();
-			if ( class_exists( 'PigCache_Admin_Pro', false ) ) {
-				PigCache_Admin_Pro::init();
-			}
 			PigCache_Metrics::init();
 			add_action( 'admin_notices', array( $this, 'maybe_notice_standalone_redis_plugin' ) );
 		}

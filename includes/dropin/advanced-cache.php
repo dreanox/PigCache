@@ -10,7 +10,10 @@
 
 defined( 'ABSPATH' ) || exit;
 
-// Locate class-pigcache-html-cache.php from the plugin directory.
+// This dropin runs from wp-content/advanced-cache.php before the plugin or mu-plugins load.
+// plugin_dir_path() is unavailable here. WP_CONTENT_DIR is the only viable base.
+// We try fixed paths first (standard + mu-plugins install), then fall back to glob()
+// so custom plugin directory layouts are also supported.
 $_pigcache_html_class = null;
 $_pigcache_candidates = array(
 	WP_CONTENT_DIR . '/plugins/pigcache/includes/class-pigcache-html-cache.php',

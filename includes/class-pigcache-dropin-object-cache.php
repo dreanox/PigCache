@@ -115,6 +115,8 @@ class PigCache_Dropin_Object_Cache {
 			return new WP_Error( 'pigcache_oc_src', __( 'PigCache object-cache source file is missing.', 'pigcache' ) );
 		}
 
+		// WP_CONTENT_DIR is intentional: we are copying the dropin into wp-content/ itself,
+		// so we must verify that directory is writable — plugin_dir_path() would be wrong here.
 		if ( ! is_writable( WP_CONTENT_DIR ) ) {
 			return new WP_Error( 'pigcache_oc_writable', __( 'wp-content is not writable.', 'pigcache' ) );
 		}
@@ -124,7 +126,7 @@ class PigCache_Dropin_Object_Cache {
 		}
 
 		if ( function_exists( 'do_action' ) ) {
-			do_action( 'redis_object_cache_enable', true );
+			do_action( 'pigcache_object_cache_enable', true );
 		}
 
 		return true;
@@ -150,7 +152,7 @@ class PigCache_Dropin_Object_Cache {
 		}
 
 		if ( function_exists( 'do_action' ) ) {
-			do_action( 'redis_object_cache_disable', true );
+			do_action( 'pigcache_object_cache_disable', true );
 		}
 
 		return true;

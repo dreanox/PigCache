@@ -323,9 +323,8 @@ class PigCache_Invalidation {
 
 	/**
 	 * Generic content change handler for non-taggable events (options, theme,
-	 * widgets). Pro: only bumps SQL epoch — HTML stays cached until a tagged
-	 * object changes. Free: also flushes HTML/fragments globally since there
-	 * are no tags to resolve.
+	 * widgets). Bumps SQL epoch and flushes HTML/fragments globally since there
+	 * are no specific tags to resolve for these events.
 	 */
 	public static function on_generic_change() {
 		if ( ! self::acquire_throttle() ) {
@@ -394,6 +393,6 @@ class PigCache_Invalidation {
 	 * @return bool
 	 */
 	private static function can_use_tag_invalidation() {
-		return class_exists( 'PigCache_License', false ) && PigCache_License::can_use_tag_invalidation();
+		return class_exists( 'PigCache_Tag_Index', false );
 	}
 }

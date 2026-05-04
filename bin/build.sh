@@ -109,22 +109,9 @@ mkdir -p "${DIST_DIR}"
 # Paths relative to the plugin root.
 # -----------------------------------------------------------------------
 PRO_ONLY_FILES=(
-  "includes/class-pigcache-environment.php"
-  "includes/class-pigcache-cloud-client.php"
-  "includes/class-pigcache-cloud-sync.php"
-  "includes/class-pigcache-sql-profile-store.php"
-  "includes/class-pigcache-sql-profiler.php"
-  "includes/class-pigcache-updates.php"
-  "includes/class-pigcache-query-buffer.php"
-  "includes/class-pigcache-query-stats.php"
-  "includes/class-pigcache-continuous-learner.php"
-  "includes/class-pigcache-mutation-tracker.php"
-  "includes/class-pigcache-traffic-reader.php"
-  "includes/class-pigcache-adaptive-ttl.php"
-  "includes/class-pigcache-admin-pro.php"
-  "includes/class-pigcache-tag-index.php"
-  "includes/class-pigcache-tag-collector.php"
-  # class-pigcache-kv.php ships in BOTH builds (always-loaded, no Pro dependency)
+  "includes/pro"
+  # The entire includes/pro/ subtree is Pro-only; listing the folder is enough
+  # because the strip loop below removes it with rm -rf for the Free build.
 )
 
 # -----------------------------------------------------------------------
@@ -166,19 +153,26 @@ build_zip() {
     cp "${PLUGIN_DIR}/README-pro.md" "${staging}/README.md"
   fi
 
-  # ---- Strip Pro-only PHP files for the Free build -----------------------
+  # ---- Strip Pro-only files for the Free build ------------------------------
   if [[ "${label}" == "free" ]]; then
     for f in "${PRO_ONLY_FILES[@]}"; do
-      rm -f "${staging}/${f}"
+      rm -rf "${staging}/${f}"
     done
+
+    # Strip PRO_START…PRO_END blocks from dual-source files.
+    sed -i '/\/\/ ── PRO_START/,/\/\/ ── PRO_END/d' \
+      "${staging}/includes/class-pigcache-admin.php"
   fi
 
-  # ---- Inject Pro-only bin files (bin/ is excluded from rsync via .distignore) ---
-  # pigcache-cron.php is a standalone CLI script shipped only in the Pro build.
+  # ---- Inject cron script (bin/ is excluded from rsync via .distignore) ------
+  # Pro: ship as-is. Free: strip Pro-only sections first.
   # build.sh itself never ships.
+  mkdir -p "${staging}/bin"
   if [[ "${label}" == "pro" ]]; then
-    mkdir -p "${staging}/bin"
     cp "${PLUGIN_DIR}/bin/pigcache-cron.php" "${staging}/bin/pigcache-cron.php"
+  else
+    sed '/\/\/ ── PRO_START/,/\/\/ ── PRO_END/d' \
+      "${PLUGIN_DIR}/bin/pigcache-cron.php" > "${staging}/bin/pigcache-cron.php"
   fi
 
   # ---- Create ZIP (pigcache/ wrapper folder required by wordpress.org) ---

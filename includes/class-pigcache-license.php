@@ -364,7 +364,7 @@ class PigCache_License {
 	 * @return bool
 	 */
 	public static function can_use_profiler() {
-		return self::has_pro_distribution();
+		return class_exists( 'PigCache_Sql_Profiler', false );
 	}
 
 	/**

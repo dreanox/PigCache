@@ -316,7 +316,7 @@ class PigCache_Metrics {
 		}
 
 		$pattern = self::scan_pattern( $wp_object_cache );
-		$paged   = isset( $_GET['paged'] ) ? max( 1, (int) $_GET['paged'] ) : 1;
+		$paged   = isset( $_GET['paged'] ) ? max( 1, absint( $_GET['paged'] ) ) : 1;
 
 		$data = get_transient( self::TRANSIENT );
 		if ( ! is_array( $data ) || empty( $data['keys'] ) || ( isset( $data['pattern'] ) && $data['pattern'] !== $pattern ) ) {

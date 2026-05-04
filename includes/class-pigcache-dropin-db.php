@@ -2,6 +2,11 @@
 /**
  * Install/remove wp-content/db.php for SQL result caching.
  *
+ * All references to WP_CONTENT_DIR in this class are intentional: db.php is a
+ * WordPress drop-in that must live in wp-content/, not inside the plugin directory.
+ * plugin_dir_path() would give the wrong location; WP_CONTENT_DIR is the only
+ * WordPress API available for the content directory path.
+ *
  * @package PigCache
  */
 
@@ -82,8 +87,8 @@ class PigCache_Dropin_DB {
 	 */
 	public static function locate_wpdb_class_file() {
 		$candidates = array(
-			WP_CONTENT_DIR . '/plugins/pigcache/includes/class-pigcache-wpdb.php',
-			WP_CONTENT_DIR . '/mu-plugins/pigcache/includes/class-pigcache-wpdb.php',
+			PIGCACHE_DIR . 'includes/class-pigcache-wpdb.php',                            // primary: plugin_dir_path()-based
+			WP_CONTENT_DIR . '/mu-plugins/pigcache/includes/class-pigcache-wpdb.php',     // mu-plugins fallback
 		);
 
 		foreach ( $candidates as $path ) {

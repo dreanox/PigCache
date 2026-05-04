@@ -22,7 +22,7 @@ class PigCache_Sql_Cache {
 	private static $long_ttl = 0;
 
 	public static function init() {
-		add_action( 'redis_object_cache_flush', array( __CLASS__, 'bump_epoch' ), 99 );
+		add_action( 'pigcache_object_cache_flush', array( __CLASS__, 'bump_epoch' ), 99 );
 	}
 
 	// ------------------------------------------------------------------
