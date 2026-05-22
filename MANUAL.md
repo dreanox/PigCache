@@ -831,6 +831,140 @@ python3 cli/pigcache-analyze.py \
 python3 cli/pigcache-analyze.py --wp-config /var/www/html/wp-config.php -o report.json
 ```
 
+### Monitor operativo (`cli/pigcache-monitor.py`)
+
+Script Python con varios subcomandos para vigilar la salud de Redis + MySQL
+**fuera de wp-admin**, pensado para correr por cron en cPanel. No requiere
+cargar WordPress.
+
+#### Instalación
+
+```bash
+pip3 install --user redis PyMySQL
+# (mysql-connector-python también sirve)
+```
+
+#### Subcomandos
+
+| Subcomando | Qué hace |
+|------------|----------|
+| `snapshot` | Reporte completo de una sola pasada (Redis + MySQL): versión, latencia PING, hit ratio acumulado, memoria vs `maxmemory`, política de evicción, evicciones/expiraciones, slowlog top 5, saturación MySQL. |
+| `health` | Pass/fail con exit codes (`0` OK, `1` warn, `2` critical). Pensado para cron con email-on-failure. Chequea circuit-breaker, ping, hit ratio, fill de memoria, política, conexiones rechazadas, stampede locks, saturación MySQL. |
+| `breakdown` | Recorre el keyspace con `SCAN` y agrupa por grupo de cache (`pigcache_html`, `pigcache_sql`, `pigcache_fragments`, `options`, `posts`, `transient`…). Muestra conteo, % sin TTL, TTL promedio, bytes muestreados con `MEMORY USAGE` y estimación de bytes totales por grupo. **Esta es la vista clave para responder "¿en qué se está usando mi memoria de Redis?".** |
+| `hot-keys` | Top N keys más grandes vía `MEMORY USAGE` (muestreo). Detecta keys gordas que están comiendo memoria. |
+| `watch` | Toma dos snapshots separados por una ventana de tiempo y calcula deltas reales (hits/s, miss/s, ops/s, evicciones/s, hit ratio **de la ventana**, no acumulado). |
+| `mysql` | Solo MySQL: `Threads_connected`, `Max_used_connections`, `Aborted_clients`, `Connection_errors_max_connections`, `Slow_queries` y `processlist` por estado. Respuesta directa al "Error establishing a database connection". |
+| `stampede` | Lista las keys `pigcache_lock_*` activas. Si hay muchas, hay regeneraciones en cola (cache MISS en páginas hot y/o DB lenta). |
+| `log-line` | Una sola línea compacta con las métricas clave. Ideal para `>> archivo.log 2>&1` y analizar con `grep`/`awk` o ingestar en cualquier monitor que tail-ee logs. |
+
+#### Flags comunes (sirven en todos los subcomandos)
+
+```
+--wp-config PATH       Auto-rellena credenciales Redis y MySQL desde wp-config.php
+--redis-host, --redis-port, --redis-password, --redis-db
+--mysql-host (acepta host:port), --mysql-user, --mysql-password, --mysql-db
+--timeout 3            Timeout de socket para Redis y MySQL (segundos)
+--json                 Emite JSON en vez de texto (para jq / ingesta)
+--skip-mysql           Solo Redis
+--sample-cap 20000     Límite de keys que `SCAN` puede recorrer
+--scan-count 500       COUNT hint para cada iteración de SCAN
+```
+
+`health` añade thresholds tuneables: `--ping-max-ms 50`, `--hit-ratio-min 80`,
+`--memory-fill-max 90`, `--stampede-max 25`, `--mysql-sat-max 80`.
+
+#### Cron en cPanel (Cron Jobs)
+
+Reemplaza `/home/USER` por tu home real y la ruta del plugin.
+
+```cron
+# Cada minuto: una línea compacta para tail / grep
+* * * * * /usr/bin/python3 /home/USER/public_html/wp-content/plugins/pigcache/cli/pigcache-monitor.py \
+    log-line --wp-config /home/USER/public_html/wp-config.php \
+    >> /home/USER/logs/pigcache-monitor.log 2>&1
+
+# Cada 5 minutos: health check, cPanel envía email si exit != 0
+*/5 * * * * /usr/bin/python3 /home/USER/public_html/wp-content/plugins/pigcache/cli/pigcache-monitor.py \
+    health --wp-config /home/USER/public_html/wp-config.php
+
+# Cada hora: breakdown por grupo en JSON (histórico de cómo se distribuye la memoria)
+0 * * * * /usr/bin/python3 /home/USER/public_html/wp-content/plugins/pigcache/cli/pigcache-monitor.py \
+    breakdown --wp-config /home/USER/public_html/wp-config.php --json \
+    >> /home/USER/logs/pigcache-breakdown.jsonl 2>&1
+
+# Cada 6 horas: top 20 keys más grandes (para detectar bloat)
+0 */6 * * * /usr/bin/python3 /home/USER/public_html/wp-content/plugins/pigcache/cli/pigcache-monitor.py \
+    hot-keys --wp-config /home/USER/public_html/wp-config.php --top 20 \
+    >> /home/USER/logs/pigcache-hotkeys.log 2>&1
+```
+
+#### Diagnóstico de "Error establishing a database connection"
+
+Ese error es de **MySQL**, no de Redis, pero suele aparecer cuando Redis no
+está absorbiendo carga y MySQL se queda sin slots de conexión. Para confirmar
+qué está pasando en el momento exacto, corre en paralelo:
+
+```bash
+python3 cli/pigcache-monitor.py snapshot --wp-config /ruta/wp-config.php
+python3 cli/pigcache-monitor.py watch    --wp-config /ruta/wp-config.php --window 60
+python3 cli/pigcache-monitor.py stampede --wp-config /ruta/wp-config.php
+```
+
+Señales por orden de gravedad:
+
+1. `circuit breaker: OPEN` → el dropin de PigCache ya marcó Redis como caído.
+   Las requests siguientes se sirven sin cache → tormenta de queries a MySQL.
+2. `rejected_connections > 0` o `connected_clients` cerca de `maxclients` →
+   Redis tirando conexiones de PHP-FPM, esos workers también caen sin cache.
+3. `mysql_conn_saturation_pct > 80%` o `connection_errors_max_connections > 0`
+   → MySQL está al límite. Sube `max_connections` y/o reduce `wait_timeout`,
+   pero la causa raíz casi siempre es cache MISS.
+4. `active locks > N` en `stampede` → muchas páginas se regeneran a la vez
+   (cache stampede). Suele coincidir con un purge global reciente.
+5. `evicted_keys` creciendo + `memory fill ~100%` → Redis está reciclando
+   keys útiles. Sube `maxmemory` o limpia keys sin TTL (ver `breakdown`).
+
+#### Recomendaciones de configuración de Redis
+
+Para alto tráfico estas opciones del `redis.conf` (o `CONFIG SET` en caliente)
+son las que más impacto tienen:
+
+```conf
+# Tope estricto, NUNCA dejarlo en 0 con WordPress detrás. Ajusta al ~70% de la
+# RAM dedicada al proceso redis-server.
+maxmemory 2gb
+
+# Estrategia de evicción. allkeys-lru es la sana por defecto en WordPress:
+# desaloja las keys menos recientes sin importar si tienen TTL o no. Con
+# `noeviction` Redis devuelve OOM en cada SET cuando se llena → cache miss
+# permanente.
+maxmemory-policy allkeys-lru
+
+# Sube el cap de clientes si tienes muchos workers PHP-FPM (por ejemplo
+# 4 pools x 200 children = 800). Default es 10000.
+maxclients 10000
+
+# Latencia: matar lazy clients para liberar slots cuando hay picos.
+timeout 300
+tcp-keepalive 60
+
+# Activa slowlog para investigar comandos lentos (>10ms) que ralenticen
+# requests:
+slowlog-log-slower-than 10000
+slowlog-max-len 256
+```
+
+En el `wp-config.php` del sitio:
+
+```php
+// Reintenta cada N segundos cuando Redis se cae (default 30). Bájalo si el
+// servicio se recupera rápido para que el dropin reintente antes:
+define( 'PIGCACHE_REDIS_RETRY_INTERVAL', 15 );
+
+// Falla con elegancia (el sitio sigue funcionando sin cache si Redis muere):
+define( 'PIGCACHE_REDIS_GRACEFUL', true );
+```
+
 ### WP-CLI (futuro)
 
 Comandos planificados para futuras versiones:
