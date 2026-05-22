@@ -190,6 +190,18 @@ build_zip() {
       "${PLUGIN_DIR}/bin/pigcache-cron.php" > "${staging}/bin/pigcache-cron.php"
   fi
 
+  # ---- Inject Python CLI tooling (cli/ is excluded from rsync via .distignore)
+  # Pro-only: pigcache-monitor.py is an ops-grade Redis+MySQL probe targeted
+  # at high-traffic deployments (the Pro persona). It has no Pro PHP-side
+  # dependencies — it reads Redis INFO/SCAN and MySQL status directly — so it
+  # ships verbatim with no PRO_START/END stripping. Falls back to a stdlib
+  # RESP client when redis-py is not installed on the host.
+  if [[ "${label}" == "pro" ]]; then
+    mkdir -p "${staging}/cli"
+    cp "${PLUGIN_DIR}/cli/pigcache-monitor.py" "${staging}/cli/pigcache-monitor.py"
+    chmod +x "${staging}/cli/pigcache-monitor.py"
+  fi
+
   # ---- Create ZIP (pigcache/ wrapper folder required by wordpress.org) ---
   # Remove any previous ZIP so we never merge stale entries from an old build.
   rm -f "${DIST_DIR}/${zip_name}"
