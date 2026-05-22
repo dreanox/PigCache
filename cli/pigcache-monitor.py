@@ -22,24 +22,46 @@ alerting via cPanel email-on-failure.
 Quick start
 -----------
 
+The `report` subcommand is the swiss-army-knife: it gathers EVERYTHING
+(Redis snapshot + per-group memory breakdown + stampede locks + MySQL
+saturation + pre-computed alerts) into a single JSON payload, and is the
+exact same invocation whether you run it by hand or from cron.
+
+Run it from inside `wp-content/plugins/pigcache/cli/` — `wp-config.php` is
+auto-discovered by walking up the directory tree (same algorithm as
+`bin/pigcache-cron.php`), so no flag is needed:
+
+    cd /home/USER/public_html/wp-content/plugins/pigcache/cli
+
+    # 1) MANUAL — prints the full JSON report to the terminal (dry-run)
+    python3 pigcache-monitor.py report
+
+    # 1b) MANUAL human-readable variant (still includes everything):
+    python3 pigcache-monitor.py report | python3 -m json.tool | less
+
+    # 2) CRON — same command, pushes the same payload to the PigCache API
+    #    every 5 min, silent in stdout, errors emailed by cPanel on non-zero exit
+    */5 * * * * /usr/bin/python3 /home/USER/public_html/wp-content/plugins/pigcache/cli/pigcache-monitor.py report --push --quiet >> /home/USER/logs/pigcache-monitor.err 2>&1
+
+The same `report` payload can also be kept on disk for offline analysis:
+
+    python3 pigcache-monitor.py report --save /home/USER/logs/pigcache-$(date +%Y%m%d-%H%M).json --push --quiet
+
+Lighter cron probes (use these in *addition* to `report` if you want
+sub-minute granularity for tail/grep/alerting):
+
+    # Per-minute single-line metric log (tailable, awk-friendly)
+    * * * * * /usr/bin/python3 /home/USER/public_html/wp-content/plugins/pigcache/cli/pigcache-monitor.py log-line >> /home/USER/logs/pigcache-monitor.log 2>&1
+
+    # Pass/fail alert (cPanel emails any non-zero exit)
+    */5 * * * * /usr/bin/python3 /home/USER/public_html/wp-content/plugins/pigcache/cli/pigcache-monitor.py health
+
+If you need to point at a wp-config in a non-standard location, every
+subcommand accepts `--wp-config /path/to/wp-config.php`.
+
+Install (recommended, but optional — see the Requirements block below):
+
     pip3 install --user redis PyMySQL    # or: mysql-connector-python
-
-    # One-shot dashboard, credentials auto-read from wp-config.php:
-    python3 pigcache-monitor.py snapshot --wp-config /home/USER/public_html/wp-config.php
-
-    # Cron-friendly compact line (every minute):
-    * * * * * /usr/bin/python3 /home/USER/.../cli/pigcache-monitor.py log-line \\
-        --wp-config /home/USER/public_html/wp-config.php \\
-        >> /home/USER/logs/pigcache-monitor.log 2>&1
-
-    # Pass/fail alert (cPanel emails any non-zero exit):
-    */5 * * * * /usr/bin/python3 /home/USER/.../cli/pigcache-monitor.py health \\
-        --wp-config /home/USER/public_html/wp-config.php
-
-    # Per-group memory breakdown (once per hour):
-    0 * * * * /usr/bin/python3 /home/USER/.../cli/pigcache-monitor.py breakdown \\
-        --wp-config /home/USER/public_html/wp-config.php --json \\
-        > /home/USER/logs/pigcache-breakdown.json
 
 Requirements
 ------------
@@ -337,7 +359,12 @@ WP_CONFIG_CONSTANTS = (
     "PIGCACHE_REDIS_PASSWORD", "PIGCACHE_REDIS_DATABASE",
     "PIGCACHE_REDIS_PREFIX", "PIGCACHE_REDIS_TIMEOUT",
     "WP_CACHE_KEY_SALT",
+    # API / cloud credentials — match bin/pigcache-cron.php exactly.
+    "PIGCACHE_CLOUD_API_URL", "PIGCACHE_API_KEY",
+    "WP_HOME", "WP_SITEURL",
 )
+
+DEFAULT_API_URL = "https://bluecache.pigworlds.com/api/v1"
 
 
 def parse_wp_config(path):
@@ -371,6 +398,132 @@ def parse_wp_config(path):
         out["table_prefix"] = m.group(1)
 
     return out
+
+
+def find_wp_config(start_dir=None, max_levels=6):
+    """Auto-discover wp-config.php by walking up from the script directory.
+
+    Mirrors the strategy of `_pigcache_cron_find_wp_config()` in
+    bin/pigcache-cron.php so both tools behave the same way when invoked
+    without `--wp-config`. The script is typically at
+        wp-content/plugins/pigcache/cli/pigcache-monitor.py
+    so wp-config.php is ~4 levels up. We walk up to `max_levels` (default 6)
+    to give margin for non-standard installs.
+    """
+    if start_dir is None:
+        start_dir = os.path.dirname(os.path.abspath(__file__))
+
+    current = start_dir
+    for _ in range(max_levels):
+        candidate = os.path.join(current, "wp-config.php")
+        if os.path.isfile(candidate):
+            return candidate
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+
+    return None
+
+
+def fetch_wp_options(conn, table_prefix, names):
+    """Fetch one or more rows from wp_options as a dict of name -> raw value.
+
+    Used to retrieve api_key / site_id from the database the same way the PHP
+    cron does it (`pigcache_license_key`, `pigcache_cloud_site_id`).
+    """
+    table = (table_prefix or "wp_") + "options"
+    cur = conn.cursor()
+    placeholders = ",".join(["%s"] * len(names))
+    out = {}
+    try:
+        cur.execute(
+            f"SELECT option_name, option_value FROM `{table}` "
+            f"WHERE option_name IN ({placeholders})",
+            tuple(names),
+        )
+        for row in cur.fetchall():
+            out[row[0]] = row[1]
+    except Exception:
+        pass
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+    return out
+
+
+def resolve_api_credentials(args, cfg, mysql_conn=None):
+    """Resolve (api_url, api_key, site_id, site_url) the same way as the PHP cron.
+
+    Precedence (highest first):
+      1. Explicit CLI flags (--api-url, --api-key, --site-id).
+      2. Constants in wp-config.php (PIGCACHE_CLOUD_API_URL, PIGCACHE_API_KEY).
+      3. wp_options rows (pigcache_license_key, pigcache_cloud_site_id, siteurl).
+    """
+    api_url = (
+        getattr(args, "api_url", None)
+        or cfg.get("PIGCACHE_CLOUD_API_URL")
+        or DEFAULT_API_URL
+    )
+    api_url = api_url.rstrip("/")
+
+    api_key = getattr(args, "api_key", None) or cfg.get("PIGCACHE_API_KEY") or ""
+    site_id = getattr(args, "site_id", None) or ""
+    site_url = cfg.get("WP_HOME") or cfg.get("WP_SITEURL") or ""
+
+    if mysql_conn is not None and (not api_key or not site_id or not site_url):
+        opts = fetch_wp_options(
+            mysql_conn,
+            cfg.get("table_prefix") or "wp_",
+            ("pigcache_license_key", "pigcache_cloud_site_id", "siteurl", "home"),
+        )
+        if not api_key:
+            api_key = opts.get("pigcache_license_key", "") or ""
+        if not site_id:
+            site_id = opts.get("pigcache_cloud_site_id", "") or ""
+        if not site_url:
+            site_url = opts.get("home") or opts.get("siteurl") or ""
+
+    return api_url, str(api_key), str(site_id), str(site_url)
+
+
+def post_json_to_api(url, body, api_key, site_id, timeout=20):
+    """POST a JSON payload to the PigCache API using stdlib `urllib` only.
+
+    Mirrors `_pigcache_cron_api_request()` from bin/pigcache-cron.php:
+    same Authorization / X-Site-Id headers, same JSON content type, same
+    20s default timeout. Returns (status_code, response_text).
+    """
+    from urllib import request as urllib_request
+    from urllib import error as urllib_error
+
+    payload = json.dumps(body, default=str).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "pigcache-monitor/1.0",
+    }
+    if api_key:
+        headers["Authorization"] = "Bearer " + api_key
+    if site_id:
+        headers["X-Site-Id"] = str(site_id)
+
+    req = urllib_request.Request(url, data=payload, headers=headers, method="POST")
+    try:
+        with urllib_request.urlopen(req, timeout=timeout) as resp:
+            return resp.getcode(), resp.read().decode("utf-8", "replace")
+    except urllib_error.HTTPError as exc:
+        try:
+            body_text = exc.read().decode("utf-8", "replace")
+        except Exception:
+            body_text = ""
+        return exc.code, body_text
+    except urllib_error.URLError as exc:
+        return 0, "URLError: " + str(exc.reason)
+    except (socket.timeout, OSError) as exc:
+        return 0, "socket/OS error: " + str(exc)
 
 
 # ─── Redis connection ────────────────────────────────────────────────────────
@@ -1342,6 +1495,246 @@ def cmd_log_line(args, cfg):
     print(line)
 
 
+def cmd_report(args, cfg):
+    """Build a complete monitoring payload and (optionally) POST it to the API.
+
+    Payload schema (version 1):
+        {
+            "schema_version": 1,
+            "monitor_version": "1.0.0",
+            "captured_at":     "<UTC ISO-8601 with Z>",
+            "site": {
+                "site_url":      "<from wp_options 'home' or wp-config WP_HOME>",
+                "site_id":       "<from option pigcache_cloud_site_id>",
+                "table_prefix":  "<wp_>",
+                "wp_config_path":"<absolute path>"
+            },
+            "monitor": {
+                "python_version": "3.x.y",
+                "redis_driver":   "redis-py" | "stdlib-bare",
+                "hostname":       "<gethostname()>",
+            },
+            "redis":            { ...redis_snapshot() output... },
+            "circuit_breaker":  { "open": bool, "age_seconds": int|null, "path": str },
+            "mysql":            { ...mysql_probe() output... }   | null,
+            "breakdown":        { ...scan_breakdown() output... } | null,
+            "stampede":         { ...scan_stampede_locks() output... } | null,
+            "alerts":           [ { severity, code, msg }, ... ]
+        }
+
+    The same `Authorization: Bearer <api_key>` + `X-Site-Id: <id>` headers as
+    bin/pigcache-cron.php are used so the API endpoint can reuse its existing
+    auth middleware.
+    """
+    import getpass
+    import platform
+
+    # ── Gather Redis state ─────────────────────────────────────────────
+    client, endpoint = connect_redis(args, cfg)
+    snap = redis_snapshot(client, endpoint)
+    cb = circuit_breaker_state(endpoint["host"], endpoint["port"])
+
+    # ── Gather MySQL state (also needed for credential lookup) ─────────
+    mysql_block = None
+    mysql_conn = None
+    if not args.skip_mysql:
+        mysql_conn, err = connect_mysql(args, cfg)
+        if mysql_conn is not None:
+            try:
+                mysql_block = mysql_probe(mysql_conn)
+            except Exception as exc:
+                mysql_block = {"error": "probe failed: " + str(exc)}
+        elif err:
+            mysql_block = {"error": err}
+
+    # ── Breakdown by group (optional) ─────────────────────────────────
+    breakdown_block = None
+    if not args.no_breakdown:
+        pattern = (cfg.get("PIGCACHE_REDIS_PREFIX") or "") + "*"
+        try:
+            breakdown_block = scan_breakdown(
+                client, pattern,
+                cap=args.sample_cap,
+                sample_per_group=50,
+                count=args.scan_count,
+            )
+        except Exception as exc:
+            breakdown_block = {"error": str(exc)}
+
+    # ── Stampede (optional) ───────────────────────────────────────────
+    stampede_block = None
+    if not args.no_stampede:
+        lock_pattern = (cfg.get("PIGCACHE_REDIS_PREFIX") or "") + "*pigcache_lock_*"
+        try:
+            stampede_block = scan_stampede_locks(
+                client, lock_pattern, cap=2000, count=500,
+            )
+        except Exception as exc:
+            stampede_block = {"error": str(exc)}
+
+    # ── Alerts (run health-check logic against this snapshot) ─────────
+    alerts = _compute_alerts(snap, cb, mysql_block, stampede_block)
+
+    # ── Resolve API credentials (constants → wp_options, like cron) ───
+    api_url, api_key, site_id, site_url = resolve_api_credentials(
+        args, cfg, mysql_conn=mysql_conn,
+    )
+
+    if mysql_conn is not None:
+        try:
+            mysql_conn.close()
+        except Exception:
+            pass
+
+    # ── Build payload ─────────────────────────────────────────────────
+    payload = {
+        "schema_version": 1,
+        "monitor_version": "1.0.0",
+        "captured_at": datetime.utcnow().isoformat() + "Z",
+        "site": {
+            "site_url": site_url,
+            "site_id": site_id,
+            "table_prefix": cfg.get("table_prefix") or "wp_",
+            "wp_config_path": args.wp_config or "",
+        },
+        "monitor": {
+            "python_version": platform.python_version(),
+            "redis_driver": endpoint.get("driver", "?"),
+            "hostname": socket.gethostname(),
+            "user": getpass.getuser(),
+        },
+        "redis": snap,
+        "circuit_breaker": cb,
+        "mysql": mysql_block,
+        "breakdown": breakdown_block,
+        "stampede": stampede_block,
+        "alerts": alerts,
+    }
+
+    # ── Optional local save ────────────────────────────────────────────
+    if args.save:
+        try:
+            with open(args.save, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, default=str)
+            print(f"info: wrote payload to {args.save}", file=sys.stderr)
+        except OSError as exc:
+            print(f"warn: could not write --save file: {exc}", file=sys.stderr)
+
+    # ── Print to stdout (unless quiet) ─────────────────────────────────
+    if not args.quiet:
+        print(json.dumps(payload, indent=2, default=str))
+
+    # ── Push to API ────────────────────────────────────────────────────
+    if not args.push:
+        return  # dry-run done
+
+    if not api_key:
+        print("error: no API key (PIGCACHE_API_KEY constant or "
+              "pigcache_license_key option). Pass --api-key or skip --push.",
+              file=sys.stderr)
+        sys.exit(3)
+    if not site_id:
+        print("error: no site_id (pigcache_cloud_site_id option). "
+              "Pass --site-id or skip --push.", file=sys.stderr)
+        sys.exit(3)
+
+    endpoint_path = args.endpoint.replace("{site_id}", site_id)
+    if not endpoint_path.startswith("/"):
+        endpoint_path = "/" + endpoint_path
+    url = api_url + endpoint_path
+
+    status, body = post_json_to_api(
+        url, payload, api_key, site_id, timeout=args.http_timeout,
+    )
+
+    if 200 <= status < 300:
+        print(f"info: API push OK → {url} (HTTP {status})", file=sys.stderr)
+    else:
+        snippet = (body or "")[:300].replace("\n", " ")
+        print(f"error: API push FAILED → {url} (HTTP {status}) {snippet}",
+              file=sys.stderr)
+        sys.exit(4)
+
+
+def _compute_alerts(snap, cb, mysql_block, stampede_block,
+                    ping_max_ms=50.0, hit_ratio_min=80.0,
+                    memory_fill_max=90.0, stampede_max=25,
+                    mysql_sat_max=80.0):
+    """Pure-function version of the rules in run_health(). Used by `report`."""
+    alerts = []
+
+    if cb["open"]:
+        alerts.append({
+            "severity": "critical", "code": "redis_circuit_open",
+            "msg": f"Circuit breaker is OPEN (age {cb['age_seconds']}s) — "
+                   f"PigCache dropin recently failed to reach Redis.",
+        })
+
+    if snap["ping_max_ms"] > ping_max_ms:
+        alerts.append({
+            "severity": "warn", "code": "redis_latency_high",
+            "msg": f"Redis PING max {snap['ping_max_ms']} ms > {ping_max_ms} ms.",
+        })
+
+    if snap["hit_ratio_pct"] is not None and snap["hit_ratio_pct"] < hit_ratio_min:
+        alerts.append({
+            "severity": "warn", "code": "low_hit_ratio",
+            "msg": f"Cumulative hit ratio {snap['hit_ratio_pct']}% "
+                   f"< {hit_ratio_min}%.",
+        })
+
+    if snap["maxmemory_bytes"] == 0:
+        alerts.append({
+            "severity": "warn", "code": "no_maxmemory",
+            "msg": "Redis maxmemory is UNLIMITED — set a cap + LRU policy.",
+        })
+    elif snap["maxmemory_fill_pct"] and snap["maxmemory_fill_pct"] > memory_fill_max:
+        alerts.append({
+            "severity": "warn", "code": "memory_pressure",
+            "msg": f"Redis memory fill {snap['maxmemory_fill_pct']}% "
+                   f"> {memory_fill_max}% — evictions imminent.",
+        })
+
+    if snap["maxmemory_policy"] == "noeviction":
+        alerts.append({
+            "severity": "warn", "code": "policy_noeviction",
+            "msg": "maxmemory-policy=noeviction — Redis returns OOM on SET "
+                   "when full. Use allkeys-lru or volatile-lru.",
+        })
+
+    if snap["rejected_connections"] > 0:
+        alerts.append({
+            "severity": "warn", "code": "rejected_connections",
+            "msg": f"{snap['rejected_connections']} rejected_connections "
+                   "since boot — maxclients reached.",
+        })
+
+    if stampede_block and stampede_block.get("active_lock_count", 0) > stampede_max:
+        alerts.append({
+            "severity": "warn", "code": "stampede_locks_high",
+            "msg": f"{stampede_block['active_lock_count']} active stampede "
+                   "locks — many pages regenerating simultaneously.",
+        })
+
+    if mysql_block and "conn_saturation_pct" in mysql_block:
+        sat = mysql_block.get("conn_saturation_pct")
+        if isinstance(sat, (int, float)) and sat > mysql_sat_max:
+            alerts.append({
+                "severity": "critical", "code": "mysql_conn_saturation",
+                "msg": f"MySQL connection usage {sat}% of max_connections "
+                       f"({mysql_block.get('threads_connected')}/"
+                       f"{mysql_block.get('max_connections')}).",
+            })
+        cme = mysql_block.get("connection_errors_max_connections", 0)
+        if cme > 0:
+            alerts.append({
+                "severity": "critical", "code": "mysql_max_conn_errors",
+                "msg": f"MySQL has refused {cme} new connections since boot.",
+            })
+
+    return alerts
+
+
 # ─── CLI ─────────────────────────────────────────────────────────────────────
 
 def _build_common_parent():
@@ -1387,7 +1780,10 @@ def build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    sub = p.add_subparsers(dest="cmd", required=True)
+    # Python 3.6 compat: `required=True` kwarg was added in 3.7; setting the
+    # attribute after creation is the supported workaround on both versions.
+    sub = p.add_subparsers(dest="cmd")
+    sub.required = True
 
     sub.add_parser("snapshot", parents=[common],
                    help="One-shot Redis (+MySQL) report")
@@ -1429,6 +1825,36 @@ def build_parser():
     sub.add_parser("log-line", parents=[common],
                    help="Single compact line — append-friendly cron output")
 
+    r = sub.add_parser(
+        "report", parents=[common],
+        help="Build a full monitoring payload (snapshot + breakdown + stampede "
+             "+ mysql + alerts) and optionally POST it to the PigCache API "
+             "(same auth flow as bin/pigcache-cron.php)",
+    )
+    r.add_argument("--push", action="store_true",
+                   help="Actually POST the payload to the API (otherwise dry-run)")
+    r.add_argument("--api-url",
+                   help="Override API base URL (default: PIGCACHE_CLOUD_API_URL "
+                        "from wp-config, or " + DEFAULT_API_URL + ")")
+    r.add_argument("--api-key",
+                   help="Override API key (default: PIGCACHE_API_KEY constant "
+                        "or pigcache_license_key option)")
+    r.add_argument("--site-id",
+                   help="Override site ID (default: pigcache_cloud_site_id option)")
+    r.add_argument("--endpoint", default="/sites/{site_id}/monitor-snapshot",
+                   help="Endpoint path appended to api-url. {site_id} placeholder "
+                        "is replaced. Default: /sites/{site_id}/monitor-snapshot")
+    r.add_argument("--save", metavar="PATH",
+                   help="Also write the payload JSON to this file")
+    r.add_argument("--quiet", action="store_true",
+                   help="Suppress stdout JSON (only useful with --push and/or --save)")
+    r.add_argument("--no-breakdown", action="store_true",
+                   help="Skip the SCAN-based group breakdown (faster, lighter payload)")
+    r.add_argument("--no-stampede", action="store_true",
+                   help="Skip stampede lock scan")
+    r.add_argument("--http-timeout", type=int, default=20,
+                   help="HTTP timeout in seconds for the API POST (default: 20)")
+
     return p
 
 
@@ -1436,9 +1862,18 @@ def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    # Auto-discover wp-config.php if not explicitly given. Same strategy as
+    # bin/pigcache-cron.php so both tools "just work" when dropped in
+    # wp-content/plugins/pigcache/cli/ and run from a cron line that omits
+    # --wp-config.
     cfg = {}
     if args.wp_config:
         cfg = parse_wp_config(args.wp_config)
+    else:
+        discovered = find_wp_config()
+        if discovered:
+            cfg = parse_wp_config(discovered)
+            args.wp_config = discovered
 
     if args.cmd == "snapshot":
         cmd_snapshot(args, cfg)
@@ -1456,6 +1891,8 @@ def main(argv=None):
         cmd_watch(args, cfg)
     elif args.cmd == "log-line":
         cmd_log_line(args, cfg)
+    elif args.cmd == "report":
+        cmd_report(args, cfg)
     else:
         parser.error(f"unknown command: {args.cmd}")
 
