@@ -1,1079 +1,1469 @@
-# PigCache — Manual completo
-
-Guía de uso, administración y desarrollo de PigCache: object cache Redis,
-HTML cache, SQL cache (con profiler) y fragmentos.
-
----
-
-## Índice
-
-1. [Instalación](#1-instalación)
-2. [HTML Cache — Caché de página completa](#2-html-cache)
-3. [SQL Cache — Caché de consultas](#3-sql-cache)
-4. [Fragment Cache — Caché de fragmentos](#4-fragment-cache)
-5. [Sistema de tags (invalidación selectiva)](#5-sistema-de-tags)
-6. [SQL Profiler — Per-table epochs](#6-sql-profiler)
-7. [PigCache Pro — Cloud SQL Profiles](#7-pigcache-pro)
-8. [Administración desde wp-admin](#8-administración-desde-wp-admin)
-9. [Constantes de configuración (wp-config.php)](#9-constantes-de-configuración)
-10. [Filtros para desarrolladores](#10-filtros-para-desarrolladores)
-11. [CLI y herramientas externas](#11-cli-y-herramientas-externas)
-12. [Troubleshooting](#12-troubleshooting)
-
----
-
-## 1. Instalación
-
-### Requisitos
-
-- WordPress 5.8+
-- PHP 7.4+
-- Redis servidor accesible (default: `127.0.0.1:6379`)
-
-### Pasos
-
-1. Copia la carpeta `pigcache/` a `wp-content/plugins/`.
-2. Activa el plugin en **Plugins**.
-3. Ve a **Ajustes -> PigCache** y pulsa **Enable object cache**.
-4. (Opcional) Instala el **db.php drop-in** para activar el SQL cache.
-5. (Opcional) Inicia el **SQL Profiler** para per-table epoch invalidation.
-
-### Clientes Redis soportados
-
-| Cliente | Cómo se usa |
-|---------|-------------|
-| **PhpRedis** | Automático si la extensión `redis` está cargada (recomendado). |
-| **Predis** | Incluido en `vendor/`. Se usa si PhpRedis no está disponible. |
-| **Relay** | Soportado vía constante `PIGCACHE_REDIS_CLIENT`. |
-
----
-
-## 2. HTML Cache
-
-### Qué hace
-
-Captura la salida HTML completa de cada página y la almacena en Redis.
-La siguiente visita del mismo URL se sirve directamente desde Redis sin
-ejecutar WordPress ni MySQL.
-
-### Quién se cachea
-
-- Visitantes **no logueados**
-- Peticiones **GET** sin datos POST
-- No admin, no AJAX, no cron, no REST, no preview
-- No páginas WooCommerce sensibles (cart, checkout, account)
-
-### Cómo funciona
-
-```
-Visitante -> GET /mi-post/
-
-  1. Redis: ¿existe "doc_{md5(/mi-post/)}" en pigcache_html?
-     -> SÍ (HIT): echo HTML, exit. Cero MySQL.
-     -> NO (MISS): WordPress renderiza la página normalmente.
-
-  2. Durante el render, el Tag Collector registra qué objetos
-     aparecen en la página:
-     - post:123, post_type:post, author:5
-     - term:10, taxonomy:category
-     - nav_menu:3, sidebar:sidebar-1
-     - zone:header, zone:footer
-
-  3. Al terminar el render:
-     a) Se guarda en Redis: { html, tags[], time }
-     b) Se guardan los tags en MySQL: wp_pigcache_tags
-     c) Se libera el stampede lock.
-```
-
-### Invalidación (tag-based)
-
-Cuando un editor guarda un post, PigCache:
-
-1. Resuelve los tags del post: `post:123`, `post_type:post`, `author:5`,
-   todos sus terms, `home`, `feed`, `date:2026-04`.
-2. Consulta MySQL: `SELECT cache_key FROM wp_pigcache_tags WHERE tag IN (...)`
-3. Borra solo esas keys en Redis.
-4. Limpia las filas de MySQL.
-
-Las 10,000 otras páginas cacheadas **no se tocan**.
-
-### Administrar el HTML cache
-
-| Acción | Cómo |
-|--------|------|
-| **Ver páginas cacheadas** | En admin: Dashboard de Cache > HTML Cache |
-| **Configurar TTL** | Ajustes -> PigCache > Cache TTL > Full-page HTML cache |
-| **Desactivar** | Filtro `pigcache_skip_html_cache` retornando `true` |
-| **Excluir una URL** | `add_filter('pigcache_skip_html_cache', fn() => is_page('contacto'));` |
-| **Ajustar TTL por URL** | Filtro `pigcache_html_ttl` |
-| **Purgar todo** | Flush object cache desde admin (borra todo Redis) |
-| **Tagear custom** | `pigcache_tag('widget:recent_posts')` en tu template |
-
----
-
-## 3. SQL Cache
-
-### Qué hace
-
-Intercepta consultas `SELECT` elegibles y guarda el resultado en Redis.
-La siguiente ejecución de la misma query se sirve desde Redis.
-
-### Dónde opera
-
-- Solo en el **frontend** (visitantes, no logueados por defecto).
-- **NO** se usa en: admin, AJAX, REST, cron, WP-CLI, XMLRPC.
-
-### Dos modos de invalidación
-
-#### Modo 1: Global epoch (default, sin profiler)
-
-Un solo contador epoch. Cualquier mutación (INSERT, UPDATE, DELETE)
-incrementa el epoch y **todas** las queries cacheadas se vuelven stale.
-
-```
-INSERT INTO wp_posts ...  ->  INCR pigcache_sql_epoch  ->  TODO stale
-```
-
-Simple y seguro. Es el modo por defecto si no has activado el profiler.
-
-#### Modo 2: Per-table epochs (con profiler compilado)
-
-Cada tabla tiene su propio epoch. Un INSERT en `wp_posts` solo invalida
-queries que tocan `wp_posts`. Queries que solo leen `wp_options` o
-`wp_terms` siguen cacheadas.
-
-```
-INSERT INTO wp_posts ...  ->  INCR epoch:wp_posts  ->  solo queries de wp_posts stale
-                              queries de wp_options siguen frescas
-```
-
-Requiere haber ejecutado el profiler (ver sección 6).
-
-### Administrar el SQL cache
-
-| Acción | Cómo |
-|--------|------|
-| **Activar** | Ajustes -> PigCache > Install db.php drop-in |
-| **Desactivar** | Ajustes -> PigCache > Remove PigCache db.php |
-| **Ver modo actual** | Admin > Dashboard de Cache > SQL Cache |
-| **Configurar TTL** | Ajustes -> PigCache > Cache TTL > SQL SELECT cache |
-| **Excluir queries** | Filtro `pigcache_sql_cache_is_cacheable` |
-| **Desactivar globalmente** | Filtro `pigcache_sql_cache_enabled` |
-
----
-
-## 4. Fragment Cache
-
-### Qué hace
-
-Cachea fragmentos de output (widgets, sidebars, componentes) vía
-object cache con tags opcionales para invalidación selectiva.
-
-### Uso básico
-
-```php
-// Sin tags (solo TTL):
-$html = pigcache_fragment( 'mi_widget', function() {
-    return '<div>Contenido del widget</div>';
-}, 300 );
-
-echo $html;
-```
-
-### Con tags (invalidación selectiva)
-
-```php
-$html = pigcache_fragment(
-    'sidebar_popular',
-    function() {
-        // renderizar los 5 posts más populares
-        $posts = get_posts(['numberposts' => 5, 'orderby' => 'comment_count']);
-        $out = '<ul>';
-        foreach ($posts as $p) {
-            pigcache_tag('post:' . $p->ID);  // taguear cada post mostrado
-            $out .= '<li>' . esc_html($p->post_title) . '</li>';
-        }
-        $out .= '</ul>';
-        return $out;
-    },
-    300,                    // TTL: 5 minutos
-    'pigcache_fragments',   // grupo
-    ['post_type:post', 'sidebar:primary']  // tags para invalidación
-);
-```
-
-Cuando se edita cualquier post de tipo `post`, este fragmento se purgará
-automáticamente porque tiene el tag `post_type:post`.
-
----
-
-## 5. Sistema de tags (invalidación selectiva)
-
-### Concepto
-
-Cada página/fragmento cacheado se asocia con "tags" que describen qué
-objetos muestra. Cuando un objeto cambia, solo se purgan las entries
-que lo referencian.
-
-### Tags automáticos
-
-| Hook WordPress | Tags generados | Ejemplo |
-|----------------|---------------|---------|
-| `the_post` | `post:{ID}`, `post_type:{type}`, `author:{ID}` | `post:123`, `post_type:post`, `author:5` |
-| `get_the_terms` | `term:{term_id}`, `taxonomy:{taxonomy}` | `term:10`, `taxonomy:category` |
-| `wp_get_nav_menu_items` | `nav_menu:{menu_id}` | `nav_menu:3` |
-| `dynamic_sidebar_before` | `sidebar:{sidebar_id}` | `sidebar:sidebar-1` |
-| `get_header` | `zone:header` | `zone:header` |
-| `get_footer` | `zone:footer` | `zone:footer` |
-
-### Tags implícitos
-
-| Condición | Tag |
-|-----------|-----|
-| Front page | `home` |
-| URL con `/feed` | `feed` |
-
-### Agregar tags manualmente
-
-```php
-// En cualquier template, widget o plugin:
-pigcache_tag( 'widget:recent_posts' );
-pigcache_tag( 'custom:mi_slider' );
-pigcache_tag( 'woo:product_list' );
-```
-
-Solo funciona durante un cache MISS (cuando el Tag Collector está activo).
-En cache HIT el collector no corre — cero overhead.
-
-### Purgar por tags desde tu plugin
-
-```php
-// Purgar todo lo que tenga el tag 'widget:recent_posts':
-if ( class_exists( 'PigCache_Tag_Index' ) ) {
-    PigCache_Tag_Index::purge_by_tags( ['widget:recent_posts'] );
+#!/usr/bin/env python3
+"""
+PigCache Monitor — Redis + MySQL health/efficiency probe for cPanel cron.
+
+Designed to answer the operational questions you actually have on a high-traffic
+WordPress install behind PigCache:
+
+  * Is Redis up, reachable, and within latency budget?
+  * Is the cache *actually* absorbing load (real hit ratio, not the in-request one)?
+  * Is Redis memory being used efficiently, or is it bloated with no-TTL keys?
+  * Are evictions happening (= maxmemory too low or bad keys)?
+  * Which PigCache group (html / sql / fragments / options / posts / …) is
+    consuming memory?
+  * Are stampede locks piling up (= regenerations queueing)?
+  * Why does MySQL throw "Error establishing a database connection" — connection
+    saturation, aborted clients, slow queries piling up?
+
+Output: plain-text dashboard (default), single-line log (for cron tailing),
+strict JSON (for ingestion / jq / Prometheus), or non-zero exit codes for
+alerting via cPanel email-on-failure.
+
+Quick start
+-----------
+
+    pip3 install --user redis PyMySQL    # or: mysql-connector-python
+
+    # One-shot dashboard, credentials auto-read from wp-config.php:
+    python3 pigcache-monitor.py snapshot --wp-config /home/USER/public_html/wp-config.php
+
+    # Cron-friendly compact line (every minute):
+    * * * * * /usr/bin/python3 /home/USER/.../cli/pigcache-monitor.py log-line \\
+        --wp-config /home/USER/public_html/wp-config.php \\
+        >> /home/USER/logs/pigcache-monitor.log 2>&1
+
+    # Pass/fail alert (cPanel emails any non-zero exit):
+    */5 * * * * /usr/bin/python3 /home/USER/.../cli/pigcache-monitor.py health \\
+        --wp-config /home/USER/public_html/wp-config.php
+
+    # Per-group memory breakdown (once per hour):
+    0 * * * * /usr/bin/python3 /home/USER/.../cli/pigcache-monitor.py breakdown \\
+        --wp-config /home/USER/public_html/wp-config.php --json \\
+        > /home/USER/logs/pigcache-breakdown.json
+
+Requirements
+------------
+  * Python 3.6+ (only hard requirement — script falls back to stdlib RESP
+    client if `redis` is not installed, which makes it work on locked-down
+    cPanel hosts where you cannot install Python packages).
+  * Recommended: redis-py (pip3 install --user redis) for richer behaviour.
+  * Optional: mysql-connector-python OR PyMySQL — only needed for the `mysql`
+    subcommand and the MySQL block of `snapshot` / `health`. Without one, pass
+    `--skip-mysql` and probe MySQL separately with `mysqladmin extended-status`.
+"""
+
+import argparse
+import json
+import os
+import re
+import socket
+import sys
+import time
+from collections import defaultdict
+from datetime import datetime
+
+# ─── Optional deps ───────────────────────────────────────────────────────────
+#
+# We try redis-py first (richer + faster), but if it isn't installed we fall
+# back to a minimal stdlib-only RESP client further down (_BareRedisClient).
+# That makes the script work on locked-down cPanel hosts where you cannot
+# install Python packages at all.
+
+try:
+    import redis as redis_lib
+except ImportError:
+    redis_lib = None
+
+DB_MODULE = None
+try:
+    import mysql.connector as _mysql_mod
+    DB_MODULE = "mysql-connector"
+except ImportError:
+    try:
+        import pymysql as _mysql_mod
+        DB_MODULE = "pymysql"
+    except ImportError:
+        _mysql_mod = None
+
+
+# ─── Stdlib-only Redis fallback (used when redis-py is not installed) ────────
+
+class _BareRedisError(Exception):
+    """Raised by _BareRedisClient when the server returns -ERR or the socket
+    misbehaves. Caught by the existing snapshot/scan loops the same way the
+    redis-py exceptions are."""
+
+
+class _BareRedisClient:
+    """Minimal Redis client implemented on top of stdlib `socket` + RESP2.
+
+    Implements only the subset that pigcache-monitor.py needs:
+        ping, info, config_get, dbsize, scan, ttl, memory_usage,
+        slowlog_get, pipeline(transaction=False).{ttl,memory_usage}.execute()
+
+    This is the zero-dependency fallback for cPanel hosts where you cannot
+    install redis-py. Performance is intentionally simple (no connection pool,
+    no SSL, no cluster) — perfect for a cron-driven monitor probe.
+    """
+
+    def __init__(self, host="127.0.0.1", port=6379, password=None, db=0,
+                 socket_timeout=3.0, socket_connect_timeout=3.0,
+                 decode_responses=True):
+        self.host = host
+        self.port = port
+        self.password = password
+        self.db = db
+        self.socket_timeout = socket_timeout
+        self.socket_connect_timeout = socket_connect_timeout
+        self.decode_responses = decode_responses
+        self._sock = None
+        self._buf = b""
+
+    def _connect(self):
+        if self._sock is not None:
+            return
+        s = socket.create_connection((self.host, self.port),
+                                     timeout=self.socket_connect_timeout)
+        s.settimeout(self.socket_timeout)
+        self._sock = s
+        self._buf = b""
+        if self.password:
+            self._call("AUTH", self.password)
+        if self.db:
+            self._call("SELECT", str(self.db))
+
+    def _close(self):
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
+            self._buf = b""
+
+    @staticmethod
+    def _encode_cmd(args):
+        parts = [b"*", str(len(args)).encode(), b"\r\n"]
+        for a in args:
+            if isinstance(a, str):
+                a = a.encode("utf-8")
+            elif isinstance(a, (int, float)):
+                a = str(a).encode()
+            elif not isinstance(a, (bytes, bytearray)):
+                a = str(a).encode("utf-8")
+            parts.extend([b"$", str(len(a)).encode(), b"\r\n", a, b"\r\n"])
+        return b"".join(parts)
+
+    def _read_line(self):
+        while b"\r\n" not in self._buf:
+            chunk = self._sock.recv(65536)
+            if not chunk:
+                raise _BareRedisError("connection closed by server")
+            self._buf += chunk
+        idx = self._buf.index(b"\r\n")
+        line = self._buf[:idx]
+        self._buf = self._buf[idx + 2:]
+        return line
+
+    def _read_n(self, n):
+        needed = n + 2
+        while len(self._buf) < needed:
+            chunk = self._sock.recv(max(65536, needed - len(self._buf)))
+            if not chunk:
+                raise _BareRedisError("connection closed by server")
+            self._buf += chunk
+        out = self._buf[:n]
+        self._buf = self._buf[needed:]
+        return out
+
+    def _read_reply(self):
+        line = self._read_line()
+        if not line:
+            raise _BareRedisError("empty reply")
+        prefix = chr(line[0])
+        rest = line[1:]
+
+        if prefix == "+":
+            return rest.decode("utf-8", "replace")
+        if prefix == "-":
+            raise _BareRedisError(rest.decode("utf-8", "replace"))
+        if prefix == ":":
+            return int(rest)
+        if prefix == "$":
+            n = int(rest)
+            if n == -1:
+                return None
+            data = self._read_n(n)
+            if self.decode_responses:
+                try:
+                    return data.decode("utf-8")
+                except UnicodeDecodeError:
+                    return data
+            return data
+        if prefix == "*":
+            n = int(rest)
+            if n == -1:
+                return None
+            return [self._read_reply() for _ in range(n)]
+        raise _BareRedisError(f"unknown RESP type byte: {prefix!r}")
+
+    def _call(self, *args):
+        self._connect()
+        try:
+            self._sock.sendall(self._encode_cmd(args))
+            return self._read_reply()
+        except (socket.timeout, OSError) as exc:
+            self._close()
+            raise _BareRedisError(str(exc))
+
+    # ── Public surface (matches the subset of redis-py we use) ─────────
+
+    def ping(self):
+        return self._call("PING") == "PONG"
+
+    def info(self, section=None):
+        args = ["INFO"]
+        if section:
+            args.append(section)
+        raw = self._call(*args) or ""
+        result = {}
+        for line in raw.splitlines():
+            if not line or line.startswith("#") or ":" not in line:
+                continue
+            k, v = line.split(":", 1)
+            try:
+                if "." in v:
+                    result[k] = float(v)
+                else:
+                    result[k] = int(v)
+            except (TypeError, ValueError):
+                result[k] = v
+        return result
+
+    def config_get(self, pattern):
+        flat = self._call("CONFIG", "GET", pattern)
+        if not isinstance(flat, list):
+            return {}
+        return {flat[i]: flat[i + 1] for i in range(0, len(flat) - 1, 2)}
+
+    def dbsize(self):
+        return int(self._call("DBSIZE"))
+
+    def scan(self, cursor=0, match=None, count=500):
+        args = ["SCAN", str(cursor)]
+        if match:
+            args.extend(["MATCH", match])
+        if count:
+            args.extend(["COUNT", str(count)])
+        result = self._call(*args)
+        if not isinstance(result, list) or len(result) < 2:
+            return (0, [])
+        return (int(result[0]), result[1] or [])
+
+    def ttl(self, key):
+        return int(self._call("TTL", key))
+
+    def memory_usage(self, key):
+        r = self._call("MEMORY", "USAGE", key)
+        return int(r) if r is not None else None
+
+    def slowlog_get(self, n=10):
+        result = self._call("SLOWLOG", "GET", str(n))
+        if not isinstance(result, list):
+            return []
+        out = []
+        for entry in result:
+            # entry: [id, start_time, duration_us, [cmd...], (client_ip?, client_name?)]
+            if not isinstance(entry, list) or len(entry) < 4:
+                continue
+            out.append({
+                "id": entry[0],
+                "start_time": entry[1],
+                "duration": entry[2],
+                "command": entry[3] if isinstance(entry[3], list) else [entry[3]],
+            })
+        return out
+
+    def pipeline(self, transaction=False):
+        return _BarePipeline(self)
+
+    def close(self):
+        self._close()
+
+
+class _BarePipeline:
+    """Buffers commands and flushes them in one sendall(), then reads N
+    replies. Matches the tiny redis-py pipeline subset we call."""
+
+    def __init__(self, client):
+        self._client = client
+        self._commands = []
+
+    def ttl(self, key):
+        self._commands.append(("TTL", key))
+        return self
+
+    def memory_usage(self, key):
+        self._commands.append(("MEMORY", "USAGE", key))
+        return self
+
+    def execute(self):
+        if not self._commands:
+            return []
+        self._client._connect()
+        encode = self._client._encode_cmd
+        payload = b"".join(encode(c) for c in self._commands)
+        try:
+            self._client._sock.sendall(payload)
+        except (socket.timeout, OSError) as exc:
+            self._client._close()
+            raise _BareRedisError(str(exc))
+
+        results = []
+        for _ in self._commands:
+            try:
+                results.append(self._client._read_reply())
+            except _BareRedisError:
+                results.append(None)
+        self._commands = []
+        return results
+
+
+# ─── wp-config.php parser (re-used pattern from pigcache-analyze.py) ─────────
+
+WP_CONFIG_CONSTANTS = (
+    "DB_NAME", "DB_USER", "DB_PASSWORD", "DB_HOST",
+    "PIGCACHE_REDIS_HOST", "PIGCACHE_REDIS_PORT",
+    "PIGCACHE_REDIS_PASSWORD", "PIGCACHE_REDIS_DATABASE",
+    "PIGCACHE_REDIS_PREFIX", "PIGCACHE_REDIS_TIMEOUT",
+    "WP_CACHE_KEY_SALT",
+)
+
+
+def parse_wp_config(path):
+    """Extract relevant defines from wp-config.php without executing PHP."""
+    out = {}
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+    except OSError as exc:
+        print(f"warn: could not read wp-config.php at {path}: {exc}",
+              file=sys.stderr)
+        return out
+
+    for const in WP_CONFIG_CONSTANTS:
+        m = re.search(
+            rf"define\s*\(\s*['\"]({const})['\"]\s*,\s*"
+            r"(?:'([^']*)'|\"([^\"]*)\"|(true|false|[0-9]+))\s*\)",
+            content,
+        )
+        if not m:
+            continue
+        val = m.group(2) or m.group(3) or m.group(4) or ""
+        if val == "true":
+            val = True
+        elif val == "false":
+            val = False
+        out[const] = val
+
+    m = re.search(r"\$table_prefix\s*=\s*['\"]([^'\"]+)['\"]", content)
+    if m:
+        out["table_prefix"] = m.group(1)
+
+    return out
+
+
+# ─── Redis connection ────────────────────────────────────────────────────────
+
+def connect_redis(args, cfg):
+    """Return a connected Redis client (redis-py if available, otherwise the
+    stdlib-only _BareRedisClient). Raises SystemExit(2) if neither can talk
+    to the Redis server."""
+    host = args.redis_host or cfg.get("PIGCACHE_REDIS_HOST") or "127.0.0.1"
+    port_raw = args.redis_port or cfg.get("PIGCACHE_REDIS_PORT") or 6379
+    try:
+        port = int(port_raw)
+    except (TypeError, ValueError):
+        port = 6379
+
+    # Allow host:port shorthand.
+    if isinstance(host, str) and ":" in host and args.redis_port is None:
+        host, p = host.rsplit(":", 1)
+        try:
+            port = int(p)
+        except ValueError:
+            pass
+
+    password = args.redis_password
+    if password is None:
+        password = cfg.get("PIGCACHE_REDIS_PASSWORD") or None
+
+    db = args.redis_db
+    if db is None:
+        db_raw = cfg.get("PIGCACHE_REDIS_DATABASE")
+        if db_raw not in (None, "", False):
+            try:
+                db = int(db_raw)
+            except (TypeError, ValueError):
+                db = 0
+        else:
+            db = 0
+
+    timeout = float(args.timeout)
+
+    if redis_lib is not None:
+        client = redis_lib.Redis(
+            host=host,
+            port=port,
+            password=password,
+            db=db,
+            socket_timeout=timeout,
+            socket_connect_timeout=timeout,
+            decode_responses=True,
+        )
+        driver = "redis-py"
+    else:
+        client = _BareRedisClient(
+            host=host,
+            port=port,
+            password=password,
+            db=db,
+            socket_timeout=timeout,
+            socket_connect_timeout=timeout,
+            decode_responses=True,
+        )
+        driver = "stdlib-bare"
+        if not getattr(args, "json", False):
+            print("info: redis-py not installed, using stdlib RESP fallback "
+                  "(pip3 install --user redis for richer behaviour)",
+                  file=sys.stderr)
+
+    try:
+        client.ping()
+    except Exception as exc:
+        print(f"error: cannot reach Redis at {host}:{port} (db {db}) "
+              f"via {driver}: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+    return client, {"host": host, "port": port, "db": db, "driver": driver}
+
+
+# ─── MySQL connection ────────────────────────────────────────────────────────
+
+def connect_mysql(args, cfg):
+    """Return a MySQL connection, or None on failure (with stderr message)."""
+    if _mysql_mod is None:
+        return None, "no MySQL driver (pip3 install --user PyMySQL)"
+
+    host = args.mysql_host or cfg.get("DB_HOST") or "127.0.0.1"
+    port = 3306
+    if isinstance(host, str) and ":" in host and args.mysql_host is None:
+        host, p = host.rsplit(":", 1)
+        try:
+            port = int(p)
+        except ValueError:
+            pass
+
+    user = args.mysql_user or cfg.get("DB_USER") or "root"
+    password = args.mysql_password
+    if password is None:
+        password = cfg.get("DB_PASSWORD", "")
+    database = args.mysql_db or cfg.get("DB_NAME") or ""
+
+    try:
+        if DB_MODULE == "pymysql":
+            conn = _mysql_mod.connect(
+                host=host, port=port, user=user, password=password,
+                database=database, charset="utf8mb4",
+                connect_timeout=int(args.timeout),
+                read_timeout=int(args.timeout),
+            )
+        else:
+            conn = _mysql_mod.connect(
+                host=host, port=port, user=user, password=password,
+                database=database, charset="utf8mb4",
+                connection_timeout=int(args.timeout),
+            )
+    except Exception as exc:
+        return None, f"connect failed: {exc}"
+
+    return conn, None
+
+
+# ─── Redis circuit-breaker flag (matches dropin) ─────────────────────────────
+
+def circuit_breaker_state(host, port):
+    """Mirror class PigCache_Dropin_Object_Cache::pigcache_circuit_path."""
+    import hashlib
+    import tempfile
+    flag = os.path.join(
+        tempfile.gettempdir(),
+        "pigcache_cb_" + hashlib.md5(f"{host}:{port}".encode()).hexdigest() + ".flag",
+    )
+    if not os.path.exists(flag):
+        return {"open": False, "path": flag, "age_seconds": None}
+    try:
+        with open(flag, "r") as f:
+            ts = int(f.read().strip() or "0")
+    except OSError:
+        return {"open": True, "path": flag, "age_seconds": None}
+    return {"open": True, "path": flag, "age_seconds": int(time.time()) - ts}
+
+
+# ─── Redis snapshot / metrics gathering ──────────────────────────────────────
+
+def redis_snapshot(client, endpoint):
+    """Take a comprehensive one-shot picture of the Redis server."""
+    t0 = time.time()
+    info = client.info()
+    info_latency_ms = (time.time() - t0) * 1000
+
+    try:
+        config = client.config_get("maxmemory*")
+    except Exception:
+        config = {}
+
+    try:
+        dbsize = int(client.dbsize())
+    except Exception:
+        dbsize = None
+
+    # PING latency (separate sample so it's not skewed by INFO size).
+    pings = []
+    for _ in range(5):
+        t = time.time()
+        try:
+            client.ping()
+            pings.append((time.time() - t) * 1000)
+        except Exception:
+            pings.append(float("inf"))
+    pings.sort()
+    ping_p50 = pings[len(pings) // 2]
+    ping_max = pings[-1]
+
+    hits = int(info.get("keyspace_hits", 0))
+    misses = int(info.get("keyspace_misses", 0))
+    total_ops = hits + misses
+    hit_ratio = (hits / total_ops * 100.0) if total_ops else None
+
+    used_memory = int(info.get("used_memory", 0))
+    maxmemory_raw = config.get("maxmemory", "0")
+    try:
+        maxmemory = int(maxmemory_raw)
+    except (TypeError, ValueError):
+        maxmemory = 0
+    mem_fill_pct = (used_memory / maxmemory * 100.0) if maxmemory > 0 else None
+
+    # Slowlog top 5.
+    slow_top = []
+    try:
+        for entry in client.slowlog_get(5):
+            slow_top.append({
+                "id": entry.get("id"),
+                "start_time": entry.get("start_time"),
+                "duration_us": entry.get("duration"),
+                "command": " ".join(
+                    str(a) for a in (entry.get("command") or [])
+                )[:200],
+            })
+    except Exception:
+        pass
+
+    snapshot = {
+        "endpoint": endpoint,
+        "captured_at": datetime.utcnow().isoformat() + "Z",
+        "info_latency_ms": round(info_latency_ms, 2),
+        "ping_p50_ms": round(ping_p50, 3),
+        "ping_max_ms": round(ping_max, 3),
+        "redis_version": info.get("redis_version"),
+        "uptime_seconds": int(info.get("uptime_in_seconds", 0)),
+        "connected_clients": int(info.get("connected_clients", 0)),
+        "blocked_clients": int(info.get("blocked_clients", 0)),
+        "maxclients": int(info.get("maxclients", 0)),
+        "instantaneous_ops_per_sec": int(info.get("instantaneous_ops_per_sec", 0)),
+        "total_commands_processed": int(info.get("total_commands_processed", 0)),
+        "total_connections_received": int(info.get("total_connections_received", 0)),
+        "rejected_connections": int(info.get("rejected_connections", 0)),
+        "keyspace_hits": hits,
+        "keyspace_misses": misses,
+        "hit_ratio_pct": round(hit_ratio, 2) if hit_ratio is not None else None,
+        "evicted_keys": int(info.get("evicted_keys", 0)),
+        "expired_keys": int(info.get("expired_keys", 0)),
+        "used_memory_bytes": used_memory,
+        "used_memory_human": info.get("used_memory_human"),
+        "used_memory_peak_bytes": int(info.get("used_memory_peak", 0)),
+        "used_memory_peak_human": info.get("used_memory_peak_human"),
+        "used_memory_rss_bytes": int(info.get("used_memory_rss", 0)),
+        "mem_fragmentation_ratio": float(info.get("mem_fragmentation_ratio", 0) or 0),
+        "maxmemory_bytes": maxmemory,
+        "maxmemory_policy": config.get("maxmemory-policy", "?"),
+        "maxmemory_fill_pct": round(mem_fill_pct, 2) if mem_fill_pct is not None else None,
+        "dbsize": dbsize,
+        "slowlog_top5": slow_top,
+    }
+    return snapshot
+
+
+# ─── SCAN-based group breakdown ──────────────────────────────────────────────
+
+# Recognised group names whose keys we want to bucket nicely. Anything not in
+# this list is grouped under the literal group token found in the key.
+KNOWN_GROUPS = {
+    # PigCache native
+    "pigcache_html", "pigcache_sql", "pigcache_fragments", "pigcache",
+    # WordPress core / very common plugins (the ones that dominate volume).
+    "options", "site-options", "transient", "site-transient",
+    "posts", "post_meta", "post-queries",
+    "terms", "term_meta", "term-queries", "term_relationships",
+    "category_relationships", "post_tag_relationships",
+    "users", "user_meta",
+    "comments", "comment_meta", "comment-queries",
+    "themes", "plugins", "translation_files",
 }
-```
 
-### Personalizar tags de invalidación por post
 
-```php
-// Agregar tags extras cuando se invalida un post:
-add_filter( 'pigcache_invalidation_tags', function( $tags, $post_id ) {
-    $tags[] = 'custom:mi_componente';
-    return $tags;
-}, 10, 2 );
-```
-
-### Debuggear tags (MySQL)
-
-```sql
--- Ver qué páginas referencian un post:
-SELECT cache_key, tag FROM wp_pigcache_tags WHERE tag = 'post:123';
-
--- Ver todos los tags de una página:
-SELECT tag FROM wp_pigcache_tags
-WHERE cache_key = 'doc_abc123' AND grp = 'pigcache_html';
-
--- Páginas con más tags:
-SELECT cache_key, COUNT(*) AS total
-FROM wp_pigcache_tags GROUP BY cache_key ORDER BY total DESC LIMIT 20;
-```
-
----
-
-## 6. SQL Profiler (Premium)
-
-> **Requiere PigCache Pro** o periodo de prueba activo.
-> Al activar el plugin por primera vez, se inicia un **trial de 14 días**
-> para que puedas evaluar el profiler en tu sitio. Una vez expirado el
-> trial, necesitas una licencia Pro para iniciar learning, compilar
-> profiles o re-aprender. Los profiles ya compilados siguen funcionando
-> en runtime (read-only) tras expirar el trial.
-
-### Concepto
-
-El profiler aprende qué queries ejecuta tu sitio durante un periodo
-de observación, extrae qué tablas toca cada query, y compila un archivo
-PHP estático. En runtime, ese archivo se carga una vez y permite
-invalidar solo las queries que tocan la tabla que cambió.
-
-### Workflow completo
-
-#### Paso 1: Iniciar learning
-
-Desde **Ajustes -> PigCache > SQL Query Profiler**:
-- Selecciona la duración (1-30 días, recomendado 7).
-- Pulsa **Start Learning**.
-
-O desde `wp-config.php`:
-```php
-define( 'PIGCACHE_SQL_PROFILE_LEARN', true );
-```
-
-#### Paso 2: Esperar
-
-Durante el periodo de learning, cada SELECT interceptado se:
-- Normaliza (valores literales -> `?`)
-- Fingerprint (`md5` del template normalizado)
-- Extrae tablas (`FROM`, `JOIN`)
-- Guarda en `wp_pigcache_sql_fingerprints`
-
-Puedes ver el progreso en la sección del admin:
-- Templates únicos encontrados
-- Total de queries grabadas
-- Días restantes
-
-#### Paso 3: Compilar
-
-Cuando el periodo termina (o antes si quieres):
-- Pulsa **Compile Now** en el admin.
-- Se genera `wp-content/pigcache-sql-profile.php`.
-- El per-table epoch mode se activa automáticamente.
-
-#### Paso 4: Runtime
-
-```
-SELECT ... FROM wp_posts JOIN wp_postmeta ...
-  -> normalize -> fingerprint -> lookup en profile estático
-  -> tables = [wp_posts, wp_postmeta]
-  -> check epoch:wp_posts = 5, epoch:wp_postmeta = 3
-  -> pack has {wp_posts:5, wp_postmeta:3} -> FRESH HIT
-
-INSERT INTO wp_posts ...
-  -> extract table = "wp_posts"
-  -> INCR epoch:wp_posts only
-  -> queries de wp_options, wp_terms siguen cacheadas
-```
-
-#### Re-learn automático
-
-Cuando se activa/desactiva un plugin, se cambia el tema, o se actualiza
-WordPress, el profiler automáticamente:
-
-1. Hace backup del profile actual (`.bak`).
-2. Inicia un nuevo periodo de learning.
-3. Usa el backup como fallback durante el re-learning.
-
-Desactivar con: `define('PIGCACHE_SQL_PROFILE_AUTO_RELEARN', false);`
-
-#### Análisis profundo (CLI, opcional)
-
-```bash
-pip3 install mysql-connector-python
-
-# Analizar con credenciales de wp-config:
-python3 cli/pigcache-analyze.py --wp-config /path/to/wp-config.php
-
-# Guardar report en JSON:
-python3 cli/pigcache-analyze.py --wp-config /path/to/wp-config.php -o report.json
-```
-
-El analyzer produce:
-- Ranking de queries por frecuencia
-- Mapa de dependencias entre tablas
-- Estimación de eficiencia: "X% de queries sobrevivirían un save_post"
-- Recomendaciones específicas
-
----
-
-## 7. PigCache Pro — Cloud SQL Profiles
-
-### Free vs Pro
-
-| Característica | Free | Trial (14 días) | Pro |
-|---------------|------|-----------------|-----|
-| Object cache Redis | Si | Si | Si |
-| HTML cache con tags | Si | Si | Si |
-| SQL cache con global epoch | Si | Si | Si |
-| Fragment cache | Si | Si | Si |
-| SQL Profiler (local learning) | No | **Si** | **Si** |
-| Per-table epoch invalidation | No | **Si** | **Si** |
-| **Cloud SQL profiles** | No | No | **Si** |
-| **Instant per-table epochs** (sin esperar learning) | No | No | **Si** |
-| **Cross-site intelligence** (WooCommerce, Jetpack, etc.) | No | No | **Si** |
-| **Environment-aware profiles** | No | No | **Si** |
-
-### Cómo funciona
-
-1. **Activar licencia**: Ingresa tu API key en Ajustes -> PigCache > PigCache Pro.
-2. **Detección de entorno**: El plugin envía la lista de plugins activos, tema y
-   versión de WP al backend (solo slugs, nunca datos del sitio).
-3. **Profile instantáneo**: Si otro sitio con el mismo stack ya contribuyó datos,
-   recibes un profile compilado de inmediato. No necesitas esperar 7 días de learning.
-4. **Sync continuo**: Si no hay profile aún, el learning local corre normalmente
-   y los fingerprints se sincronizan al cloud cada 12 horas.
-5. **Inteligencia agregada**: El backend combina fingerprints de muchos sitios con
-   el mismo entorno, produciendo profiles más completos y confiables.
-
-### Qué datos se envían
-
-El plugin envía **templates SQL normalizados** (sin valores reales):
-
-```
-Original:  SELECT * FROM wp_posts WHERE post_author = 5 AND post_status = 'publish'
-Se envía:  SELECT * FROM wp_posts WHERE post_author = ? AND post_status = ?
-```
-
-Además:
-- Nombres de tablas extraídos de la query
-- Conteo de hits y promedio de filas
-- Slugs de plugins activos (e.g. "woocommerce")
-- Slug del tema
-- Versión mayor de WP
-
-**Nunca se envían**: datos reales, contenido del sitio, usuarios, passwords,
-ni credenciales de conexión.
-
-### Activar desde wp-config.php
-
-```php
-define( 'PIGCACHE_LICENSE_KEY', 'a1b2c3d4e5f678901234567890abcdef0123456789abcdef0123456789abcd' );
-define( 'PIGCACHE_CLOUD_API_URL', 'https://api.pigcache.com/v1' );  // default
-define( 'PIGCACHE_CLOUD_SYNC', true );  // default cuando es Pro
-```
-
-### Administrar Pro desde wp-admin
-
-| Acción | Dónde |
-|--------|-------|
-| **Activar licencia** | Ajustes -> PigCache > PigCache Pro |
-| **Ver plan y status** | Misma sección — muestra plan, Site ID, last sync |
-| **Sync manual** | Botón "Sync Now" — sube fingerprints y descarga profile |
-| **Desactivar** | Botón "Deactivate License" — libera el seat |
-| **Ver source del profile** | Cloud vs Local en la tabla de status |
-
-### Fallback
-
-Si el cloud no está disponible (sin internet, API caída, etc.), el plugin:
-1. Usa el profile local si existe.
-2. Si no hay profile, usa global epoch (mode por defecto).
-3. Nunca crashea ni bloquea el sitio.
-
----
-
-## 8. Administración desde wp-admin
-
-### Ajustes -> PigCache
-
-| Sección | Qué muestra/controla |
-|---------|---------------------|
-| **Cache Dashboard** | Vista en tiempo real: HTML pages cacheadas, SQL mode, tag index stats, epochs |
-| **Redis object cache** | Estado del drop-in, botones Enable/Disable/Flush/Update |
-| **Cache TTL** | Configurar TTL para SQL y HTML cache |
-| **Object cache groups** | Ver/agregar grupos no-persistentes |
-| **SQL result cache** | Estado de db.php, Install/Remove |
-| **SQL Query Profiler** | Learning status, Start/Compile/Re-learn/Delete |
-| **PigCache Pro** | Licencia, Cloud sync status, Sync Now, Deactivate |
-| **Remove drop-ins** | Eliminar object-cache.php y/o db.php |
-
-### Ajustes -> PigCache metrics
-
-| Sección | Qué muestra |
-|---------|-------------|
-| **Object cache (this request)** | Hits, misses, ratio, bytes, Redis calls |
-| **Redis server (INFO)** | Memoria, conexiones, keyspace hits/misses, versión |
-| **Cached keys** | Lista paginada de keys con TTL, tipo, y label inferido |
-
-### Cache Dashboard (nuevo)
-
-El dashboard muestra de un vistazo:
-
-- **HTML Cache**: páginas en el tag index, páginas cacheadas, invalidación mode
-- **SQL Cache**: mode (global epoch / per-table epoch), epoch actual, profile status
-- **Fragments**: entries en el tag index
-- **Tag Index**: total de rows en `wp_pigcache_tags`, tags únicos
-
----
-
-## 9. Constantes de configuración
-
-### Redis
-
-| Constante | Default | Descripción |
-|-----------|---------|-------------|
-| `PIGCACHE_REDIS_HOST` | `127.0.0.1` | Host Redis |
-| `PIGCACHE_REDIS_PORT` | `6379` | Puerto |
-| `PIGCACHE_REDIS_DATABASE` | `0` | DB lógica (ver nota abajo) |
-| `PIGCACHE_REDIS_PASSWORD` | _(vacío)_ | Password |
-| `PIGCACHE_REDIS_PREFIX` | _(auto: `md5(DB_NAME\|table_prefix)`)_ | Prefijo para keys Redis. Se auto-genera si no se define. |
-| `PIGCACHE_REDIS_SELECTIVE_FLUSH` | _(auto: `true` si hay prefix)_ | Solo borrar keys con el prefijo del sitio al hacer flush. Se activa automáticamente cuando hay un prefix. |
-| `PIGCACHE_REDIS_CLIENT` | _(auto)_ | Forzar: `phpredis`, `predis`, `relay` |
-| `PIGCACHE_REDIS_TIMEOUT` | `1` | Timeout de conexión TCP en segundos. Aumentar en redes con latencia alta. |
-| `PIGCACHE_REDIS_READ_TIMEOUT` | `1` | Timeout de lectura de socket en segundos. Si Redis tarda más de este tiempo en responder (p. ej. durante un `BGSAVE` en servidores con mucha RAM), phpredis lanza "read error on connection". **Recomendado: `3` en sitios de alto tráfico.** |
-
-> **Auto-prefix:** Si no defines `PIGCACHE_REDIS_PREFIX`, `WP_CACHE_KEY_SALT`,
-> ni estás en Cloudways, PigCache genera un hash de 8 caracteres a partir
-> de `DB_NAME` y `$table_prefix`. Esto garantiza que dos sitios con bases
-> de datos diferentes nunca colisionen en Redis, incluso si comparten la
-> misma instancia y la misma DB lógica.
-
-> **Nota sobre `PIGCACHE_REDIS_DATABASE`:** Muchos hostings compartidos usan
-> proxies Redis (Twemproxy, Redis Cluster, servicios single-DB) que
-> **ignoran el comando `SELECT`** silenciosamente. No confíes solo en
-> esta constante para aislar sitios. El auto-prefix es la forma segura.
-
-### Hosting compartido — varios sitios, un solo Redis
-
-En hosting compartido donde varias instalaciones WordPress comparten el
-mismo servidor Redis (`public_html/sitio1/`, `public_html/sitio2/`, etc.):
-
-**Sin configurar nada** (recomendado si las bases de datos son distintas):
-
-PigCache genera automáticamente un prefijo único por sitio. Cada sitio
-tendrá sus propias claves Redis sin colisión. Al hacer flush en un sitio,
-solo se borran las claves de ese sitio.
-
-**Con configuración manual** (si quieres prefijos legibles):
-
-```php
-// wp-config.php — Sitio 1 (tienda.ejemplo.com)
-define( 'PIGCACHE_REDIS_HOST', '127.0.0.1' );
-define( 'PIGCACHE_REDIS_PREFIX', 'tienda:' );
-
-// wp-config.php — Sitio 2 (blog.ejemplo.com)
-define( 'PIGCACHE_REDIS_HOST', '127.0.0.1' );
-define( 'PIGCACHE_REDIS_PREFIX', 'blog:' );
-```
-
-**Con DB lógicas separadas** (se puede combinar con prefix):
-
-```php
-// wp-config.php — Sitio 1 (usa DB 0 por defecto)
-
-// wp-config.php — Sitio 2
-define( 'PIGCACHE_REDIS_DATABASE', 7 );
-```
-
-**Qué pasa con el flush:**
-
-| Escenario | Qué borra el flush |
-|-----------|-------------------|
-| Con prefix (auto o manual) | Solo keys del sitio actual (selective flush) |
-| Sin prefix + sin selective flush | `FLUSHDB` — borra **todas** las keys del DB lógica actual |
-
-Por eso PigCache activa `PIGCACHE_REDIS_SELECTIVE_FLUSH` automáticamente
-cuando hay un prefix activo.
-
-### Resiliencia — fallback y circuit breaker
-
-Si Redis no está disponible (reinicio, fallo de red, timeout de lectura), PigCache
-puede degradarse silenciosamente en lugar de mostrar una pantalla de error a los
-visitantes. El sitio sigue funcionando con MySQL; simplemente no hay caché esa request.
-
-| Constante | Default | Descripción |
-|-----------|---------|-------------|
-| `PIGCACHE_REDIS_GRACEFUL` | `true` | **`true`** (default): si Redis falla, PigCache cae en fallback silencioso — el object cache usa solo la memoria PHP de la request, el SQL cache hace miss, el HTML cache se salta. Los visitantes no ven ningún error. **`false`**: muestra la pantalla de error "Error establishing a Redis connection" y detiene la carga de WordPress hasta que Redis vuelva. Solo útil para depuración. |
-| `PIGCACHE_REDIS_RETRY_INTERVAL` | `30` | Segundos que el circuit breaker mantiene Redis "desconectado" tras un fallo. Durante este intervalo **ninguna** request intenta conectarse a Redis (evita acumular N × `PIGCACHE_REDIS_READ_TIMEOUT` de latencia extra durante una caída). Transcurrido el intervalo, una sola request "sonda" la conexión; si tiene éxito el circuit se cierra automáticamente. |
-
-#### Cómo funciona el circuit breaker
-
-```
-Request 1 → intenta conectar Redis → fallo (read error, 1 s de timeout)
-            → handle_exception() → redis_connected = false
-            → escribe /tmp/pigcache_cb_{hash}.flag con timestamp
-            → fallback: PHP array cache para esta request
-
-Request 2–N (siguientes 30 s) → detecta flag, lo lee, ve que tiene < 30 s
-            → salta el intento de conexión completamente (0 ms de overhead)
-            → fallback: PHP array cache
-
-Request (tras 30 s) → detecta flag, ve que tiene ≥ 30 s → borra flag
-            → intenta conexión → si Redis volvió: éxito → circuit cerrado
-            →                    si Redis sigue caído: flag se crea de nuevo
-```
-
-#### Configuración recomendada para sitios de alto tráfico
-
-```php
-// wp-config.php
-
-// Dar a Redis 3 s para responder — previene "read error" durante BGSAVE
-// en instancias con mucha RAM (854 MB+, 1 GB+).
-define( 'PIGCACHE_REDIS_READ_TIMEOUT', 3 );
-
-// Fallback silencioso activado por defecto (no necesitas esta línea
-// a menos que quieras DESACTIVARLO para depuración):
-// define( 'PIGCACHE_REDIS_GRACEFUL', false );
-
-// Extender la ventana del circuit breaker a 60 s en entornos donde
-// los reinicios de Redis tardan más de 30 s:
-// define( 'PIGCACHE_REDIS_RETRY_INTERVAL', 60 );
-```
-
-#### Por qué aparece "read error on connection"
-
-El error `read error on connection to 127.0.0.1:6379` **no significa que Redis
-esté caído** — significa que la conexión TCP se estableció pero la respuesta tardó
-más de `PIGCACHE_REDIS_READ_TIMEOUT` (default `1 s`). Causas frecuentes:
-
-- **`BGSAVE` / `BGREWRITEAOF`**: Redis hace un `fork()` para guardar en disco.
-  Con 500 MB+ en memoria, el fork tarda decenas o cientos de ms y puede incrementar
-  la latencia de otras operaciones durante ese lapso.
-- **`read_timeout` demasiado corto**: el default de 1 s es apropiado para Redis
-  en la misma máquina bajo carga normal, pero puede ser insuficiente bajo picos.
-- **Conexiones TCP stale**: con conexiones persistentes y reinicios de Redis,
-  el socket puede quedar "muerto" del lado del OS.
-
-Diagnosticar con:
-
-```bash
-# Ver latencia en tiempo real (1 muestra por segundo):
-redis-cli --latency-history -i 1
-
-# Ver los últimos comandos lentos (> 10 ms por defecto):
-redis-cli SLOWLOG GET 25
-
-# Ver configuración actual de saves:
-redis-cli CONFIG GET save
-
-# Deshabilitar BGSAVE periódico si no necesitas RDB snapshots
-# (solo si usas AOF o no necesitas persistencia):
-redis-cli CONFIG SET save ""
-```
-
-### Invalidación
-
-| Constante | Default | Descripción |
-|-----------|---------|-------------|
-| `PIGCACHE_INVALIDATE_THROTTLE` | `2` | Segundos mínimos entre invalidaciones |
-| `PIGCACHE_INVALIDATE_ON_OPTION` | `false` | Invalidar en cambios de opciones |
-| `PIGCACHE_INVALIDATE_ON_TERM` | `false` | Invalidar en cambios de términos |
-| `PIGCACHE_INVALIDATE_ON_COMMENT` | `false` | Invalidar en cambios de comentarios |
-| `PIGCACHE_INVALIDATE_ON_NAV_MENU` | `false` | Invalidar en cambios de menús |
-| `PIGCACHE_INVALIDATE_ON_WIDGET` | `false` | Invalidar en cambios de widgets |
-| `PIGCACHE_INVALIDATE_ON_THEME` | `false` | Invalidar en cambio de tema |
-| `PIGCACHE_INVALIDATE_ON_USER` | `false` | Invalidar en cambios de usuarios |
-
-### SQL Profiler (Premium — Trial 14 días / Pro)
-
-| Constante | Default | Descripción |
-|-----------|---------|-------------|
-| `PIGCACHE_SQL_PROFILE_LEARN` | `false` | Forzar learning mode (requiere Pro/trial) |
-| `PIGCACHE_SQL_PROFILE_PATH` | `wp-content/pigcache-sql-profile.php` | Ruta del profile compilado |
-| `PIGCACHE_SQL_PROFILE_AUTO_RELEARN` | `true` | Re-learn en cambio de plugin/tema (requiere Pro/trial) |
-
-### PigCache Pro (Cloud)
-
-| Constante | Default | Descripción |
-|-----------|---------|-------------|
-| `PIGCACHE_LICENSE_KEY` | _(vacío)_ | API key (alternativa al admin UI) |
-| `PIGCACHE_CLOUD_API_URL` | `https://api.pigcache.com/v1` | URL del backend |
-| `PIGCACHE_CLOUD_SYNC` | `true` (cuando es pro) | Habilitar/deshabilitar sync |
-
-### Continuous Learning (Pro)
-
-| Constante | Default | Descripción |
-|-----------|---------|-------------|
-| `PIGCACHE_CONTINUOUS_LEARNING` | _(desde API)_ | `true`/`false` para forzar on/off independientemente de la config remota |
-| `PIGCACHE_LEARNING_SAMPLE_RATE` | `0.10` | Fracción de requests que registran queries (0.0–1.0) |
-| `PIGCACHE_ADAPTIVE_TTL` | _(desde API)_ | `true` activa TTL adaptivo por tiempo de ejecución |
-| `PIGCACHE_FLUSH_INTERVAL` | `15` | Intervalo del cron en minutos (1–60). Cambia la frecuencia con que el cron standalone y WP-Cron vacían el buffer. Ver [intervalo del cron](#intervalo-del-cron). |
-| `PIGCACHE_USE_WP_CRON` | _(no definido)_ | Usar WP-Cron como fallback en lugar del cron standalone. No recomendado en producción. |
-
-### Ejemplo wp-config.php — Sitio único
-
-```php
-// Redis (PigCache genera auto-prefix, no necesitas PIGCACHE_REDIS_PREFIX)
-define( 'PIGCACHE_REDIS_HOST', '127.0.0.1' );
-
-// Invalidación
-define( 'PIGCACHE_INVALIDATE_THROTTLE', 3 );
-define( 'PIGCACHE_INVALIDATE_ON_COMMENT', true );
-define( 'PIGCACHE_INVALIDATE_ON_TERM', true );
-
-// SQL Profiler
-define( 'PIGCACHE_SQL_PROFILE_AUTO_RELEARN', true );
-
-// PigCache Pro
-define( 'PIGCACHE_LICENSE_KEY', 'a1b2c3d4e5f678901234567890abcdef0123456789abcdef0123456789abcd' );
-```
-
-### Ejemplo wp-config.php — Hosting compartido (varios sitios)
-
-```php
-// Sitio A (public_html/tienda/) — wp-config.php
-define( 'PIGCACHE_REDIS_HOST', '127.0.0.1' );
-// Sin PIGCACHE_REDIS_PREFIX ni PIGCACHE_REDIS_DATABASE: PigCache aísla
-// automáticamente usando DB_NAME como semilla del prefix.
-
-// Sitio B (public_html/blog/) — wp-config.php
-define( 'PIGCACHE_REDIS_HOST', '127.0.0.1' );
-// Mismo Redis, distinta DB MySQL = auto-prefix distinto = aislado.
-
-// Alternativa: prefixes explícitos para mayor claridad en redis-cli
-define( 'PIGCACHE_REDIS_PREFIX', 'blog:' );
-```
-
----
-
-## 10. Filtros para desarrolladores
-
-| Filtro | Parámetros | Uso |
-|--------|-----------|-----|
-| `pigcache_html_ttl` | `$ttl, $uri` | Ajustar TTL de HTML por URI |
-| `pigcache_skip_html_cache` | `$skip` | Saltar HTML cache para esta request |
-| `pigcache_sql_cache_ttl` | `$ttl` | Ajustar TTL de SQL cache |
-| `pigcache_sql_cache_enabled` | `$enabled` | Desactivar SQL cache globalmente |
-| `pigcache_sql_cache_skip_context` | `$skip` | Forzar skip del SQL cache en un contexto |
-| `pigcache_sql_cache_is_cacheable` | `$cacheable, $sql` | Marcar un SELECT como no cacheable |
-| `pigcache_invalidation_tags` | `$tags, $post_id` | Agregar/modificar tags en invalidación |
-
-### Ejemplos
-
-```php
-// No cachear HTML en páginas de búsqueda:
-add_filter( 'pigcache_skip_html_cache', function() {
-    return is_search();
-});
-
-// TTL de 5 minutos para el feed, 1 hora para todo lo demás:
-add_filter( 'pigcache_html_ttl', function( $ttl, $uri ) {
-    if ( strpos( $uri, '/feed' ) !== false ) {
-        return 300;
+def _classify_key(key):
+    """Return the cache group of a PigCache key like
+    'PREFIX:blogprefix:GROUP:userkey' or 'PREFIX:GROUP:userkey'.
+    Falls back to '__other__' when the shape doesn't match.
+    """
+    parts = key.split(":", 4)
+    # Try each part from the right side; the group is the segment that matches
+    # KNOWN_GROUPS or starts with 'pigcache'.
+    for p in parts:
+        if p in KNOWN_GROUPS:
+            return p
+        if p.startswith("pigcache"):
+            return p
+    if len(parts) >= 2:
+        return parts[-2] or "__other__"
+    return "__other__"
+
+
+def scan_breakdown(client, pattern, cap, sample_per_group, count):
+    """Walk the keyspace via SCAN and bucket keys per group.
+
+    For each group: counts the keys, samples up to `sample_per_group` for
+    MEMORY USAGE + TTL stats, and computes averages.
+    """
+    groups = defaultdict(lambda: {
+        "key_count": 0,
+        "no_ttl_count": 0,
+        "ttls": [],
+        "sampled_bytes": [],
+        "sample_keys": [],
+        "sample_size": 0,
+    })
+
+    scanned = 0
+    cursor = 0
+    pipe_chunk = 200
+
+    while True:
+        cursor, batch = client.scan(cursor=cursor, match=pattern, count=count)
+        if batch:
+            # Pre-classify and pipeline TTL for the whole batch.
+            classified = [(_classify_key(k), k) for k in batch]
+            pipe = client.pipeline(transaction=False)
+            for _, k in classified:
+                pipe.ttl(k)
+            try:
+                ttls = pipe.execute()
+            except Exception:
+                ttls = [None] * len(classified)
+
+            for (group, k), ttl in zip(classified, ttls):
+                g = groups[group]
+                g["key_count"] += 1
+                if ttl is None or ttl == -1:
+                    g["no_ttl_count"] += 1
+                elif ttl > 0:
+                    g["ttls"].append(int(ttl))
+
+                # Sample MEMORY USAGE only up to sample_per_group per group.
+                if g["sample_size"] < sample_per_group:
+                    g["sample_keys"].append(k)
+                    g["sample_size"] += 1
+
+            scanned += len(batch)
+
+        if cursor == 0 or scanned >= cap:
+            break
+
+    # Now MEMORY USAGE for the sampled keys, pipelined per group.
+    for group, g in groups.items():
+        if not g["sample_keys"]:
+            continue
+        for i in range(0, len(g["sample_keys"]), pipe_chunk):
+            chunk = g["sample_keys"][i:i + pipe_chunk]
+            pipe = client.pipeline(transaction=False)
+            for k in chunk:
+                pipe.memory_usage(k)
+            try:
+                sizes = pipe.execute()
+            except Exception:
+                sizes = [None] * len(chunk)
+            for sz in sizes:
+                if isinstance(sz, int) and sz > 0:
+                    g["sampled_bytes"].append(sz)
+
+    # Build summary rows.
+    rows = []
+    for group, g in groups.items():
+        sb = g["sampled_bytes"]
+        ttls = g["ttls"]
+        avg_bytes = (sum(sb) / len(sb)) if sb else None
+        est_total_bytes = int(avg_bytes * g["key_count"]) if avg_bytes else None
+        rows.append({
+            "group": group,
+            "key_count": g["key_count"],
+            "no_ttl_count": g["no_ttl_count"],
+            "no_ttl_pct": round(g["no_ttl_count"] / g["key_count"] * 100, 1) if g["key_count"] else 0,
+            "avg_ttl_s": int(sum(ttls) / len(ttls)) if ttls else None,
+            "min_ttl_s": min(ttls) if ttls else None,
+            "max_ttl_s": max(ttls) if ttls else None,
+            "sample_size": len(sb),
+            "avg_bytes_sampled": int(avg_bytes) if avg_bytes else None,
+            "est_total_bytes": est_total_bytes,
+        })
+
+    rows.sort(key=lambda r: r["est_total_bytes"] or 0, reverse=True)
+    return {
+        "scanned_keys": scanned,
+        "scan_capped_at": cap,
+        "pattern": pattern,
+        "groups": rows,
     }
-    return 3600;
-}, 10, 2 );
 
-// No cachear queries que contengan 'wp_wc_orders':
-add_filter( 'pigcache_sql_cache_is_cacheable', function( $cacheable, $sql ) {
-    if ( stripos( $sql, 'wp_wc_orders' ) !== false ) {
-        return false;
+
+# ─── Hot keys (largest by MEMORY USAGE) ──────────────────────────────────────
+
+def scan_hot_keys(client, pattern, cap, top_n, count):
+    sampled = []
+    cursor = 0
+    scanned = 0
+    pipe_chunk = 200
+
+    while True:
+        cursor, batch = client.scan(cursor=cursor, match=pattern, count=count)
+        if batch:
+            for i in range(0, len(batch), pipe_chunk):
+                chunk = batch[i:i + pipe_chunk]
+                pipe = client.pipeline(transaction=False)
+                for k in chunk:
+                    pipe.memory_usage(k)
+                try:
+                    sizes = pipe.execute()
+                except Exception:
+                    sizes = [None] * len(chunk)
+                for k, sz in zip(chunk, sizes):
+                    if isinstance(sz, int) and sz > 0:
+                        sampled.append((sz, k))
+
+            scanned += len(batch)
+        if cursor == 0 or scanned >= cap:
+            break
+
+    sampled.sort(reverse=True)
+    return {
+        "scanned_keys": scanned,
+        "scan_capped_at": cap,
+        "pattern": pattern,
+        "top": [{"bytes": sz, "key": k} for sz, k in sampled[:top_n]],
     }
-    return $cacheable;
-}, 10, 2 );
-```
 
----
 
-## 11. CLI y herramientas externas
-
-### Cron standalone (`bin/pigcache-cron.php`)
-
-Script CLI que ejecuta el pipeline de analytics **sin cargar WordPress**.
-Lee `wp-config.php` por regex, conecta a MySQL directamente y usa `curl` para la API.
-
-#### Tareas que ejecuta (en orden)
-
-| # | Tarea | Condición |
-|---|-------|-----------|
-| 1 | Flush buffer APCu/Redis → `wp_pigcache_query_stats` | Siempre (salvo `--send-only` o `--cloud-only`) |
-| 2 | Enviar query stats pendientes → API | Siempre (salvo `--flush-only` o `--cloud-only`) |
-| 3 | **Cloud sync** — environment + fingerprints + profile | Siempre (salvo `--flush-only`, `--send-only`, o `--no-cloud`) |
-
-#### Tarea 3 — Cloud sync detallado
-
-1. **Environment** — lee plugins activos y tema de `wp_options`, versión WP de `wp-includes/version.php` → `POST /sites/{id}/environment`
-2. **Fingerprints** — vacía `wp_pigcache_sql_fingerprints` (unsynced) en batches de 500 → `POST /sites/{id}/fingerprints`; marca cada batch como `synced_at = NOW()`
-3. **Profile** — `GET /sites/{id}/profile`; si hay perfil compilado lo escribe en `wp-content/pigcache-sql-profile.php`
-
-Esta tarea es la que hace que los **templates de consulta se vean reflejados** sin necesidad de WP-Cron.
-
-#### Flags disponibles
-
-```
---flush-only    Solo tarea 1. Útil para sites sin API key.
---send-only     Solo tarea 2. Solo envío de stats.
---cloud-only    Solo tarea 3 (cloud sync). Útil para diagnóstico.
---no-cloud      Tareas 1 y 2, sin cloud sync.
---wp-config /ruta/wp-config.php   Path explícito al wp-config.
-```
-
-#### Intervalo del cron
-
-El intervalo por defecto es **15 minutos**. Puedes cambiarlo con:
-
-```php
-// wp-config.php
-define( 'PIGCACHE_FLUSH_INTERVAL', 5 );  // minutos; rango válido: 1–60
-```
-
-- Afecta al schedule de WP-Cron (cuando `PIGCACHE_USE_WP_CRON` está activo).
-- Para el cron real de servidor (cPanel), ajusta también la expresión crontab para que coincida.
-- El panel de admin considera el cron "activo" si corrió en los últimos `PIGCACHE_FLUSH_INTERVAL + 10` minutos.
-
-**Ejemplo crontab cada 5 minutos:**
-```
-*/5 * * * *  /usr/local/bin/php -q /path/to/pigcache/bin/pigcache-cron.php \
-  > /dev/null 2>> /path/to/pigcache/logs/pigcache-cron.log
-```
-
-#### Diagnóstico con modo verbose (API)
-
-Para verificar qué perfil tiene el backend y qué templates contiene:
-
-```
-GET /api/v1/sites/{siteId}/profile?verbose=1
-```
-
-La respuesta incluye `debug.templates` con la lista de fingerprints, hits y template de cada query, y `debug.fingerprints_stored_in_db` vs `debug.fingerprints_in_profile` para detectar si el cron compiló el perfil correctamente.
-
-#### Por qué el admin no reconocía el cron
-
-El script standalone escribe directamente a MySQL sin pasar por WordPress. Si el site usa un object cache persistente (Redis o APCu), `get_option()` devolvía el valor cacheado anterior. La solución implementada es llamar `wp_cache_delete()` antes de cada `get_option()` en `is_cron_confirmed()` y en la lectura de timestamps del admin.
-
-### Python analyzer
-
-```bash
-# Instalar dependencia
-pip3 install mysql-connector-python
-
-# Analizar con wp-config
-python3 cli/pigcache-analyze.py --wp-config /var/www/html/wp-config.php
-
-# Analizar con credenciales manuales
-python3 cli/pigcache-analyze.py \
-    --host 127.0.0.1 \
-    --user root \
-    --password mipass \
-    --database wordpress
-
-# Guardar report
-python3 cli/pigcache-analyze.py --wp-config /var/www/html/wp-config.php -o report.json
-```
-
-### Monitor operativo (`cli/pigcache-monitor.py`)
-
-Script Python con varios subcomandos para vigilar la salud de Redis + MySQL
-**fuera de wp-admin**, pensado para correr por cron en cPanel. No requiere
-cargar WordPress.
-
-#### Instalación
-
-```bash
-pip3 install --user redis PyMySQL
-# (mysql-connector-python también sirve)
-```
-
-#### Subcomandos
-
-| Subcomando | Qué hace |
-|------------|----------|
-| `snapshot` | Reporte completo de una sola pasada (Redis + MySQL): versión, latencia PING, hit ratio acumulado, memoria vs `maxmemory`, política de evicción, evicciones/expiraciones, slowlog top 5, saturación MySQL. |
-| `health` | Pass/fail con exit codes (`0` OK, `1` warn, `2` critical). Pensado para cron con email-on-failure. Chequea circuit-breaker, ping, hit ratio, fill de memoria, política, conexiones rechazadas, stampede locks, saturación MySQL. |
-| `breakdown` | Recorre el keyspace con `SCAN` y agrupa por grupo de cache (`pigcache_html`, `pigcache_sql`, `pigcache_fragments`, `options`, `posts`, `transient`…). Muestra conteo, % sin TTL, TTL promedio, bytes muestreados con `MEMORY USAGE` y estimación de bytes totales por grupo. **Esta es la vista clave para responder "¿en qué se está usando mi memoria de Redis?".** |
-| `hot-keys` | Top N keys más grandes vía `MEMORY USAGE` (muestreo). Detecta keys gordas que están comiendo memoria. |
-| `watch` | Toma dos snapshots separados por una ventana de tiempo y calcula deltas reales (hits/s, miss/s, ops/s, evicciones/s, hit ratio **de la ventana**, no acumulado). |
-| `mysql` | Solo MySQL: `Threads_connected`, `Max_used_connections`, `Aborted_clients`, `Connection_errors_max_connections`, `Slow_queries` y `processlist` por estado. Respuesta directa al "Error establishing a database connection". |
-| `stampede` | Lista las keys `pigcache_lock_*` activas. Si hay muchas, hay regeneraciones en cola (cache MISS en páginas hot y/o DB lenta). |
-| `log-line` | Una sola línea compacta con las métricas clave. Ideal para `>> archivo.log 2>&1` y analizar con `grep`/`awk` o ingestar en cualquier monitor que tail-ee logs. |
-
-#### Flags comunes (sirven en todos los subcomandos)
-
-```
---wp-config PATH       Auto-rellena credenciales Redis y MySQL desde wp-config.php
---redis-host, --redis-port, --redis-password, --redis-db
---mysql-host (acepta host:port), --mysql-user, --mysql-password, --mysql-db
---timeout 3            Timeout de socket para Redis y MySQL (segundos)
---json                 Emite JSON en vez de texto (para jq / ingesta)
---skip-mysql           Solo Redis
---sample-cap 20000     Límite de keys que `SCAN` puede recorrer
---scan-count 500       COUNT hint para cada iteración de SCAN
-```
-
-`health` añade thresholds tuneables: `--ping-max-ms 50`, `--hit-ratio-min 80`,
-`--memory-fill-max 90`, `--stampede-max 25`, `--mysql-sat-max 80`.
-
-#### Cron en cPanel (Cron Jobs)
-
-Reemplaza `/home/USER` por tu home real y la ruta del plugin.
-
-```cron
-# Cada minuto: una línea compacta para tail / grep
-* * * * * /usr/bin/python3 /home/USER/public_html/wp-content/plugins/pigcache/cli/pigcache-monitor.py \
-    log-line --wp-config /home/USER/public_html/wp-config.php \
-    >> /home/USER/logs/pigcache-monitor.log 2>&1
-
-# Cada 5 minutos: health check, cPanel envía email si exit != 0
-*/5 * * * * /usr/bin/python3 /home/USER/public_html/wp-content/plugins/pigcache/cli/pigcache-monitor.py \
-    health --wp-config /home/USER/public_html/wp-config.php
-
-# Cada hora: breakdown por grupo en JSON (histórico de cómo se distribuye la memoria)
-0 * * * * /usr/bin/python3 /home/USER/public_html/wp-content/plugins/pigcache/cli/pigcache-monitor.py \
-    breakdown --wp-config /home/USER/public_html/wp-config.php --json \
-    >> /home/USER/logs/pigcache-breakdown.jsonl 2>&1
-
-# Cada 6 horas: top 20 keys más grandes (para detectar bloat)
-0 */6 * * * /usr/bin/python3 /home/USER/public_html/wp-content/plugins/pigcache/cli/pigcache-monitor.py \
-    hot-keys --wp-config /home/USER/public_html/wp-config.php --top 20 \
-    >> /home/USER/logs/pigcache-hotkeys.log 2>&1
-```
-
-#### Diagnóstico de "Error establishing a database connection"
-
-Ese error es de **MySQL**, no de Redis, pero suele aparecer cuando Redis no
-está absorbiendo carga y MySQL se queda sin slots de conexión. Para confirmar
-qué está pasando en el momento exacto, corre en paralelo:
-
-```bash
-python3 cli/pigcache-monitor.py snapshot --wp-config /ruta/wp-config.php
-python3 cli/pigcache-monitor.py watch    --wp-config /ruta/wp-config.php --window 60
-python3 cli/pigcache-monitor.py stampede --wp-config /ruta/wp-config.php
-```
-
-Señales por orden de gravedad:
-
-1. `circuit breaker: OPEN` → el dropin de PigCache ya marcó Redis como caído.
-   Las requests siguientes se sirven sin cache → tormenta de queries a MySQL.
-2. `rejected_connections > 0` o `connected_clients` cerca de `maxclients` →
-   Redis tirando conexiones de PHP-FPM, esos workers también caen sin cache.
-3. `mysql_conn_saturation_pct > 80%` o `connection_errors_max_connections > 0`
-   → MySQL está al límite. Sube `max_connections` y/o reduce `wait_timeout`,
-   pero la causa raíz casi siempre es cache MISS.
-4. `active locks > N` en `stampede` → muchas páginas se regeneran a la vez
-   (cache stampede). Suele coincidir con un purge global reciente.
-5. `evicted_keys` creciendo + `memory fill ~100%` → Redis está reciclando
-   keys útiles. Sube `maxmemory` o limpia keys sin TTL (ver `breakdown`).
-
-#### Recomendaciones de configuración de Redis
-
-Para alto tráfico estas opciones del `redis.conf` (o `CONFIG SET` en caliente)
-son las que más impacto tienen:
-
-```conf
-# Tope estricto, NUNCA dejarlo en 0 con WordPress detrás. Ajusta al ~70% de la
-# RAM dedicada al proceso redis-server.
-maxmemory 2gb
-
-# Estrategia de evicción. allkeys-lru es la sana por defecto en WordPress:
-# desaloja las keys menos recientes sin importar si tienen TTL o no. Con
-# `noeviction` Redis devuelve OOM en cada SET cuando se llena → cache miss
-# permanente.
-maxmemory-policy allkeys-lru
-
-# Sube el cap de clientes si tienes muchos workers PHP-FPM (por ejemplo
-# 4 pools x 200 children = 800). Default es 10000.
-maxclients 10000
-
-# Latencia: matar lazy clients para liberar slots cuando hay picos.
-timeout 300
-tcp-keepalive 60
-
-# Activa slowlog para investigar comandos lentos (>10ms) que ralenticen
-# requests:
-slowlog-log-slower-than 10000
-slowlog-max-len 256
-```
-
-En el `wp-config.php` del sitio:
-
-```php
-// Reintenta cada N segundos cuando Redis se cae (default 30). Bájalo si el
-// servicio se recupera rápido para que el dropin reintente antes:
-define( 'PIGCACHE_REDIS_RETRY_INTERVAL', 15 );
-
-// Falla con elegancia (el sitio sigue funcionando sin cache si Redis muere):
-define( 'PIGCACHE_REDIS_GRACEFUL', true );
-```
-
-### WP-CLI (futuro)
-
-Comandos planificados para futuras versiones:
-- `wp pigcache flush html` — Purgar todo el HTML cache
-- `wp pigcache flush sql` — Bump SQL epoch
-- `wp pigcache profiler start` — Iniciar learning
-- `wp pigcache profiler compile` — Compilar profile
-- `wp pigcache tags list --post=123` — Ver tags de un post
-
----
-
-## 12. Troubleshooting
-
-### El HTML cache no funciona
-
-1. Verifica que el object cache esté activo (Ajustes -> PigCache).
-2. Verifica que no estés logueado (el HTML cache es solo para visitantes).
-3. Revisa si algún filtro retorna `true` en `pigcache_skip_html_cache`.
-4. Verifica en Redis: `redis-cli GET wp:1:pigcache_html:doc_*`
-
-### El SQL cache no funciona
-
-1. Verifica que `db.php` esté instalado (Ajustes -> PigCache).
-2. El SQL cache no opera en admin, AJAX, REST, cron ni WP-CLI.
-3. Verifica el contexto con `pigcache_sql_cache_skip_context`.
-
-### El profiler no compila
-
-1. Verifica que el learning haya corrido al menos unos días.
-2. Revisa que `wp-content/` sea escribible por PHP.
-3. Si el profile está vacío, verifica que el db.php drop-in esté activo.
-
-### Las páginas no se invalidan
-
-1. Revisa que el tag collector esté recogiendo tags:
-   ```sql
-   SELECT * FROM wp_pigcache_tags WHERE tag = 'post:123';
-   ```
-2. Si no hay filas, la página no fue taqueada durante el render.
-3. Agrega `pigcache_tag('post:123')` manualmente en tu template.
-
-### Un sitio muestra el contenido de otro (hosting compartido)
-
-1. Verifica que ambos sitios tengan **bases de datos diferentes** (`DB_NAME`
-   distinto en cada wp-config.php). El auto-prefix se calcula a partir de
-   `DB_NAME`, así que DBs diferentes = prefixes diferentes = aislamiento.
-2. Si ambos sitios usan la misma DB MySQL (con distinto `$table_prefix`),
-   el auto-prefix también los diferencia.
-3. Si aun así hay contaminación, define `PIGCACHE_REDIS_PREFIX` explícitamente
-   en cada sitio con un valor único.
-4. Después de cualquier cambio de prefix, haz flush de caché en **todos**
-   los sitios (o `redis-cli FLUSHALL` una sola vez).
-
-### Redis no conecta
-
-1. Verifica que Redis esté corriendo: `redis-cli ping`
-2. Revisa las constantes `PIGCACHE_REDIS_HOST`, `PIGCACHE_REDIS_PORT`.
-3. Si usas password: `PIGCACHE_REDIS_PASSWORD`.
-4. Revisa el log de PHP para errores de conexión.
-
-### Flush de Redis desde línea de comandos
-
-Después de actualizar PigCache o cambiar prefixes, necesitas limpiar las
-claves viejas de Redis. Desde SSH:
-
-```bash
-# Borrar TODAS las claves de TODAS las DB lógicas (nuclear, úsalo solo
-# si Redis es exclusivo para tus sitios WordPress):
-redis-cli FLUSHALL
-
-# Si Redis tiene password:
-redis-cli -a tu_password FLUSHALL
-```
-
-Si necesitas borrar solo una DB lógica específica (sin afectar las demás):
-
-```bash
-# Borrar solo DB 0 (la default):
-redis-cli -n 0 FLUSHDB
-
-# Borrar solo DB 7:
-redis-cli -n 7 FLUSHDB
-
-# Con password + DB específica:
-redis-cli -a tu_password -n 7 FLUSHDB
-```
-
-Si solo quieres borrar las claves de **un sitio** (sin tocar los demás)
-y conoces su prefix:
-
-```bash
-# Ver qué prefixes hay:
-redis-cli KEYS "*" | head -20
-
-# Borrar solo las keys de un prefix (ejemplo: a3f8b21c:*):
-redis-cli --scan --pattern "a3f8b21c:*" | xargs redis-cli DEL
-
-# Con password:
-redis-cli -a tu_password --scan --pattern "a3f8b21c:*" | xargs redis-cli -a tu_password DEL
-```
-
-> **Tip:** Después del flush, visita cada sitio una vez para que se
-> regenere la caché. La primera visita será más lenta de lo normal.
-
-### Demasiada memoria en Redis
-
-1. Revisa TTLs (Ajustes -> PigCache > Cache TTL).
-2. Ejecuta el cleanup de tags stale:
-   ```php
-   PigCache_Tag_Index::cleanup_stale();
-   ```
-3. Considera `redis-cli INFO memory` para ver el uso.
+# ─── Stampede locks ──────────────────────────────────────────────────────────
+
+def scan_stampede_locks(client, pattern, cap, count):
+    locks = []
+    cursor = 0
+    scanned = 0
+    while True:
+        cursor, batch = client.scan(cursor=cursor, match=pattern, count=count)
+        for k in batch:
+            try:
+                ttl = client.ttl(k)
+            except Exception:
+                ttl = None
+            locks.append({"key": k, "ttl": ttl})
+            scanned += 1
+            if scanned >= cap:
+                break
+        if cursor == 0 or scanned >= cap:
+            break
+    return {"active_lock_count": len(locks), "locks": locks[:50]}
+
+
+# ─── MySQL probe ─────────────────────────────────────────────────────────────
+
+def mysql_probe(conn):
+    cur = conn.cursor()
+    keys = (
+        "Threads_connected", "Threads_running", "Threads_cached", "Threads_created",
+        "Max_used_connections", "Aborted_connects", "Aborted_clients",
+        "Connection_errors_max_connections", "Connection_errors_internal",
+        "Slow_queries", "Uptime", "Questions", "Com_select", "Com_insert",
+        "Com_update", "Com_delete",
+    )
+    status = {}
+    for k in keys:
+        try:
+            cur.execute("SHOW GLOBAL STATUS LIKE %s", (k,))
+            row = cur.fetchone()
+            if row:
+                status[row[0]] = row[1]
+        except Exception:
+            continue
+
+    variables = {}
+    for v in ("max_connections", "wait_timeout", "interactive_timeout",
+              "max_user_connections", "table_open_cache", "innodb_buffer_pool_size"):
+        try:
+            cur.execute("SHOW VARIABLES LIKE %s", (v,))
+            row = cur.fetchone()
+            if row:
+                variables[row[0]] = row[1]
+        except Exception:
+            continue
+
+    # Best-effort: count CURRENT processlist (cheap on most cPanel hosts).
+    processlist_count = None
+    proc_states = defaultdict(int)
+    try:
+        cur.execute("SELECT COMMAND FROM information_schema.PROCESSLIST")
+        for (cmd,) in cur.fetchall():
+            processlist_count = (processlist_count or 0) + 1
+            proc_states[cmd or "?"] += 1
+    except Exception:
+        pass
+
+    cur.close()
+
+    def _i(d, k, default=0):
+        try:
+            return int(d.get(k, default))
+        except (TypeError, ValueError):
+            return default
+
+    threads_conn = _i(status, "Threads_connected")
+    threads_run = _i(status, "Threads_running")
+    max_used = _i(status, "Max_used_connections")
+    max_conn = _i(variables, "max_connections")
+    aborted_c = _i(status, "Aborted_clients")
+    aborted_s = _i(status, "Aborted_connects")
+    uptime = _i(status, "Uptime")
+    questions = _i(status, "Questions")
+
+    return {
+        "captured_at": datetime.utcnow().isoformat() + "Z",
+        "threads_connected": threads_conn,
+        "threads_running": threads_run,
+        "max_used_connections": max_used,
+        "max_connections": max_conn,
+        "conn_saturation_pct": round(threads_conn / max_conn * 100, 2) if max_conn else None,
+        "peak_saturation_pct": round(max_used / max_conn * 100, 2) if max_conn else None,
+        "aborted_clients": aborted_c,
+        "aborted_connects": aborted_s,
+        "connection_errors_max_connections": _i(status, "Connection_errors_max_connections"),
+        "connection_errors_internal": _i(status, "Connection_errors_internal"),
+        "slow_queries": _i(status, "Slow_queries"),
+        "uptime_s": uptime,
+        "questions": questions,
+        "qps_avg_since_boot": round(questions / uptime, 2) if uptime else None,
+        "wait_timeout_s": _i(variables, "wait_timeout"),
+        "innodb_buffer_pool_bytes": _i(variables, "innodb_buffer_pool_size"),
+        "processlist_total": processlist_count,
+        "processlist_by_command": dict(proc_states),
+    }
+
+
+# ─── Rendering helpers ───────────────────────────────────────────────────────
+
+def _fmt_bytes(b):
+    if b is None:
+        return "-"
+    if not isinstance(b, (int, float)):
+        return str(b)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if b < 1024:
+            return f"{b:.2f} {unit}" if unit != "B" else f"{int(b)} {unit}"
+        b /= 1024
+    return f"{b:.2f} PiB"
+
+
+def _fmt_pct(p):
+    return f"{p:.2f}%" if isinstance(p, (int, float)) else "-"
+
+
+def _ascii_bar(pct, width=20):
+    if not isinstance(pct, (int, float)):
+        return "[" + " " * width + "]"
+    p = max(0.0, min(100.0, pct))
+    filled = int(p / 100 * width)
+    return "[" + "#" * filled + "-" * (width - filled) + "]"
+
+
+def render_snapshot_text(snap, cb_state):
+    out = []
+    e = snap["endpoint"]
+    out.append("─── Redis health ─────────────────────────────────────")
+    out.append(f"  endpoint                : {e['host']}:{e['port']} (db {e['db']})  driver={e.get('driver', '?')}")
+    out.append(f"  redis_version           : {snap['redis_version']}")
+    out.append(f"  uptime                  : {snap['uptime_seconds']}s")
+    out.append(f"  ping p50 / max          : {snap['ping_p50_ms']} ms / {snap['ping_max_ms']} ms")
+    out.append(f"  info() latency          : {snap['info_latency_ms']} ms")
+    if cb_state["open"]:
+        age = cb_state.get("age_seconds")
+        out.append(f"  circuit breaker         : OPEN  (flag {cb_state['path']}, age {age}s)")
+    else:
+        out.append(f"  circuit breaker         : closed")
+    out.append("")
+    out.append("─── Throughput ───────────────────────────────────────")
+    out.append(f"  ops/sec (instant)       : {snap['instantaneous_ops_per_sec']}")
+    out.append(f"  total commands          : {snap['total_commands_processed']:,}")
+    out.append(f"  rejected connections    : {snap['rejected_connections']}")
+    out.append(f"  connected clients       : {snap['connected_clients']} / maxclients {snap['maxclients']}")
+    out.append(f"  blocked clients         : {snap['blocked_clients']}")
+    out.append("")
+    out.append("─── Cache effectiveness (since Redis boot) ───────────")
+    out.append(f"  keyspace_hits           : {snap['keyspace_hits']:,}")
+    out.append(f"  keyspace_misses         : {snap['keyspace_misses']:,}")
+    hr = snap['hit_ratio_pct']
+    out.append(f"  cumulative hit ratio    : {_fmt_pct(hr)}  {_ascii_bar(hr)}")
+    out.append(f"  evicted_keys            : {snap['evicted_keys']:,}")
+    out.append(f"  expired_keys            : {snap['expired_keys']:,}")
+    out.append("")
+    out.append("─── Memory ───────────────────────────────────────────")
+    out.append(f"  used_memory             : {snap['used_memory_human']}")
+    out.append(f"  used_memory_peak        : {snap['used_memory_peak_human']}")
+    out.append(f"  used_memory_rss         : {_fmt_bytes(snap['used_memory_rss_bytes'])}")
+    out.append(f"  fragmentation ratio     : {snap['mem_fragmentation_ratio']}")
+    out.append(f"  maxmemory               : {_fmt_bytes(snap['maxmemory_bytes']) if snap['maxmemory_bytes'] else 'UNLIMITED (!)'}")
+    out.append(f"  maxmemory-policy        : {snap['maxmemory_policy']}")
+    fill = snap['maxmemory_fill_pct']
+    out.append(f"  memory fill             : {_fmt_pct(fill)}  {_ascii_bar(fill)}")
+    out.append(f"  total keys in this db   : {snap['dbsize']}")
+    if snap["slowlog_top5"]:
+        out.append("")
+        out.append("─── Slowlog (top 5) ──────────────────────────────────")
+        for s in snap["slowlog_top5"]:
+            out.append(f"  {s['duration_us']:>8} µs  {s['command']}")
+    return "\n".join(out)
+
+
+def render_breakdown_text(b):
+    out = []
+    out.append("─── Cache breakdown by group ─────────────────────────")
+    out.append(f"  pattern={b['pattern']}  scanned={b['scanned_keys']}  cap={b['scan_capped_at']}")
+    out.append("")
+    header = "  {:<28} {:>10} {:>11} {:>11} {:>11} {:>10}".format(
+        "group", "keys", "no-ttl%", "avg ttl", "avg bytes", "est total"
+    )
+    out.append(header)
+    out.append("  " + "-" * (len(header) - 2))
+    for r in b["groups"]:
+        out.append("  {:<28} {:>10} {:>10.1f}% {:>11} {:>11} {:>10}".format(
+            r["group"][:28],
+            f"{r['key_count']:,}",
+            r["no_ttl_pct"],
+            f"{r['avg_ttl_s']}s" if r["avg_ttl_s"] else "-",
+            _fmt_bytes(r["avg_bytes_sampled"]) if r["avg_bytes_sampled"] else "-",
+            _fmt_bytes(r["est_total_bytes"]) if r["est_total_bytes"] else "-",
+        ))
+    return "\n".join(out)
+
+
+def render_hot_text(h):
+    out = []
+    out.append("─── Largest sampled keys ─────────────────────────────")
+    out.append(f"  pattern={h['pattern']}  scanned={h['scanned_keys']}  cap={h['scan_capped_at']}")
+    out.append("")
+    for entry in h["top"]:
+        out.append(f"  {_fmt_bytes(entry['bytes']):>12}  {entry['key']}")
+    if not h["top"]:
+        out.append("  (no keys sampled)")
+    return "\n".join(out)
+
+
+def render_stampede_text(s):
+    out = []
+    out.append("─── Stampede locks (pigcache_lock_*) ─────────────────")
+    out.append(f"  active locks: {s['active_lock_count']}")
+    if s["active_lock_count"] > 0:
+        out.append("  ⚠ regenerations queueing — investigate slow pages or DB.")
+    for lk in s["locks"][:20]:
+        out.append(f"    ttl={lk['ttl']:>4}  {lk['key']}")
+    return "\n".join(out)
+
+
+def render_mysql_text(m):
+    out = []
+    out.append("─── MySQL connection saturation ──────────────────────")
+    out.append(f"  threads_connected       : {m['threads_connected']} / max {m['max_connections']}"
+               f"  ({_fmt_pct(m['conn_saturation_pct'])})  {_ascii_bar(m['conn_saturation_pct'])}")
+    out.append(f"  max_used_connections    : {m['max_used_connections']}"
+               f"  ({_fmt_pct(m['peak_saturation_pct'])} peak)")
+    out.append(f"  threads_running         : {m['threads_running']}")
+    out.append(f"  aborted_clients         : {m['aborted_clients']}")
+    out.append(f"  aborted_connects        : {m['aborted_connects']}")
+    out.append(f"  conn_errors_max_conn    : {m['connection_errors_max_connections']}")
+    out.append(f"  slow_queries            : {m['slow_queries']}")
+    out.append(f"  qps avg since boot      : {m['qps_avg_since_boot']}")
+    out.append(f"  wait_timeout            : {m['wait_timeout_s']}s")
+    if m["processlist_total"] is not None:
+        out.append(f"  processlist total       : {m['processlist_total']}")
+        for cmd, n in sorted(m["processlist_by_command"].items(), key=lambda x: -x[1]):
+            out.append(f"    {n:>4}  {cmd}")
+    return "\n".join(out)
+
+
+# ─── Health check (alerting) ─────────────────────────────────────────────────
+
+DEFAULT_THRESHOLDS = {
+    "ping_max_ms": 50,
+    "hit_ratio_min_pct": 80.0,
+    "memory_fill_max_pct": 90.0,
+    "rejected_conn_delta": 1,           # any new rejection is bad
+    "evictions_delta_warn": 100,        # per call window
+    "stampede_locks_max": 25,
+    "mysql_conn_saturation_max_pct": 80.0,
+    "mysql_conn_errors_max_delta": 1,
+}
+
+
+def run_health(args, cfg):
+    redis_client, endpoint = connect_redis(args, cfg)
+    snap = redis_snapshot(redis_client, endpoint)
+    cb = circuit_breaker_state(endpoint["host"], endpoint["port"])
+
+    alerts = []
+
+    if cb["open"]:
+        alerts.append({
+            "severity": "critical",
+            "code": "redis_circuit_open",
+            "msg": f"Circuit breaker is OPEN (age {cb['age_seconds']}s) — "
+                   f"PigCache dropin recently failed to reach Redis."
+        })
+
+    if snap["ping_max_ms"] > args.ping_max_ms:
+        alerts.append({
+            "severity": "warn",
+            "code": "redis_latency_high",
+            "msg": f"Redis PING max {snap['ping_max_ms']} ms > "
+                   f"{args.ping_max_ms} ms threshold."
+        })
+
+    if snap["hit_ratio_pct"] is not None and snap["hit_ratio_pct"] < args.hit_ratio_min:
+        alerts.append({
+            "severity": "warn",
+            "code": "low_hit_ratio",
+            "msg": f"Cumulative hit ratio {snap['hit_ratio_pct']}% < "
+                   f"{args.hit_ratio_min}% (since Redis boot — see `watch` "
+                   f"for current-window ratio)."
+        })
+
+    if snap["maxmemory_bytes"] == 0:
+        alerts.append({
+            "severity": "warn",
+            "code": "no_maxmemory",
+            "msg": "Redis maxmemory is UNLIMITED. With high traffic this "
+                   "lets old keys accumulate; set maxmemory + an LRU policy."
+        })
+    elif snap["maxmemory_fill_pct"] and snap["maxmemory_fill_pct"] > args.memory_fill_max:
+        alerts.append({
+            "severity": "warn",
+            "code": "memory_pressure",
+            "msg": f"Redis memory fill {snap['maxmemory_fill_pct']}% > "
+                   f"{args.memory_fill_max}% — evictions imminent."
+        })
+
+    if snap["maxmemory_policy"] in ("noeviction",):
+        alerts.append({
+            "severity": "warn",
+            "code": "policy_noeviction",
+            "msg": "maxmemory-policy=noeviction — once full, Redis returns "
+                   "OOM errors for SETs. Use allkeys-lru or volatile-lru."
+        })
+
+    if snap["rejected_connections"] > 0:
+        alerts.append({
+            "severity": "warn",
+            "code": "rejected_connections",
+            "msg": f"{snap['rejected_connections']} rejected_connections "
+                   f"since boot — Redis maxclients reached at some point."
+        })
+
+    # Stampede locks
+    if not args.skip_stampede:
+        lock_pattern = (cfg.get("PIGCACHE_REDIS_PREFIX") or "") + "*pigcache_lock_*"
+        st = scan_stampede_locks(redis_client, lock_pattern,
+                                 cap=2000, count=500)
+        if st["active_lock_count"] > args.stampede_max:
+            alerts.append({
+                "severity": "warn",
+                "code": "stampede_locks_high",
+                "msg": f"{st['active_lock_count']} active stampede locks "
+                       f"(>{args.stampede_max}) — many pages are regenerating "
+                       "simultaneously (slow MISS path)."
+            })
+
+    # MySQL saturation
+    mysql_block = None
+    if not args.skip_mysql:
+        conn, err = connect_mysql(args, cfg)
+        if conn is not None:
+            try:
+                mysql_block = mysql_probe(conn)
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            sat = mysql_block.get("conn_saturation_pct")
+            if isinstance(sat, (int, float)) and sat > args.mysql_sat_max:
+                alerts.append({
+                    "severity": "critical",
+                    "code": "mysql_conn_saturation",
+                    "msg": f"MySQL connection usage {sat}% of max_connections "
+                           f"({mysql_block['threads_connected']}/"
+                           f"{mysql_block['max_connections']}). "
+                           "This is exactly what causes 'Error establishing a "
+                           "database connection'."
+                })
+            cme = mysql_block.get("connection_errors_max_connections", 0)
+            if cme > 0:
+                alerts.append({
+                    "severity": "critical",
+                    "code": "mysql_max_conn_errors",
+                    "msg": f"MySQL has refused {cme} new connections "
+                           "since boot due to max_connections — site is "
+                           "definitely failing under load."
+                })
+        elif err:
+            alerts.append({
+                "severity": "info",
+                "code": "mysql_skip",
+                "msg": f"MySQL probe skipped: {err}"
+            })
+
+    report = {
+        "ok": all(a["severity"] not in ("critical", "warn") for a in alerts),
+        "alerts": alerts,
+        "redis": snap,
+        "circuit_breaker": cb,
+        "mysql": mysql_block,
+    }
+
+    if args.json:
+        print(json.dumps(report, indent=2, default=str))
+    else:
+        if not alerts:
+            print("[OK] PigCache health check passed.")
+        for a in alerts:
+            print(f"[{a['severity'].upper()}] {a['code']}: {a['msg']}")
+
+    # Exit code policy.
+    if any(a["severity"] == "critical" for a in alerts):
+        sys.exit(2)
+    if any(a["severity"] == "warn" for a in alerts):
+        sys.exit(1)
+    sys.exit(0)
+
+
+# ─── Subcommand implementations ──────────────────────────────────────────────
+
+def cmd_snapshot(args, cfg):
+    client, endpoint = connect_redis(args, cfg)
+    snap = redis_snapshot(client, endpoint)
+    cb = circuit_breaker_state(endpoint["host"], endpoint["port"])
+
+    mysql_block = None
+    if not args.skip_mysql:
+        conn, err = connect_mysql(args, cfg)
+        if conn is not None:
+            try:
+                mysql_block = mysql_probe(conn)
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    if args.json:
+        print(json.dumps({
+            "redis": snap, "circuit_breaker": cb, "mysql": mysql_block,
+        }, indent=2, default=str))
+        return
+
+    print(render_snapshot_text(snap, cb))
+    if mysql_block:
+        print()
+        print(render_mysql_text(mysql_block))
+
+
+def cmd_breakdown(args, cfg):
+    client, endpoint = connect_redis(args, cfg)
+    pattern = (cfg.get("PIGCACHE_REDIS_PREFIX") or "") + "*"
+    b = scan_breakdown(client, pattern,
+                       cap=args.sample_cap,
+                       sample_per_group=args.sample_per_group,
+                       count=args.scan_count)
+    if args.json:
+        print(json.dumps(b, indent=2, default=str))
+    else:
+        print(render_breakdown_text(b))
+
+
+def cmd_hot_keys(args, cfg):
+    client, _ = connect_redis(args, cfg)
+    pattern = (cfg.get("PIGCACHE_REDIS_PREFIX") or "") + "*"
+    h = scan_hot_keys(client, pattern,
+                      cap=args.sample_cap,
+                      top_n=args.top,
+                      count=args.scan_count)
+    if args.json:
+        print(json.dumps(h, indent=2, default=str))
+    else:
+        print(render_hot_text(h))
+
+
+def cmd_stampede(args, cfg):
+    client, _ = connect_redis(args, cfg)
+    pattern = (cfg.get("PIGCACHE_REDIS_PREFIX") or "") + "*pigcache_lock_*"
+    s = scan_stampede_locks(client, pattern, cap=args.sample_cap,
+                            count=args.scan_count)
+    if args.json:
+        print(json.dumps(s, indent=2, default=str))
+    else:
+        print(render_stampede_text(s))
+
+
+def cmd_mysql(args, cfg):
+    conn, err = connect_mysql(args, cfg)
+    if conn is None:
+        print(f"error: {err}", file=sys.stderr)
+        sys.exit(2)
+    try:
+        m = mysql_probe(conn)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    if args.json:
+        print(json.dumps(m, indent=2, default=str))
+    else:
+        print(render_mysql_text(m))
+
+
+def cmd_watch(args, cfg):
+    """Compute deltas across a time window — gives a *real* current hit ratio."""
+    client, endpoint = connect_redis(args, cfg)
+    snap1 = redis_snapshot(client, endpoint)
+    t1 = time.time()
+    if not args.json:
+        print(f"Sampling for {args.window}s...", file=sys.stderr)
+    time.sleep(args.window)
+    snap2 = redis_snapshot(client, endpoint)
+    t2 = time.time()
+    elapsed = max(0.001, t2 - t1)
+
+    d_hits = snap2["keyspace_hits"] - snap1["keyspace_hits"]
+    d_miss = snap2["keyspace_misses"] - snap1["keyspace_misses"]
+    d_evict = snap2["evicted_keys"] - snap1["evicted_keys"]
+    d_expir = snap2["expired_keys"] - snap1["expired_keys"]
+    d_cmd = snap2["total_commands_processed"] - snap1["total_commands_processed"]
+    d_conn = snap2["total_connections_received"] - snap1["total_connections_received"]
+    d_reject = snap2["rejected_connections"] - snap1["rejected_connections"]
+    total = d_hits + d_miss
+    window_ratio = (d_hits / total * 100.0) if total else None
+
+    out = {
+        "window_s": round(elapsed, 2),
+        "hits_per_sec": round(d_hits / elapsed, 2),
+        "miss_per_sec": round(d_miss / elapsed, 2),
+        "cmd_per_sec": round(d_cmd / elapsed, 2),
+        "new_conn_per_sec": round(d_conn / elapsed, 2),
+        "evictions_per_sec": round(d_evict / elapsed, 2),
+        "expirations_per_sec": round(d_expir / elapsed, 2),
+        "rejected_in_window": d_reject,
+        "hit_ratio_in_window_pct": round(window_ratio, 2) if window_ratio else None,
+    }
+    if args.json:
+        print(json.dumps(out, indent=2))
+    else:
+        print("─── Live window ──────────────────────────────────────")
+        for k, v in out.items():
+            print(f"  {k:<25} : {v}")
+
+
+def cmd_log_line(args, cfg):
+    """Single compact line — best for `>> file 2>&1` cron tailing."""
+    client, endpoint = connect_redis(args, cfg)
+    snap = redis_snapshot(client, endpoint)
+    cb = circuit_breaker_state(endpoint["host"], endpoint["port"])
+
+    mysql_summary = ""
+    if not args.skip_mysql:
+        conn, _err = connect_mysql(args, cfg)
+        if conn is not None:
+            try:
+                m = mysql_probe(conn)
+                mysql_summary = (
+                    f" mysql_conn={m['threads_connected']}/{m['max_connections']}"
+                    f" mysql_max_used={m['max_used_connections']}"
+                    f" mysql_aborted_c={m['aborted_clients']}"
+                )
+            except Exception:
+                pass
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    line = (
+        f"{datetime.utcnow().isoformat()}Z"
+        f" host={endpoint['host']}:{endpoint['port']}/{endpoint['db']}"
+        f" cb={'OPEN' if cb['open'] else 'ok'}"
+        f" ops/s={snap['instantaneous_ops_per_sec']}"
+        f" clients={snap['connected_clients']}"
+        f" hit_ratio={snap['hit_ratio_pct']}"
+        f" mem={snap['used_memory_human']}"
+        f" mem_fill={snap['maxmemory_fill_pct']}"
+        f" policy={snap['maxmemory_policy']}"
+        f" evicted={snap['evicted_keys']}"
+        f" rejected_conn={snap['rejected_connections']}"
+        f" ping_max_ms={snap['ping_max_ms']}"
+        f"{mysql_summary}"
+    )
+    print(line)
+
+
+# ─── CLI ─────────────────────────────────────────────────────────────────────
+
+def _build_common_parent():
+    """Common flags inherited by every subcommand (so they work *after* it too).
+
+    This is what lets cron jobs write the natural order:
+        pigcache-monitor.py snapshot --wp-config /path/to/wp-config.php --json
+    """
+    parent = argparse.ArgumentParser(add_help=False)
+    parent.add_argument("--wp-config",
+                        help="Path to wp-config.php (auto-fills creds)")
+    parent.add_argument("--redis-host")
+    parent.add_argument("--redis-port", type=int)
+    parent.add_argument("--redis-password")
+    parent.add_argument("--redis-db", type=int)
+    parent.add_argument("--mysql-host")
+    parent.add_argument("--mysql-user")
+    parent.add_argument("--mysql-password")
+    parent.add_argument("--mysql-db")
+    parent.add_argument("--timeout", type=float, default=3.0,
+                        help="Socket timeout for Redis/MySQL in seconds "
+                             "(default: 3)")
+    parent.add_argument("--json", action="store_true",
+                        help="Emit JSON instead of text")
+    parent.add_argument("--skip-mysql", action="store_true",
+                        help="Skip MySQL probe (Redis-only run)")
+    parent.add_argument("--sample-cap", type=int, default=20000,
+                        help="Max keys to walk via SCAN (default: 20000)")
+    parent.add_argument("--scan-count", type=int, default=500,
+                        help="COUNT hint per SCAN iteration (default: 500)")
+    return parent
+
+
+def build_parser():
+    common = _build_common_parent()
+
+    # Common flags are attached to each subparser (not the root) to avoid the
+    # well-known argparse pitfall where the subparser silently overwrites the
+    # parent's value with the default of its own copy of the same option.
+    p = argparse.ArgumentParser(
+        prog="pigcache-monitor",
+        description="PigCache Redis + MySQL operational monitor",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("snapshot", parents=[common],
+                   help="One-shot Redis (+MySQL) report")
+
+    h = sub.add_parser("health", parents=[common],
+                       help="Pass/fail health check (exits 0/1/2 for cron alerts)")
+    h.add_argument("--ping-max-ms", type=float,
+                   default=DEFAULT_THRESHOLDS["ping_max_ms"])
+    h.add_argument("--hit-ratio-min", type=float,
+                   default=DEFAULT_THRESHOLDS["hit_ratio_min_pct"])
+    h.add_argument("--memory-fill-max", type=float,
+                   default=DEFAULT_THRESHOLDS["memory_fill_max_pct"])
+    h.add_argument("--stampede-max", type=int,
+                   default=DEFAULT_THRESHOLDS["stampede_locks_max"])
+    h.add_argument("--mysql-sat-max", type=float,
+                   default=DEFAULT_THRESHOLDS["mysql_conn_saturation_max_pct"])
+    h.add_argument("--skip-stampede", action="store_true")
+
+    bd = sub.add_parser("breakdown", parents=[common],
+                        help="Per-group key/memory breakdown via SCAN")
+    bd.add_argument("--sample-per-group", type=int, default=50,
+                    help="Keys per group to sample for MEMORY USAGE / TTL")
+
+    hk = sub.add_parser("hot-keys", parents=[common],
+                        help="Top largest keys via MEMORY USAGE sampling")
+    hk.add_argument("--top", type=int, default=20)
+
+    sub.add_parser("stampede", parents=[common],
+                   help="List active pigcache_lock_* keys")
+
+    sub.add_parser("mysql", parents=[common],
+                   help="MySQL connection saturation snapshot")
+
+    w = sub.add_parser("watch", parents=[common],
+                       help="Compute deltas over a time window")
+    w.add_argument("--window", type=int, default=30,
+                   help="Seconds to sample (default: 30)")
+
+    sub.add_parser("log-line", parents=[common],
+                   help="Single compact line — append-friendly cron output")
+
+    return p
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    cfg = {}
+    if args.wp_config:
+        cfg = parse_wp_config(args.wp_config)
+
+    if args.cmd == "snapshot":
+        cmd_snapshot(args, cfg)
+    elif args.cmd == "health":
+        run_health(args, cfg)
+    elif args.cmd == "breakdown":
+        cmd_breakdown(args, cfg)
+    elif args.cmd == "hot-keys":
+        cmd_hot_keys(args, cfg)
+    elif args.cmd == "stampede":
+        cmd_stampede(args, cfg)
+    elif args.cmd == "mysql":
+        cmd_mysql(args, cfg)
+    elif args.cmd == "watch":
+        cmd_watch(args, cfg)
+    elif args.cmd == "log-line":
+        cmd_log_line(args, cfg)
+    else:
+        parser.error(f"unknown command: {args.cmd}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except (BrokenPipeError, socket.error):
+        sys.exit(141)
