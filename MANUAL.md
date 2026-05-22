@@ -844,6 +844,42 @@ pip3 install --user redis PyMySQL
 # (mysql-connector-python también sirve)
 ```
 
+#### Sin pip / cPanel bloqueado
+
+El script tiene un **fallback de stdlib pura para Redis**: si `redis-py` no está
+instalado, usa un cliente RESP interno hecho a mano con solo `socket`. Esto
+significa que `snapshot`, `breakdown`, `hot-keys`, `stampede`, `health`,
+`watch` y `log-line` funcionan **sin instalar nada** mientras tengas Python 3.
+
+Solo el subcomando `mysql` (y la sección MySQL de `snapshot` / `health`)
+requiere un driver Python para MySQL. Si no hay PyMySQL ni
+`mysql-connector-python`, basta con añadir `--skip-mysql` y, en paralelo,
+correr en cron algo como:
+
+```bash
+mysqladmin -h localhost -u USER -pPASS extended-status \
+    | grep -E 'Threads_(connected|running)|Max_used_connections|Aborted_(connects|clients)|Connection_errors'
+```
+
+Diagnóstico rápido de qué hay en el cPanel:
+
+```bash
+python3 --version
+python3 -m pip --version 2>&1                 # pip ya instalado?
+python3 -m ensurepip --version 2>&1 | head -1 # se puede bootstrappear?
+python3 -c "import redis"   2>&1              # paquete presente?
+python3 -c "import pymysql" 2>&1
+which mysql redis-cli
+```
+
+Caminos en orden de preferencia si pip falta:
+
+1. `python3 -m ensurepip --user --upgrade && python3 -m pip install --user redis PyMySQL`
+2. cPanel **Setup Python App** → crea un virtualenv con su propio pip → activarlo y `pip install redis PyMySQL`. En el cron usa la ruta absoluta al `python3` de ese virtualenv.
+3. `curl -sS https://bootstrap.pypa.io/get-pip.py | python3 - --user` y luego `python3 -m pip install --user redis PyMySQL`.
+4. Vendor manual: descarga los `.whl` (son zips), descomprime en `~/pigcache-deps/` y corre con `PYTHONPATH=$HOME/pigcache-deps python3 pigcache-monitor.py ...`.
+5. **No hagas nada** y deja que el script use el fallback de stdlib. Pierdes algo de rendimiento en `breakdown` con `--sample-cap` muy alto, pero para uso normal de monitoreo es perfectamente bueno.
+
 #### Subcomandos
 
 | Subcomando | Qué hace |
