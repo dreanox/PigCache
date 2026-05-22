@@ -110,6 +110,7 @@ class PigCache_WPDB extends wpdb {
 			$this->pigcache_bypass = false;
 		}
 
+		// ── PRO_START ─────────────────────────────────────────────────────────────────
 		if ( false !== $out
 			&& class_exists( 'PigCache_Sql_Profiler', false )
 			&& PigCache_Sql_Profiler::is_learning()
@@ -127,6 +128,7 @@ class PigCache_WPDB extends wpdb {
 			$mem_kb      = (int) round( memory_get_usage() / 1024 );
 			PigCache_Continuous_Learner::record( $normalized, $tables, $exec_ms, $mem_kb );
 		}
+		// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 		return $out;
 	}
@@ -224,6 +226,7 @@ class PigCache_WPDB extends wpdb {
 	 * @return bool
 	 */
 	private function pigcache_is_fresh( $pack, $query = '' ) {
+		// ── PRO_START ─────────────────────────────────────────────────────────────────
 		if ( isset( $pack['table_epochs'] ) && is_array( $pack['table_epochs'] ) && ! empty( $pack['table_epochs'] ) ) {
 			if ( class_exists( 'PigCache_Sql_Cache', false ) ) {
 				$current = PigCache_Sql_Cache::get_table_epochs( array_keys( $pack['table_epochs'] ) );
@@ -236,6 +239,7 @@ class PigCache_WPDB extends wpdb {
 				return true;
 			}
 		}
+		// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 		if ( ! isset( $pack['epoch'] ) ) {
 			return false;
@@ -272,12 +276,14 @@ class PigCache_WPDB extends wpdb {
 			$ttl = PigCache_Sql_Cache::ttl();
 		}
 
+		// ── PRO_START ─────────────────────────────────────────────────────────────────
 		if ( class_exists( 'PigCache_Continuous_Learner', false ) ) {
 			$adaptive = PigCache_Continuous_Learner::adaptive_ttl( $exec_ms );
 			if ( null !== $adaptive ) {
 				$ttl = $adaptive;
 			}
 		}
+		// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 		$pack = array(
 			'last_result' => $this->last_result,
@@ -285,20 +291,27 @@ class PigCache_WPDB extends wpdb {
 			'return_val'  => $return_val,
 		);
 
+		// ── PRO_START ─────────────────────────────────────────────────────────────────
 		$table_epochs = $this->pigcache_resolve_table_epochs( $query );
 
 		if ( ! empty( $table_epochs ) ) {
 			$pack['table_epochs'] = $table_epochs;
-		} elseif ( class_exists( 'PigCache_Sql_Cache', false ) ) {
+		} else {
+		// ── PRO_END ───────────────────────────────────────────────────────────────────
+		if ( class_exists( 'PigCache_Sql_Cache', false ) ) {
 			$pack['epoch'] = PigCache_Sql_Cache::get_epoch();
 		} else {
 			// Drop-in loaded before plugin — skip caching this query.
 			return;
 		}
+		// ── PRO_START ─────────────────────────────────────────────────────────────────
+		} // end else (no table_epochs)
+		// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 		wp_cache_set( $key, $pack, 'pigcache_sql', $ttl );
 	}
 
+	// ── PRO_START ─────────────────────────────────────────────────────────────────
 	/**
 	 * Try to resolve per-table epochs for a query using the compiled profile.
 	 *
@@ -322,6 +335,7 @@ class PigCache_WPDB extends wpdb {
 
 		return array();
 	}
+	// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 	/**
 	 * Handle a successful mutation: bump only the mutated table's epoch when
@@ -330,6 +344,7 @@ class PigCache_WPDB extends wpdb {
 	 * @param string $trim Left-trimmed SQL of the mutating statement.
 	 */
 	private function pigcache_on_mutation( $trim ) {
+		// ── PRO_START ─────────────────────────────────────────────────────────────────
 		if ( class_exists( 'PigCache_Sql_Profiler', false )
 			&& PigCache_Sql_Profiler::has_profile()
 			&& class_exists( 'PigCache_Sql_Cache', false )
@@ -342,9 +357,11 @@ class PigCache_WPDB extends wpdb {
 			}
 		}
 
+		// ── PRO_END ───────────────────────────────────────────────────────────────────
 		$this->pigcache_bump_epoch();
 	}
 
+	// ── PRO_START ─────────────────────────────────────────────────────────────────
 	/**
 	 * Normalize a SQL query for analytics (replace literals with ?).
 	 *
@@ -374,6 +391,7 @@ class PigCache_WPDB extends wpdb {
 		}
 		return array_values( $tables );
 	}
+	// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 	/**
 	 * Global epoch bump fallback.

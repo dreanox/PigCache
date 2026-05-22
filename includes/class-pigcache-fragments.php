@@ -33,11 +33,13 @@ class PigCache_Fragments {
 
 		wp_cache_set( $safe_key, $data, $group, (int) $ttl );
 
+		// ── PRO_START ─────────────────────────────────────────────────────────────────
 		$tag_inv = class_exists( 'PigCache_Tag_Index', false );
 
 		if ( $tag_inv && ! empty( $tags ) ) {
 			PigCache_Tag_Index::store_tags( $safe_key, $group, $tags );
 		}
+		// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 		return $data;
 	}

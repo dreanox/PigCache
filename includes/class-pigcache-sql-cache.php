@@ -78,10 +78,12 @@ class PigCache_Sql_Cache {
 			wp_cache_set( $key, 2, self::GROUP_META, self::long_ttl() );
 		}
 
+		// ── PRO_START ─────────────────────────────────────────────────────────────────
 		// Record mutation for Adaptive TTL v2 stability tracking.
 		if ( class_exists( 'PigCache_Mutation_Tracker', false ) ) {
 			PigCache_Mutation_Tracker::record_mutation( $table );
 		}
+		// ── PRO_END ───────────────────────────────────────────────────────────────────
 	}
 
 	/**

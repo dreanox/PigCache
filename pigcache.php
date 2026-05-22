@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       PigCache
  * Description:       Redis object-cache drop-in with optional SQL, HTML page, and fragment caching.
- * Version: 1.0.5
+ * Version: 1.0.9
  * Requires at least: 5.8
  * Requires PHP:      7.4
  * Author:            PigCache
@@ -17,7 +17,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'PIGCACHE_VERSION', '1.0.5' );
+define( 'PIGCACHE_VERSION', '1.0.9' );
 define( 'PIGCACHE_FILE', __FILE__ );
 define( 'PIGCACHE_DIR', plugin_dir_path( __FILE__ ) );
 define( 'PIGCACHE_URL', plugin_dir_url( __FILE__ ) );
@@ -34,7 +34,6 @@ if ( ! defined( 'PIGCACHE_OC_VERSION' ) && ! empty( $oc_meta['Version'] ) ) {
 
 // Always loaded (Free + Pro).
 require_once PIGCACHE_DIR . 'includes/class-pigcache-config.php';
-require_once PIGCACHE_DIR . 'includes/class-pigcache-license.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-kv.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-sql-cache.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-html-cache.php';
@@ -49,6 +48,7 @@ require_once PIGCACHE_DIR . 'includes/class-pigcache-plugin.php';
 
 // Pro-only — present in the Pro build, absent in the Free build.
 foreach ( array(
+	'class-pigcache-license.php',
 	'class-pigcache-tag-collector.php',
 	'class-pigcache-tag-index.php',
 	'class-pigcache-environment.php',
@@ -75,6 +75,7 @@ register_activation_hook(
 	PIGCACHE_FILE,
 	static function () {
 		PigCache_Config::on_activate();
+		// ── PRO_START ─────────────────────────────────────────────────────────────────
 		if ( class_exists( 'PigCache_Tag_Index', false ) ) {
 			PigCache_Tag_Index::create_table();
 		}
@@ -95,6 +96,7 @@ register_activation_hook(
 		if ( class_exists( 'PigCache_Continuous_Learner', false ) ) {
 			PigCache_Continuous_Learner::schedule();
 		}
+		// ── PRO_END ───────────────────────────────────────────────────────────────────
 	}
 );
 
@@ -109,6 +111,7 @@ register_deactivation_hook(
 			PigCache_Dropin_Html_Cache::remove();
 		}
 
+		// ── PRO_START ─────────────────────────────────────────────────────────────────
 		if ( class_exists( 'PigCache_Cloud_Sync', false ) ) {
 			PigCache_Cloud_Sync::unschedule();
 		}
@@ -116,6 +119,7 @@ register_deactivation_hook(
 		if ( class_exists( 'PigCache_Continuous_Learner', false ) ) {
 			PigCache_Continuous_Learner::unschedule();
 		}
+		// ── PRO_END ───────────────────────────────────────────────────────────────────
 	}
 );
 
@@ -137,6 +141,7 @@ add_filter(
 );
 
 add_action( 'plugins_loaded', array( 'PigCache_Config', 'apply_extra_non_persistent_groups' ), 1 );
+// ── PRO_START ─────────────────────────────────────────────────────────────────
 if ( class_exists( 'PigCache_Updates', false ) ) {
 	add_action( 'plugins_loaded', array( 'PigCache_Updates', 'init' ), 5 );
 }
@@ -146,6 +151,7 @@ if ( class_exists( 'PigCache_Cloud_Sync', false ) ) {
 if ( class_exists( 'PigCache_Continuous_Learner', false ) ) {
 	add_action( 'plugins_loaded', array( 'PigCache_Continuous_Learner', 'init' ), 15 );
 }
+// ── PRO_END ───────────────────────────────────────────────────────────────────
 add_action( 'plugins_loaded', array( 'PigCache_Plugin', 'instance' ), 20 );
 
 /**
@@ -168,11 +174,14 @@ function pigcache_fragment( $key, $callback, $ttl = 60, $group = 'pigcache_fragm
  * @param string $tag  e.g. "widget:recent_posts", "custom:my_slider".
  */
 function pigcache_tag( $tag ) {
+	// ── PRO_START ─────────────────────────────────────────────────────────────────
 	if ( class_exists( 'PigCache_Tag_Collector', false ) ) {
 		PigCache_Tag_Collector::add( $tag );
 	}
+	// ── PRO_END ───────────────────────────────────────────────────────────────────
 }
 
+// ── PRO_START ─────────────────────────────────────────────────────────────────
 /**
  * Full path to the compiled SQL profiler profile (Pro only).
  *
@@ -185,3 +194,4 @@ function pigcache_sql_profile_path() {
 
 	return PigCache_Sql_Profiler::profile_path();
 }
+// ── PRO_END ───────────────────────────────────────────────────────────────────

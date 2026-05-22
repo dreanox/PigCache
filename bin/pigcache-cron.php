@@ -16,6 +16,12 @@
  *
  * @package PigCache
  */
+// ── PRO_START ─────────────────────────────────────────────────────────────────
+/**
+ * With log file (errors and verbose output appended to plugin root):
+ *   php .../pigcache/bin/pigcache-cron.php > /dev/null 2>> .../pigcache/pigcache-cron.log
+ */
+// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 // ── Safety ───────────────────────────────────────────────────────────────────
 
@@ -100,7 +106,7 @@ $kv_ready      = _pigcache_cron_table_exists( $db, $kv_table );
 // ── Resolve API credentials (reused by tasks + error sink) ───────────────────
 
 $api_url = rtrim( $cfg['PIGCACHE_CLOUD_API_URL'] ?? 'https://bluecache.pigworlds.com/api/v1', '/' );
-$api_key = $cfg['PIGCACHE_API_KEY']
+$api_key = ( $cfg['PIGCACHE_API_KEY'] ?? '' )
 	?: _pigcache_cron_get_option( $db, $options_table, 'pigcache_license_key' );
 $site_id = _pigcache_cron_get_option( $db, $options_table, 'pigcache_cloud_site_id' );
 // ── PRO_END ───────────────────────────────────────────────────────────────────
@@ -144,13 +150,14 @@ $run_send             = true;
 $run_cloud            = true;
 $run_mutation_harvest = true;
 $run_traffic_harvest  = true;
+$run_html_tier_report = true;
 
 foreach ( $argv ?? array() as $arg ) {
-	if ( $arg === '--flush-only'  ) { $run_send = false; $run_cloud = false; $run_mutation_harvest = false; $run_traffic_harvest = false; }
-	if ( $arg === '--send-only'   ) { $run_flush = false; $run_cloud = false; $run_mutation_harvest = false; $run_traffic_harvest = false; }
+	if ( $arg === '--flush-only'  ) { $run_send = false; $run_cloud = false; $run_mutation_harvest = false; $run_traffic_harvest = false; $run_html_tier_report = false; }
+	if ( $arg === '--send-only'   ) { $run_flush = false; $run_cloud = false; $run_mutation_harvest = false; $run_traffic_harvest = false; $run_html_tier_report = false; }
 	if ( $arg === '--no-cloud'    ) { $run_cloud = false; }
-	if ( $arg === '--cloud-only'  ) { $run_flush = false; $run_send = false; $run_mutation_harvest = false; $run_traffic_harvest = false; }
-	if ( $arg === '--no-adaptive' ) { $run_mutation_harvest = false; $run_traffic_harvest = false; }
+	if ( $arg === '--cloud-only'  ) { $run_flush = false; $run_send = false; $run_mutation_harvest = false; $run_traffic_harvest = false; $run_html_tier_report = false; }
+	if ( $arg === '--no-adaptive' ) { $run_mutation_harvest = false; $run_traffic_harvest = false; $run_html_tier_report = false; }
 }
 // ── PRO_END ───────────────────────────────────────────────────────────────────
 
@@ -390,6 +397,43 @@ if ( $run_traffic_harvest ) {
 		_pigcache_cron_log( 'traffic harvest — skipped (last run ' . round( ( time() - $last_traffic ) / 3600, 1 ) . 'h ago)' );
 	}
 }
+// ── TASK 6: Report HTML cache tier log → API ─────────────────────────────────
+
+if ( $run_html_tier_report && $api_key && $site_id ) {
+	$tier_log_raw = _pigcache_cron_get_option( $db, $options_table, 'pigcache_html_tier_log' );
+	$tier_log     = $tier_log_raw ? json_decode( $tier_log_raw, true ) : array();
+
+	if ( is_array( $tier_log ) && ! empty( $tier_log ) ) {
+		$counts      = array( 'hot_stable' => 0, 'hot_dynamic' => 0, 'cold' => 0 );
+		$hot_dynamic = array();
+		$hot_stable  = array();
+
+		foreach ( $tier_log as $entry ) {
+			$tier            = isset( $entry['tier'] ) ? $entry['tier'] : 'cold';
+			$counts[ $tier ] = ( isset( $counts[ $tier ] ) ? $counts[ $tier ] : 0 ) + 1;
+
+			if ( $tier === 'hot_dynamic' && count( $hot_dynamic ) < 20 ) {
+				$hot_dynamic[] = array( 'uri' => $entry['uri'], 'ttl' => (int) $entry['ttl'] );
+			}
+			if ( $tier === 'hot_stable' && count( $hot_stable ) < 20 ) {
+				$hot_stable[] = array( 'uri' => $entry['uri'], 'ttl' => (int) $entry['ttl'] );
+			}
+		}
+
+		_pigcache_cron_api_request( 'POST', $api_url . '/adaptive-ttl-report', $api_key, $site_id, array(
+			'tier_counts' => $counts,
+			'hot_dynamic' => $hot_dynamic,
+			'hot_stable'  => $hot_stable,
+			'total'       => count( $tier_log ),
+			'reported_at' => gmdate( 'c' ),
+		) );
+
+		_pigcache_cron_log( 'html tier report sent — ' . count( $tier_log ) . ' URIs (' . $counts['hot_stable'] . ' stable, ' . $counts['hot_dynamic'] . ' dynamic, ' . $counts['cold'] . ' cold)' );
+	} else {
+		_pigcache_cron_log( 'html tier report — no tier log yet' );
+	}
+}
+
 // ── PRO_END ───────────────────────────────────────────────────────────────────
 
 $elapsed = round( ( microtime( true ) - PIGCACHE_CRON_START ) * 1000 );

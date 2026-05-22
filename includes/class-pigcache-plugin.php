@@ -33,19 +33,23 @@ class PigCache_Plugin {
 
 		PigCache_Sql_Cache::init();
 
+		// ── PRO_START ─────────────────────────────────────────────────────────────────
 		if ( class_exists( 'PigCache_Sql_Profiler', false ) ) {
 			PigCache_Sql_Profiler::init();
 		}
+		// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 		PigCache_Html_Cache::init();
 		PigCache_Invalidation::init();
 
+		// ── PRO_START ─────────────────────────────────────────────────────────────────
 		if ( class_exists( 'PigCache_Continuous_Learner', false ) ) {
 			PigCache_Continuous_Learner::init();
 			if ( PigCache_Continuous_Learner::using_wp_cron_fallback() ) {
 				PigCache_Continuous_Learner::schedule();
 			}
 		}
+		// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 		if ( is_admin() ) {
 			PigCache_Admin::init();
@@ -78,6 +82,7 @@ class PigCache_Plugin {
 
 		require_once ABSPATH . 'wp-admin/includes/upgrade.php';
 
+		// ── PRO_START ─────────────────────────────────────────────────────────────────
 		// Per-table mutation frequency for Adaptive TTL v2.
 		dbDelta( "CREATE TABLE {$wpdb->prefix}pigcache_table_stability (
 			table_name      varchar(128)  NOT NULL,
@@ -96,6 +101,7 @@ class PigCache_Plugin {
 			PRIMARY KEY  (url_hash, period_start),
 			KEY idx_period (period_start)
 		) {$charset};" );
+		// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 		// General-purpose key-value store — bypasses object cache.
 		// Used for cron heartbeat timestamps, harvest metadata, and any
@@ -116,8 +122,10 @@ class PigCache_Plugin {
 	public static function drop_tables(): void {
 		global $wpdb;
 
+		// ── PRO_START ─────────────────────────────────────────────────────────────────
 		$wpdb->query( "DROP TABLE IF EXISTS {$wpdb->prefix}pigcache_table_stability" ); // phpcs:ignore
 		$wpdb->query( "DROP TABLE IF EXISTS {$wpdb->prefix}pigcache_url_traffic" );     // phpcs:ignore
+		// ── PRO_END ───────────────────────────────────────────────────────────────────
 		$wpdb->query( "DROP TABLE IF EXISTS {$wpdb->prefix}pigcache_kv" );              // phpcs:ignore
 
 		delete_option( self::DB_VERSION_OPTION );

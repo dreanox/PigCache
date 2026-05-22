@@ -18,6 +18,9 @@ class PigCache_Html_Cache {
 	const GROUP_HTML = 'pigcache_html';
 	const GROUP_META = 'pigcache';
 
+	/** True while our ob_start() buffer is open and not yet flushed. */
+	private static bool $buffering = false;
+
 	/**
 	 * Bootstrap hooks.
 	 */
@@ -104,10 +107,12 @@ class PigCache_Html_Cache {
 		$pack = self::get_pack();
 
 		if ( is_array( $pack ) && ! empty( $pack['html'] ) ) {
+			// ── PRO_START ─────────────────────────────────────────────────────────────────
 			// Record this HIT for Adaptive TTL traffic tracking (own-counter fallback).
 			if ( class_exists( 'PigCache_Traffic_Reader', false ) ) {
 				PigCache_Traffic_Reader::record_hit( self::cache_key(), self::request_uri() );
 			}
+			// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 			echo $pack['html']; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
 			exit;
@@ -120,13 +125,28 @@ class PigCache_Html_Cache {
 			return;
 		}
 
+		// ── PRO_START ─────────────────────────────────────────────────────────────────
 		$tag_inv = class_exists( 'PigCache_Tag_Index', false );
 
 		if ( $tag_inv && class_exists( 'PigCache_Tag_Collector', false ) ) {
 			PigCache_Tag_Collector::start();
 		}
+		// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 		ob_start( array( __CLASS__, 'ob_callback' ) );
+		self::$buffering = true;
+		add_action( 'shutdown', array( __CLASS__, 'end_buffer' ), 0 );
+	}
+
+	/**
+	 * Explicitly close the output buffer at WordPress shutdown.
+	 * Paired with the ob_start() in maybe_start_buffer() to satisfy
+	 * WordPress.org's requirement that every ob_start() has an explicit close.
+	 */
+	public static function end_buffer(): void {
+		if ( self::$buffering && ob_get_level() > 0 ) {
+			ob_end_flush();
+		}
 	}
 
 	/**
@@ -134,15 +154,19 @@ class PigCache_Html_Cache {
 	 * @return string
 	 */
 	public static function ob_callback( $html ) {
+		self::$buffering = false;
+
 		if ( $html === '' ) {
 			self::release_lock();
 			return $html;
 		}
 
 		$tags = array();
+		// ── PRO_START ─────────────────────────────────────────────────────────────────
 		if ( class_exists( 'PigCache_Tag_Collector', false ) && PigCache_Tag_Collector::is_active() ) {
 			$tags = PigCache_Tag_Collector::stop();
 		}
+		// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 		$base = class_exists( 'PigCache_Config', false )
 			? PigCache_Config::get_html_cache_ttl()
@@ -153,12 +177,14 @@ class PigCache_Html_Cache {
 			$ttl = $base > 0 ? $base : 60;
 		}
 
+		// ── PRO_START ─────────────────────────────────────────────────────────────────
 		// Adaptive TTL v2 — overrides static TTL when enabled and data is available.
 		if ( class_exists( 'PigCache_Adaptive_Ttl', false ) ) {
 			$adaptive = PigCache_Adaptive_Ttl::decide( self::request_uri(), $tags );
 
 			if ( 0 === $adaptive ) {
 				// ❄️ Cold — skip caching entirely.
+				self::log_tier_decision( self::request_uri(), 0, $tags );
 				self::release_lock();
 				return $html;
 			}
@@ -166,9 +192,11 @@ class PigCache_Html_Cache {
 			if ( $adaptive > 0 ) {
 				// Hot + Stable or Hot + Dynamic tier.
 				$ttl = $adaptive;
+				self::log_tier_decision( self::request_uri(), $adaptive, $tags );
 			}
 			// $adaptive === -1 → no data yet or disabled → keep static $ttl.
 		}
+		// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 		$key = self::cache_key();
 
@@ -180,11 +208,13 @@ class PigCache_Html_Cache {
 
 		wp_cache_set( $key, $pack, self::GROUP_HTML, $ttl );
 
+		// ── PRO_START ─────────────────────────────────────────────────────────────────
 		$tag_inv = class_exists( 'PigCache_Tag_Index', false );
 
 		if ( $tag_inv && ! empty( $tags ) ) {
 			PigCache_Tag_Index::store_tags( $key, self::GROUP_HTML, $tags );
 		}
+		// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 		self::release_lock();
 
@@ -322,4 +352,53 @@ class PigCache_Html_Cache {
 	public static function flush_all() {
 		wp_cache_flush_group( self::GROUP_HTML );
 	}
+
+	// ── PRO_START ─────────────────────────────────────────────────────────────────
+	/**
+	 * Record the adaptive TTL tier decision for a URI in wp_options.
+	 * The cron harvests this log and reports it to the PigCache API.
+	 * Deduplicates by URI and throttles to one write per URI per hour.
+	 *
+	 * @param string   $uri  Request URI.
+	 * @param int      $ttl  Assigned TTL (0 = cold, >0 = hot tier).
+	 * @param string[] $tags Tags collected during render.
+	 */
+	private static function log_tier_decision( string $uri, int $ttl, array $tags ): void {
+		if ( ! class_exists( 'PigCache_Adaptive_Ttl', false ) ) {
+			return;
+		}
+
+		$tier = 'cold';
+		if ( $ttl > 0 ) {
+			$tier = $ttl >= PigCache_Adaptive_Ttl::ttl_hot_stable() ? 'hot_stable' : 'hot_dynamic';
+		}
+
+		$log = get_option( 'pigcache_html_tier_log', array() );
+		if ( ! is_array( $log ) ) {
+			$log = array();
+		}
+
+		$key = md5( $uri );
+
+		// Throttle: skip if same URI was logged in the last hour.
+		if ( isset( $log[ $key ] ) && ( time() - $log[ $key ]['time'] ) < 3600 ) {
+			return;
+		}
+
+		$log[ $key ] = array(
+			'uri'  => $uri,
+			'tier' => $tier,
+			'ttl'  => $ttl,
+			'time' => time(),
+		);
+
+		// Keep the 500 most recently seen URIs.
+		if ( count( $log ) > 500 ) {
+			uasort( $log, static function ( $a, $b ) { return $a['time'] - $b['time']; } );
+			$log = array_slice( $log, -500, null, true );
+		}
+
+		update_option( 'pigcache_html_tier_log', $log, false );
+	}
+	// ── PRO_END ───────────────────────────────────────────────────────────────────
 }

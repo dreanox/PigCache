@@ -160,8 +160,23 @@ build_zip() {
     done
 
     # Strip PRO_START…PRO_END blocks from dual-source files.
+    for _pro_file in \
+      "${staging}/pigcache.php" \
+      "${staging}/includes/class-pigcache-admin.php" \
+      "${staging}/includes/class-pigcache-html-cache.php" \
+      "${staging}/includes/class-pigcache-invalidation.php" \
+      "${staging}/includes/class-pigcache-wpdb.php" \
+      "${staging}/includes/class-pigcache-fragments.php" \
+      "${staging}/includes/class-pigcache-sql-cache.php" \
+      "${staging}/includes/class-pigcache-plugin.php" \
+    ; do
+      sed -i '/\/\/ ── PRO_START/,/\/\/ ── PRO_END/d' "${_pro_file}"
+    done
+    unset _pro_file
+
+    # Strip PRO_START…PRO_END blocks from readme.txt (changelog entries).
     sed -i '/\/\/ ── PRO_START/,/\/\/ ── PRO_END/d' \
-      "${staging}/includes/class-pigcache-admin.php"
+      "${staging}/readme.txt"
   fi
 
   # ---- Inject cron script (bin/ is excluded from rsync via .distignore) ------
