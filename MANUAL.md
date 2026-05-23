@@ -846,20 +846,25 @@ pip3 install --user redis PyMySQL
 
 #### Sin pip / cPanel bloqueado
 
-El script tiene un **fallback de stdlib pura para Redis**: si `redis-py` no está
-instalado, usa un cliente RESP interno hecho a mano con solo `socket`. Esto
-significa que `snapshot`, `breakdown`, `hot-keys`, `stampede`, `health`,
-`watch` y `log-line` funcionan **sin instalar nada** mientras tengas Python 3.
+El script tiene **dos fallbacks de stdlib pura** para que funcione sin
+instalar ni un solo paquete Python:
 
-Solo el subcomando `mysql` (y la sección MySQL de `snapshot` / `health`)
-requiere un driver Python para MySQL. Si no hay PyMySQL ni
-`mysql-connector-python`, basta con añadir `--skip-mysql` y, en paralelo,
-correr en cron algo como:
+* **Redis**: si `redis-py` no está instalado, usa un cliente RESP interno
+  hecho a mano con `socket` (driver reportado como `stdlib-bare`).
+* **MySQL**: si ni `PyMySQL` ni `mysql-connector-python` están instalados,
+  hace `subprocess.run(["mariadb", ...])` (o `mysql`) y parsea el output
+  tab-separado de `SHOW GLOBAL STATUS` / `SHOW VARIABLES`. El binario se
+  auto-detecta vía `shutil.which()` con paths típicos de cPanel
+  (`/usr/bin/mariadb`, `/opt/cpanel/ea-mariadb*/bin/mariadb`, etc.).
+  Override manual: `--mysql-cli /ruta/al/mariadb`.
 
-```bash
-mysqladmin -h localhost -u USER -pPASS extended-status \
-    | grep -E 'Threads_(connected|running)|Max_used_connections|Aborted_(connects|clients)|Connection_errors'
-```
+Resultado: **TODOS** los subcomandos (`snapshot`, `health`, `breakdown`,
+`hot-keys`, `stampede`, `mysql`, `watch`, `log-line`, `report --push`)
+funcionan en un cPanel bloqueado con solo Python 3 + el binario `mariadb`
+(que ya viene siempre en los hosts compartidos).
+
+La contraseña al CLI nunca aparece en `ps` — se pasa por la variable de
+entorno `MYSQL_PWD` (la forma documentada por MySQL/MariaDB).
 
 Diagnóstico rápido de qué hay en el cPanel:
 
@@ -892,6 +897,7 @@ Caminos en orden de preferencia si pip falta:
 | `mysql` | Solo MySQL: `Threads_connected`, `Max_used_connections`, `Aborted_clients`, `Connection_errors_max_connections`, `Slow_queries` y `processlist` por estado. Respuesta directa al "Error establishing a database connection". |
 | `stampede` | Lista las keys `pigcache_lock_*` activas. Si hay muchas, hay regeneraciones en cola (cache MISS en páginas hot y/o DB lenta). |
 | `log-line` | Una sola línea compacta con las métricas clave. Ideal para `>> archivo.log 2>&1` y analizar con `grep`/`awk` o ingestar en cualquier monitor que tail-ee logs. |
+| `report` | Arma un payload JSON con TODO (snapshot + breakdown + stampede + mysql + alerts) y opcionalmente lo **manda al API** vía `POST` con los mismos headers de auth que el `bin/pigcache-cron.php` (`Authorization: Bearer ...` + `X-Site-Id: ...`). Útil para alimentar dashboards remotos y para que el backend tome decisiones (TTL adaptivo, alertas, autoscaling). |
 
 #### Flags comunes (sirven en todos los subcomandos)
 
@@ -915,24 +921,160 @@ Reemplaza `/home/USER` por tu home real y la ruta del plugin.
 
 ```cron
 # Cada minuto: una línea compacta para tail / grep
-* * * * * /usr/bin/python3 /home/USER/public_html/wp-content/plugins/pigcache/cli/pigcache-monitor.py \
-    log-line --wp-config /home/USER/public_html/wp-config.php \
-    >> /home/USER/logs/pigcache-monitor.log 2>&1
+* * * * * /usr/bin/python3 /home/USER/public_html/wp-content/plugins/pigcache/cli/pigcache-monitor.py log-line --wp-config /home/USER/public_html/wp-config.php >> /home/USER/logs/pigcache-monitor.log 2>&1
 
 # Cada 5 minutos: health check, cPanel envía email si exit != 0
-*/5 * * * * /usr/bin/python3 /home/USER/public_html/wp-content/plugins/pigcache/cli/pigcache-monitor.py \
-    health --wp-config /home/USER/public_html/wp-config.php
+*/5 * * * * /usr/bin/python3 /home/USER/public_html/wp-content/plugins/pigcache/cli/pigcache-monitor.py health --wp-config /home/USER/public_html/wp-config.php
 
 # Cada hora: breakdown por grupo en JSON (histórico de cómo se distribuye la memoria)
-0 * * * * /usr/bin/python3 /home/USER/public_html/wp-content/plugins/pigcache/cli/pigcache-monitor.py \
-    breakdown --wp-config /home/USER/public_html/wp-config.php --json \
-    >> /home/USER/logs/pigcache-breakdown.jsonl 2>&1
+0 * * * * /usr/bin/python3 /home/USER/public_html/wp-content/plugins/pigcache/cli/pigcache-monitor.py breakdown --wp-config /home/USER/public_html/wp-config.php --json >> /home/USER/logs/pigcache-breakdown.jsonl 2>&1
 
 # Cada 6 horas: top 20 keys más grandes (para detectar bloat)
-0 */6 * * * /usr/bin/python3 /home/USER/public_html/wp-content/plugins/pigcache/cli/pigcache-monitor.py \
-    hot-keys --wp-config /home/USER/public_html/wp-config.php --top 20 \
-    >> /home/USER/logs/pigcache-hotkeys.log 2>&1
+0 */6 * * * /usr/bin/python3 /home/USER/public_html/wp-content/plugins/pigcache/cli/pigcache-monitor.py hot-keys --wp-config /home/USER/public_html/wp-config.php --top 20 >> /home/USER/logs/pigcache-hotkeys.log 2>&1
 ```
+
+#### `report` — payload completo y push al API
+
+El subcomando `report` arma un snapshot completo en JSON y opcionalmente lo
+envía al backend, reutilizando exactamente el mismo flujo de autenticación
+que `bin/pigcache-cron.php`:
+
+* **wp-config.php**: si no le pasas `--wp-config`, el script camina hacia
+  arriba desde `cli/` (hasta 6 niveles) buscando `wp-config.php`, igual que
+  el cron PHP.
+* **API URL**: `--api-url` → `PIGCACHE_CLOUD_API_URL` de wp-config → default
+  `https://bluecache.pigworlds.com/api/v1`.
+* **API key**: `--api-key` → `PIGCACHE_API_KEY` constante → opción
+  `pigcache_license_key` en `wp_options`.
+* **Site ID**: `--site-id` → opción `pigcache_cloud_site_id` en `wp_options`.
+* **HTTP**: `urllib.request` (stdlib), `Content-Type: application/json`,
+  `Authorization: Bearer <api_key>`, `X-Site-Id: <site_id>`, timeout 20s.
+
+Por defecto el endpoint es `/sites/{site_id}/monitor-snapshot` (`{site_id}`
+se reemplaza al vuelo). Cámbialo con `--endpoint /tu/ruta` o
+`--endpoint /sites/{site_id}/health-report`.
+
+##### Esquema del payload (schema_version: 1)
+
+```json
+{
+  "schema_version": 1,
+  "monitor_version": "1.0.0",
+  "captured_at": "2026-05-22T23:33:07.080267Z",
+  "site": {
+    "site_url": "https://example.com",
+    "site_id":  "site_demo_123",
+    "table_prefix": "wp_",
+    "wp_config_path": "/home/USER/public_html/wp-config.php"
+  },
+  "monitor": {
+    "python_version": "3.6.8",
+    "redis_driver": "redis-py | stdlib-bare",
+    "hostname": "bh8972.hostingcpanel.example",
+    "user": "bvkegbla"
+  },
+  "redis": {
+    "endpoint": { "host": "127.0.0.1", "port": 6379, "db": 5, "driver": "..." },
+    "redis_version": "7.4.9",
+    "ping_p50_ms": 0.21, "ping_max_ms": 0.41,
+    "uptime_seconds": 12345,
+    "connected_clients": 14, "blocked_clients": 0, "maxclients": 10000,
+    "instantaneous_ops_per_sec": 1830,
+    "keyspace_hits": 4823155, "keyspace_misses": 412009,
+    "hit_ratio_pct": 92.13,
+    "evicted_keys": 0, "expired_keys": 9831,
+    "used_memory_bytes": 67108864, "used_memory_human": "64M",
+    "maxmemory_bytes": 2147483648, "maxmemory_policy": "allkeys-lru",
+    "maxmemory_fill_pct": 3.12,
+    "rejected_connections": 0,
+    "mem_fragmentation_ratio": 1.07,
+    "dbsize": 18420,
+    "slowlog_top5": [ { "duration_us": 12500, "command": "..." } ]
+  },
+  "circuit_breaker": { "open": false, "age_seconds": null, "path": "/tmp/pigcache_cb_*.flag" },
+  "mysql": {
+    "threads_connected": 87, "threads_running": 4,
+    "max_connections": 150, "max_used_connections": 142,
+    "conn_saturation_pct": 58.0, "peak_saturation_pct": 94.67,
+    "aborted_clients": 0, "aborted_connects": 12,
+    "connection_errors_max_connections": 0,
+    "slow_queries": 38, "qps_avg_since_boot": 1247.3,
+    "processlist_total": 87,
+    "processlist_by_command": { "Sleep": 65, "Query": 22 }
+  },
+  "breakdown": {
+    "scanned_keys": 18420, "scan_capped_at": 20000, "pattern": "ab12:*",
+    "groups": [
+      { "group": "pigcache_html",      "key_count": 5230, "no_ttl_pct": 0.0,   "avg_ttl_s": 178, "avg_bytes_sampled": 28432, "est_total_bytes": 148... },
+      { "group": "pigcache_sql",       "key_count": 9100, "no_ttl_pct": 0.0,   "avg_ttl_s": 119, "avg_bytes_sampled": 1420,  "est_total_bytes": ... },
+      { "group": "options",            "key_count": 1240, "no_ttl_pct": 100.0, "avg_ttl_s": null, ... }
+    ]
+  },
+  "stampede": { "active_lock_count": 3, "locks": [ {"key": "...", "ttl": 18} ] },
+  "alerts": [
+    { "severity": "warn", "code": "low_hit_ratio", "msg": "..." }
+  ]
+}
+```
+
+##### Flags
+
+```
+--push                       POST el payload al API (sin esto, es dry-run)
+--api-url URL                Override de la base URL del API
+--api-key KEY                Override de la API key
+--site-id ID                 Override del site ID
+--endpoint PATH              Override del path; soporta {site_id}
+                             (default: /sites/{site_id}/monitor-snapshot)
+--save PATH                  Escribe el payload JSON a un archivo local
+--quiet                      No imprime el JSON en stdout
+--no-breakdown               Omite el SCAN por grupos (más rápido)
+--no-stampede                Omite el scan de pigcache_lock_*
+--http-timeout 20            Timeout HTTP del POST
+```
+
+##### Ejemplos de cron
+
+```cron
+# Cada 5 min: snapshot completo enviado al API, sin output local
+*/5 * * * * /usr/bin/python3 /home/USER/public_html/wp-content/plugins/pigcache/cli/pigcache-monitor.py report --push --quiet >> /home/USER/logs/pigcache-report.err 2>&1
+
+# Cada minuto: solo guardar localmente (sin push) — útil si no tienes API
+* * * * * /usr/bin/python3 /home/USER/public_html/wp-content/plugins/pigcache/cli/pigcache-monitor.py report --save /home/USER/logs/pigcache-last.json --quiet 2>&1
+
+# Cada 15 min: push Y archivar histórico
+*/15 * * * * /usr/bin/python3 /home/USER/public_html/wp-content/plugins/pigcache/cli/pigcache-monitor.py report --push --save /home/USER/logs/pigcache-$(date +\%Y\%m\%d-\%H\%M).json --quiet
+```
+
+Nota: al correr el script desde `wp-content/plugins/pigcache/cli/`, omitir
+`--wp-config` funciona porque el auto-discovery encuentra el archivo
+automáticamente.
+
+##### Endpoint del lado del backend (PigCache API)
+
+Para que el push sirva, el backend debe exponer:
+
+```
+POST /api/v1/sites/{site_id}/monitor-snapshot
+Headers: Authorization: Bearer <api_key>
+         X-Site-Id: <site_id>
+         Content-Type: application/json
+Body:    <schema_version: 1 payload>
+Returns: 2xx para aceptar, 4xx/5xx para que el monitor exit 4 (alerta cron)
+```
+
+Casos de uso típicos en el backend:
+
+* **Auto-tuning de Adaptive TTL**: si `redis.hit_ratio_pct` cae bajo un
+  umbral o `mysql.conn_saturation_pct` sube, el backend puede subir el TTL
+  base que sirve al perfil compilado del sitio.
+* **Alertas**: el array `alerts` ya viene pre-calculado con severidades
+  `info`/`warn`/`critical` y un `code` estable, listo para encolarlo en
+  PagerDuty/Slack/email.
+* **Detección de bloat**: `breakdown.groups` con `no_ttl_pct=100%` y
+  `est_total_bytes` alto identifica plugins que están metiendo basura sin TTL.
+* **Forensics de outages**: `circuit_breaker.open=true` con `age_seconds`
+  bajo significa que el dropin acaba de marcar Redis como caído.
 
 #### Diagnóstico de "Error establishing a database connection"
 
@@ -1000,6 +1142,186 @@ define( 'PIGCACHE_REDIS_RETRY_INTERVAL', 15 );
 // Falla con elegancia (el sitio sigue funcionando sin cache si Redis muere):
 define( 'PIGCACHE_REDIS_GRACEFUL', true );
 ```
+
+### Cómo se complementan `pigcache-cron.php` y `pigcache-monitor.py`
+
+Los dos scripts envían telemetría al mismo backend pero **observan capas
+diferentes**. Combinados dan a la API la información completa para tomar
+decisiones automatizadas (ajuste de TTLs, alertas, throttling, recomendaciones
+de configuración).
+
+#### División de responsabilidades
+
+| Aspecto | `bin/pigcache-cron.php` | `cli/pigcache-monitor.py` |
+|---|---|---|
+| **Capa** | Aplicación (lo que el plugin observó) | Infra (estado real de Redis + MySQL) |
+| **Necesita WP** | No (lee `wp-config.php` por regex) | No (lee `wp-config.php` por regex) |
+| **Frecuencia típica** | 5–15 min | 1–5 min |
+| **Origen de datos** | `wp_pigcache_query_stats`, `wp_pigcache_sql_fingerprints`, `wp_pigcache_table_stability`, `wp_pigcache_url_traffic`, `pigcache_html_tier_log`, `wp_options` | `INFO`, `DBSIZE`, `SCAN`, `MEMORY USAGE`, `SLOWLOG`, `SHOW GLOBAL STATUS`, `SHOW VARIABLES` |
+| **Reporta al API** | `POST /query-stats`, `/sites/{id}/environment`, `/sites/{id}/fingerprints`, `/cron-error`, `/adaptive-ttl-report` | `POST /<endpoint custom>` con un payload `schema_version: 1` que contiene `redis`, `circuit_breaker`, `mysql`, `breakdown`, `stampede`, `alerts` |
+| **Descarga del API** | Perfil SQL compilado → `wp-content/pigcache-sql-profile.php` | Nada (solo emite) |
+| **Modifica MySQL** | Sí (escribe stats, marca rows como `synced_at`, almacena `pigcache_traffic_map`/`pigcache_stability_map` como transients) | No (todo es read-only) |
+| **Modifica Redis** | Lee y borra el buffer `pigcache_qbuf:*` (consume y vacía) | No toca Redis (todo `INFO`/`SCAN`/`MEMORY USAGE`) |
+| **Latencia tolerada** | Lento OK (cada 15 min) | Rápido (cron de 1 min no puede tardar más de pocos segundos) |
+| **Falla típica** | "No envió fingerprints" / "Profile vacío" | "Redis caído", "MySQL saturado", "Hit ratio cayó" |
+
+Regla mental: si tu pregunta es *"¿qué consultas SQL está haciendo este sitio?"*
+mirá el cron; si es *"¿por qué el sitio va lento ahora mismo?"* mirá el monitor.
+
+#### Esquema combinado del payload
+
+El backend, al recibir el snapshot del monitor (`POST` con `Authorization:
+Bearer …` + `X-Site-Id: …`), puede cruzarlo con los datos que el cron ya
+acumuló para ese mismo `site_id`. Las claves de cross-reference son:
+
+| Clave en cron | Clave en monitor | Ejemplo de join |
+|---|---|---|
+| `wp_pigcache_query_stats.normalized` | `redis.keyspace["pigcache_sql"]` count | "Cliente tiene 12,000 templates únicos pero solo 800 keys SQL en Redis → invalidaciones por epoch demasiado agresivas" |
+| `wp_pigcache_table_stability` mutations | `mysql.threads_connected`, `slow_queries` | "Tabla X mutó 50k veces hoy + 11k slow queries → recomendar índice" |
+| `pigcache_html_tier_log.hot_dynamic` | `redis.breakdown["pigcache_html"].avg_ttl` | "URI marcado hot_dynamic pero su TTL real es 60s → Adaptive TTL no se aplicó, profile desactualizado" |
+| `wp_pigcache_url_traffic.hit_count` | `redis.breakdown["pigcache_html"].keys` | "Top-10 URLs por tráfico no están en cache → revisar gating" |
+| Errores en `wp_pigcache_kv.cron_last_error` | `alerts[].code == "redis_circuit_open"` | "Cron lleva 3 ciclos fallando + breaker abierto → autenticación, no Redis" |
+
+#### Matriz de decisión — qué hacer ante cada señal
+
+El backend puede automatizar respuestas basándose en `alerts[].code` del monitor
+combinado con los datos del cron. Esta tabla es la fuente de la verdad para
+implementar el sistema de recomendaciones / notificaciones:
+
+| Señal del monitor | Confirmar con (cron) | Diagnóstico | Acción automatizable |
+|---|---|---|---|
+| `redis_circuit_open` | `cron_last_error` reciente con `"context":"redis"` | Redis estuvo down ≥ `RETRY_INTERVAL` | Email "Redis caído"; abrir incidente si > 5 min |
+| `redis_circuit_open` (sin cron error) | Cron OK pero monitor falla | Firewall / iptables entre WP-PHP y Redis | Notificar al hoster (cPanel) |
+| `redis_latency_high` (>50 ms PING) | `breakdown.dbsize_total` > 500k | Redis CPU-bound o swap | Sugerir `maxmemory-policy=allkeys-lru` + reducir keyspace |
+| `low_hit_ratio` (<80%) + `redis.keyspace_hits` creciendo | `pigcache_html_tier_log` mostrando muchos `cold` | Adaptive TTL marca casi todo como frío | Forzar `pigcache_html_ttl` mínimo más alto vía filtro remoto |
+| `low_hit_ratio` + DBSIZE bajo | `query_stats` con `hit_count` alto en pocos templates | Las queries top se invalidan demasiado | Revisar mutaciones de la tabla → ¿necesita per-table epoch? |
+| `no_maxmemory` | `breakdown.total_bytes` > 70% de la RAM del nodo | Riesgo de OOM kill del proceso Redis | Bloquear nuevas writes hasta que el hoster configure `maxmemory` |
+| `memory_pressure` (>90%) + `policy_noeviction` | `breakdown` muestra grupo dominante (ej. `posts` 60%) | Grupo creció sin control | Lanzar `wp_cache_flush_group("posts")` remoto + alertar |
+| `policy_noeviction` solo | n/a | Configuración subóptima | Recomendar `allkeys-lru` (no es urgente) |
+| `rejected_connections` > 0 | `slowlog` con comandos largos | Pico de tráfico + comandos lentos | Sugerir subir `maxclients`; revisar `KEYS *` rogue |
+| `stampede_locks_high` (>25) | `query_stats.max_exec_ms` alto en queries de portada | Página pesada regenerándose en paralelo | Subir `pigcache_lock_ttl_seconds` a 20; activar adaptive TTL más agresivo |
+| `mysql_conn_saturation` (>80%) | `pigcache_url_traffic` mostrando spike de URLs sin cache | Demasiados misses cayendo a MySQL | Webhook al sitio para activar modo "high-load" (TTL más largo, gating relajado) |
+| `mysql_max_conn_errors` >0 | Cualquier error | MySQL rechazó conexiones nuevas | Crítico → SMS / PagerDuty; sugerir bajar `wait_timeout` o subir `max_connections` |
+
+#### Casos de uso del backend
+
+##### 1. Auto-tuning de TTL del HTML cache
+
+```
+Datos:
+  - cron: pigcache_html_tier_log con distribución hot_stable/hot_dynamic/cold
+  - cron: wp_pigcache_url_traffic top 1000 URLs por hits
+  - monitor: redis.breakdown["pigcache_html"]{keys, total_bytes, avg_ttl}
+  - monitor: redis.maxmemory_fill_pct
+
+Regla:
+  SI maxmemory_fill_pct > 80 Y avg_ttl > 1800
+    → API responde con "ttl_recommendation": 600
+    → el plugin lo lee en el siguiente cron y aplica via filtro pigcache_html_ttl
+  SI hot_dynamic > 60% AND avg_ttl < 300
+    → API responde con "ttl_recommendation": 900 (las páginas dinámicas son las dominantes)
+```
+
+##### 2. Detección de "tabla problemática"
+
+```
+Datos:
+  - cron: wp_pigcache_table_stability (mutaciones/h por tabla)
+  - cron: query_stats con tables_json y max_exec_ms
+  - monitor: mysql.slow_queries, mysql.threads_running
+
+Regla:
+  SI tabla T tiene >10k mutaciones/h AND query_stats[T].max_exec_ms > 1000
+    → notificar al cliente: "wp_postmeta crece sin freno + queries lentas;
+       considera limpiar postmeta huérfano"
+  SI mysql.slow_queries crece >100/min AND no hay tabla con stability >5k
+    → no es PigCache, problema externo (¿plugin nuevo? ¿bot scraping?)
+```
+
+##### 3. Alerta de "circuit breaker aleteando"
+
+```
+Datos:
+  - monitor: alerts contiene redis_circuit_open
+  - monitor: circuit_breaker.age_seconds < 60 en 3 reportes seguidos
+  - cron: wp_pigcache_kv.cron_last_error
+
+Regla:
+  SI 3 reportes consecutivos abren breaker dentro de los 5 min
+    → Redis está flapping (DOWN brevemente y volviendo)
+    → posible memoria insuficiente del nodo Redis, OOM kill
+    → SMS al admin: revisar `dmesg | grep -i redis`
+```
+
+##### 4. Recomendación automática de `--sample-cap` óptimo
+
+```
+Datos:
+  - monitor: breakdown.dbsize_total, coverage_pct, sample_cap_resolved
+
+Regla:
+  SI coverage_pct < 5
+    → API responde con "monitor_recommendation": {
+         "sample_cap": <dbsize_total // 10>,
+         "frequency": "cada 15 min en vez de 5"
+       }
+    → admin del sitio ve el aviso en su dashboard
+```
+
+##### 5. Healthcheck combinado para el dashboard del backend
+
+```
+Datos:
+  - monitor: alerts[]
+  - cron: cron_flush_last, cron_send_last (heartbeats en wp_pigcache_kv)
+
+Estado del sitio = peor de:
+  - cron_flush_last < (NOW - 30 min) → "cron stalled" CRITICAL
+  - cron_send_last  < (NOW - 60 min) → "no telemetry"  WARN
+  - alerts[severity=critical] presente → CRITICAL
+  - alerts[severity=warn] presente    → WARN
+  - sin alerts                        → OK
+```
+
+##### 6. Webhook para flush selectivo desde el API
+
+Cuando el backend detecta (vía monitor) que un grupo concreto está
+saturando memoria, puede pedir al sitio que purgue ESE grupo:
+
+```php
+// El plugin escucha un endpoint webhook (Pro). Pseudocódigo:
+add_action( 'rest_api_init', function () {
+    register_rest_route( 'pigcache/v1', '/admin-action', [
+        'methods'  => 'POST',
+        'permission_callback' => 'pigcache_verify_api_signature',
+        'callback' => function ( $req ) {
+            $action = $req->get_param( 'action' );
+            $group  = sanitize_key( $req->get_param( 'group' ) );
+
+            if ( 'flush_group' === $action && $group ) {
+                wp_cache_flush_group( $group );  // surgical
+                return [ 'ok' => true, 'flushed' => $group ];
+            }
+            // ... más acciones: bump_epoch, set_ttl_override, etc.
+        },
+    ] );
+} );
+```
+
+#### Para implementar todo esto en el backend
+
+1. Definir un endpoint `POST /sites/{id}/monitor-report` que acepte el
+   schema del monitor (ver sección anterior).
+2. Persistir cada snapshot en una tabla `monitor_reports` con `captured_at`
+   indexado — sirve para detectar tendencias (¿el hit ratio cae los lunes?).
+3. Cruzar con `query_stats` y `table_stability` ya almacenados por el cron
+   en `pigcache-cron.php` para validar/correlacionar alertas (ej. confirmar
+   `mysql_conn_saturation` con un spike de inserts en `wp_options`).
+4. Responder a `POST /query-stats` y `POST /monitor-report` con un payload
+   opcional `recommendations: [...]` que el plugin lea y aplique vía filtros
+   (`pigcache_html_ttl`, `pigcache_sql_cache_ttl`, etc).
+5. Las acciones más invasivas (flush, bump epoch) requieren un webhook
+   firmado, no son respuesta del POST.
 
 ### WP-CLI (futuro)
 
