@@ -47,6 +47,50 @@ The same `report` payload can also be kept on disk for offline analysis:
 
     python3 pigcache-monitor.py report --save /home/USER/logs/pigcache-$(date +%Y%m%d-%H%M).json --push --quiet
 
+Sizing the SCAN sample
+----------------------
+
+`report` and `breakdown` walk Redis via SCAN to compute the per-group memory
+breakdown. By default they scan up to 20,000 keys (`--sample-cap 20000`),
+which on a 700k-key database means ~2.8 % coverage — fine for trends, but
+inaccurate per-group totals get extrapolated from a tiny sample.
+
+For accurate numbers, point `--sample-cap` at your real DBSIZE. Three ways
+(all work via either the redis-py driver OR the stdlib-bare fallback):
+
+    # ── 0) Quick check: how many keys does this Redis hold right now? ─
+    #     (DBSIZE is global to the Redis DB you connect to; PigCache uses
+    #      whatever PIGCACHE_REDIS_DATABASE points at in wp-config.php.)
+    python3 pigcache-monitor.py snapshot --skip-mysql --json | python3 -c "import json,sys;d=json.load(sys.stdin);print('dbsize:',d['redis']['dbsize'])"
+
+    # ── 1) Easy mode: scan EVERYTHING (cap auto-resolves to DBSIZE) ────
+    #     For a 1M-key Redis this typically runs in ~2-4 s and gives you
+    #     100% coverage. Use this when you want trustworthy per-group bytes.
+    python3 pigcache-monitor.py report --sample-cap auto --quiet --save /home/USER/logs/pigcache-$(date +%Y%m%d-%H%M).json
+
+    # ── 2) Percentage of DBSIZE (sample 25% of the keyspace) ──────────
+    python3 pigcache-monitor.py report --sample-cap pct:25 --quiet --save /home/USER/logs/pigcache-$(date +%Y%m%d-%H%M).json
+
+    # ── 3) Explicit number, with k/m shorthand ────────────────────────
+    python3 pigcache-monitor.py report --sample-cap 200k --quiet --save /home/USER/logs/pigcache-$(date +%Y%m%d-%H%M).json
+    python3 pigcache-monitor.py report --sample-cap 1m   --quiet --save /home/USER/logs/pigcache-$(date +%Y%m%d-%H%M).json
+
+The resulting JSON always reports the actual coverage so you can tell what
+you got:
+
+    "breakdown": {
+      "dbsize_total":         705679,
+      "scanned_keys":         705679,
+      "coverage_pct":         100.0,
+      "sample_cap_requested": "auto",
+      "sample_cap_resolved":  705679,
+      ...
+    }
+
+Rule of thumb: for ad-hoc analysis use `--sample-cap auto`; for high-frequency
+cron use a fixed integer (e.g. `--sample-cap 50000`) so each run takes a
+predictable amount of time even as the keyspace grows.
+
 Lighter cron probes (use these in *addition* to `report` if you want
 sub-minute granularity for tail/grep/alerting):
 
@@ -65,13 +109,14 @@ Install (recommended, but optional — see the Requirements block below):
 
 Requirements
 ------------
-  * Python 3.6+ (only hard requirement — script falls back to stdlib RESP
-    client if `redis` is not installed, which makes it work on locked-down
-    cPanel hosts where you cannot install Python packages).
-  * Recommended: redis-py (pip3 install --user redis) for richer behaviour.
-  * Optional: mysql-connector-python OR PyMySQL — only needed for the `mysql`
-    subcommand and the MySQL block of `snapshot` / `health`. Without one, pass
-    `--skip-mysql` and probe MySQL separately with `mysqladmin extended-status`.
+  * Python 3.6+ — the ONLY hard requirement. The script falls back to:
+        - a stdlib-only Redis RESP client if `redis-py` is missing,
+        - the `mariadb` / `mysql` CLI binary (via subprocess) if no Python
+          MySQL driver is installed.
+    So on locked-down cPanel hosts with no pip you still get a fully
+    working monitor.
+  * Recommended (faster, less subprocess overhead, but optional):
+        pip3 install --user redis PyMySQL
 """
 
 import argparse
@@ -603,20 +648,27 @@ def connect_redis(args, cfg):
 
 # ─── MySQL connection ────────────────────────────────────────────────────────
 
-def connect_mysql(args, cfg):
-    """Return a MySQL connection, or None on failure (with stderr message)."""
-    if _mysql_mod is None:
-        return None, "no MySQL driver (pip3 install --user PyMySQL)"
-
-    host = args.mysql_host or cfg.get("DB_HOST") or "127.0.0.1"
+def _resolve_mysql_endpoint(args, cfg):
+    """Pick the (host, port) tuple to connect to, accepting `host:port` in
+    either --mysql-host or wp-config's DB_HOST."""
+    raw = args.mysql_host or cfg.get("DB_HOST") or "127.0.0.1"
+    host = raw
     port = 3306
-    if isinstance(host, str) and ":" in host and args.mysql_host is None:
-        host, p = host.rsplit(":", 1)
+    if isinstance(raw, str) and ":" in raw:
+        host, p = raw.rsplit(":", 1)
         try:
             port = int(p)
         except ValueError:
-            pass
+            host, port = raw, 3306
+    return host, port
 
+
+def connect_mysql(args, cfg):
+    """Return a MySQL connection, or None on failure (with stderr message)."""
+    if _mysql_mod is None:
+        return None, "no MySQL Python driver — using mariadb/mysql CLI fallback"
+
+    host, port = _resolve_mysql_endpoint(args, cfg)
     user = args.mysql_user or cfg.get("DB_USER") or "root"
     password = args.mysql_password
     if password is None:
@@ -948,50 +1000,36 @@ def scan_stampede_locks(client, pattern, cap, count):
     return {"active_lock_count": len(locks), "locks": locks[:50]}
 
 
-# ─── MySQL probe ─────────────────────────────────────────────────────────────
+# ─── MySQL probe — Python driver path + mariadb/mysql CLI fallback ──────────
+#
+# On shared cPanel hosts you often can't install PyMySQL or mysql-connector
+# (no pip). But the `mariadb` (or `mysql`) CLI binary is universally present.
+# When the Python driver is missing we shell out to it via `subprocess`,
+# parse the tab-separated output, and produce the same result dict — so the
+# rest of the script doesn't care which path was taken.
 
-def mysql_probe(conn):
-    cur = conn.cursor()
-    keys = (
-        "Threads_connected", "Threads_running", "Threads_cached", "Threads_created",
-        "Max_used_connections", "Aborted_connects", "Aborted_clients",
-        "Connection_errors_max_connections", "Connection_errors_internal",
-        "Slow_queries", "Uptime", "Questions", "Com_select", "Com_insert",
-        "Com_update", "Com_delete",
-    )
-    status = {}
-    for k in keys:
-        try:
-            cur.execute("SHOW GLOBAL STATUS LIKE %s", (k,))
-            row = cur.fetchone()
-            if row:
-                status[row[0]] = row[1]
-        except Exception:
-            continue
+# Status keys we want from SHOW GLOBAL STATUS (everything else is filtered out
+# to keep the payload small even though SHOW STATUS returns ~500 rows).
+_MYSQL_STATUS_KEYS = frozenset((
+    "Threads_connected", "Threads_running", "Threads_cached", "Threads_created",
+    "Max_used_connections", "Aborted_connects", "Aborted_clients",
+    "Connection_errors_max_connections", "Connection_errors_internal",
+    "Slow_queries", "Uptime", "Questions", "Com_select", "Com_insert",
+    "Com_update", "Com_delete",
+))
 
-    variables = {}
-    for v in ("max_connections", "wait_timeout", "interactive_timeout",
-              "max_user_connections", "table_open_cache", "innodb_buffer_pool_size"):
-        try:
-            cur.execute("SHOW VARIABLES LIKE %s", (v,))
-            row = cur.fetchone()
-            if row:
-                variables[row[0]] = row[1]
-        except Exception:
-            continue
+_MYSQL_VAR_KEYS = frozenset((
+    "max_connections", "wait_timeout", "interactive_timeout",
+    "max_user_connections", "table_open_cache", "innodb_buffer_pool_size",
+    "version", "version_comment",
+))
 
-    # Best-effort: count CURRENT processlist (cheap on most cPanel hosts).
-    processlist_count = None
-    proc_states = defaultdict(int)
-    try:
-        cur.execute("SELECT COMMAND FROM information_schema.PROCESSLIST")
-        for (cmd,) in cur.fetchall():
-            processlist_count = (processlist_count or 0) + 1
-            proc_states[cmd or "?"] += 1
-    except Exception:
-        pass
 
-    cur.close()
+def _build_mysql_summary(status, variables, processlist_count, proc_states,
+                         probe_via):
+    """Shared dict-builder used by both the Python-driver and CLI paths.
+    Produces the exact same shape so consumers (snapshot, report, alerts)
+    don't need to know which path produced the data."""
 
     def _i(d, k, default=0):
         try:
@@ -1010,6 +1048,8 @@ def mysql_probe(conn):
 
     return {
         "captured_at": datetime.utcnow().isoformat() + "Z",
+        "probe_via": probe_via,
+        "server_version": variables.get("version") or "?",
         "threads_connected": threads_conn,
         "threads_running": threads_run,
         "max_used_connections": max_used,
@@ -1029,6 +1069,333 @@ def mysql_probe(conn):
         "processlist_total": processlist_count,
         "processlist_by_command": dict(proc_states),
     }
+
+
+# ── Python-driver path ─────────────────────────────────────────────────
+
+def mysql_probe(conn):
+    """Probe MySQL via the open Python-driver connection."""
+    cur = conn.cursor()
+
+    status = {}
+    try:
+        cur.execute("SHOW GLOBAL STATUS")
+        for row in cur.fetchall():
+            if row and row[0] in _MYSQL_STATUS_KEYS:
+                status[row[0]] = row[1]
+    except Exception:
+        pass
+
+    variables = {}
+    try:
+        cur.execute("SHOW VARIABLES")
+        for row in cur.fetchall():
+            if row and row[0] in _MYSQL_VAR_KEYS:
+                variables[row[0]] = row[1]
+    except Exception:
+        pass
+
+    processlist_count = None
+    proc_states = defaultdict(int)
+    try:
+        cur.execute("SELECT COMMAND FROM information_schema.PROCESSLIST")
+        for (cmd,) in cur.fetchall():
+            processlist_count = (processlist_count or 0) + 1
+            proc_states[cmd or "?"] += 1
+    except Exception:
+        pass
+
+    cur.close()
+    return _build_mysql_summary(
+        status, variables, processlist_count, proc_states,
+        probe_via="python-driver:" + (DB_MODULE or "?"),
+    )
+
+
+# ── CLI-binary path (mariadb / mysql) ──────────────────────────────────
+
+# Common cPanel install locations checked when shutil.which() comes up empty
+# (cron jobs usually run with a very minimal PATH like "/usr/bin:/bin").
+_MYSQL_CLI_FALLBACK_PATHS = (
+    "/usr/bin/mariadb", "/usr/local/bin/mariadb",
+    "/usr/bin/mysql", "/usr/local/bin/mysql",
+    # cPanel EasyApache / MariaDB packages:
+    "/opt/cpanel/ea-mariadb*/bin/mariadb",
+    "/opt/cpanel/ea-mysql*/bin/mysql",
+)
+
+
+def find_mysql_cli(override=None):
+    """Return absolute path to `mariadb` or `mysql` CLI binary, or None.
+    Used as the no-dependency fallback for the MySQL probe when neither
+    PyMySQL nor mysql-connector-python is installed (typical cPanel)."""
+    import shutil
+    import glob as _glob
+
+    if override:
+        if os.path.isfile(override) and os.access(override, os.X_OK):
+            return override
+        return None
+
+    for name in ("mariadb", "mysql"):
+        path = shutil.which(name)
+        if path:
+            return path
+
+    for pattern in _MYSQL_CLI_FALLBACK_PATHS:
+        if "*" in pattern:
+            for p in _glob.glob(pattern):
+                if os.access(p, os.X_OK):
+                    return p
+        elif os.path.isfile(pattern) and os.access(pattern, os.X_OK):
+            return pattern
+
+    return None
+
+
+def _mysql_cli_invoke(binary, host, port, user, password, db, sql, timeout):
+    """Run a single SQL statement through the mariadb/mysql CLI in batch mode.
+    Returns the raw tab-separated text on success, raises RuntimeError on
+    non-zero exit. Password is passed via MYSQL_PWD env (the documented
+    way to avoid leaking it in `ps`)."""
+    import subprocess
+
+    env = os.environ.copy()
+    if password:
+        env["MYSQL_PWD"] = password
+    # Strip any inherited credentials we don't want the CLI to pick up.
+    env.pop("MYSQL_HOST", None)
+    env.pop("MYSQL_USER", None)
+
+    cmd = [binary,
+           "-h", str(host),
+           "-P", str(port),
+           "-u", str(user),
+           "--batch",                # tab-separated, machine-readable
+           "--skip-column-names",    # no header row
+           "--silent",               # suppress connect-time chatter
+           "-e", sql]
+    if db:
+        cmd.extend(["-D", str(db)])
+
+    try:
+        result = subprocess.run(
+            cmd, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=timeout, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("CLI timeout after %ss" % timeout)
+    except (FileNotFoundError, OSError) as exc:
+        raise RuntimeError("CLI exec failed: %s" % exc)
+
+    if result.returncode != 0:
+        err = result.stderr.decode("utf-8", "replace").strip()
+        # Trim very long error bodies so they fit in a single log line.
+        raise RuntimeError("exit %d: %s" % (result.returncode, err[:300]))
+
+    return result.stdout.decode("utf-8", "replace")
+
+
+def _parse_kv_tab_lines(text):
+    """Parse `--batch --skip-column-names` output of SHOW STATUS / VARIABLES.
+    Each line is `key\\tvalue`. Empty lines and malformed rows are skipped."""
+    out = {}
+    for line in text.splitlines():
+        if "\t" not in line:
+            continue
+        k, v = line.split("\t", 1)
+        out[k] = v
+    return out
+
+
+def mysql_probe_via_cli(args, cfg, binary=None):
+    """Probe MySQL by shelling out to `mariadb` / `mysql`. No Python deps.
+
+    Returns the same shape as mysql_probe(conn) on success, or
+    {"error": "..."} on failure.
+    """
+    if binary is None:
+        binary = find_mysql_cli(getattr(args, "mysql_cli", None))
+    if not binary:
+        return {"error": "no MySQL Python driver and no mariadb/mysql CLI "
+                         "binary found in PATH. Pass --mysql-cli /path/to/mariadb"}
+
+    host, port = _resolve_mysql_endpoint(args, cfg)
+    user = args.mysql_user or cfg.get("DB_USER") or "root"
+    password = args.mysql_password
+    if password is None:
+        password = cfg.get("DB_PASSWORD", "") or ""
+    database = args.mysql_db or cfg.get("DB_NAME") or ""
+
+    timeout = max(2, int(args.timeout))
+
+    try:
+        status_text = _mysql_cli_invoke(
+            binary, host, port, user, password, database,
+            "SHOW GLOBAL STATUS", timeout,
+        )
+        vars_text = _mysql_cli_invoke(
+            binary, host, port, user, password, database,
+            "SHOW VARIABLES", timeout,
+        )
+        proc_text = _mysql_cli_invoke(
+            binary, host, port, user, password, database,
+            "SELECT COMMAND, COUNT(*) FROM information_schema.PROCESSLIST "
+            "GROUP BY COMMAND", timeout,
+        )
+    except RuntimeError as exc:
+        return {"error": "mariadb/mysql CLI probe failed: %s" % exc,
+                "binary": binary}
+
+    status = _parse_kv_tab_lines(status_text)
+    status = {k: v for k, v in status.items() if k in _MYSQL_STATUS_KEYS}
+    variables = _parse_kv_tab_lines(vars_text)
+    variables = {k: v for k, v in variables.items() if k in _MYSQL_VAR_KEYS}
+
+    processlist_count = 0
+    proc_states = defaultdict(int)
+    for line in proc_text.splitlines():
+        if "\t" not in line:
+            continue
+        cmd, n = line.split("\t", 1)
+        try:
+            n_int = int(n)
+        except ValueError:
+            continue
+        proc_states[cmd or "?"] += n_int
+        processlist_count += n_int
+
+    summary = _build_mysql_summary(
+        status, variables, processlist_count, proc_states,
+        probe_via="cli:" + os.path.basename(binary),
+    )
+    summary["cli_binary"] = binary
+    return summary
+
+
+# ── Orchestrator used by every subcommand that needs MySQL data ────────
+
+def gather_mysql(args, cfg):
+    """Return the MySQL probe dict, transparently choosing the best path.
+
+    Order:
+      1. Python driver (PyMySQL / mysql-connector-python) — if installed.
+      2. `mariadb` / `mysql` CLI binary via subprocess — for cPanel hosts
+         where no pip / no Python MySQL driver is available.
+    """
+    if _mysql_mod is not None:
+        conn, err = connect_mysql(args, cfg)
+        if conn is not None:
+            try:
+                return mysql_probe(conn)
+            except Exception as exc:
+                return {"error": "Python driver probe failed: %s" % exc}
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        # Python driver present but couldn't connect — try CLI as fallback.
+        result = mysql_probe_via_cli(args, cfg)
+        if "error" not in result:
+            return result
+        return {"error": "python-driver connect failed (%s); cli fallback: %s"
+                         % (err, result.get("error"))}
+
+    # No Python driver — straight to CLI fallback.
+    return mysql_probe_via_cli(args, cfg)
+
+
+def _open_mysql_for_options(args, cfg):
+    """Open either a real Python driver connection OR a tiny shim that exposes
+    a `query_options(table, names) -> dict` method backed by the CLI binary.
+
+    Used by resolve_api_credentials() to look up pigcache_license_key and
+    pigcache_cloud_site_id from wp_options without depending on PyMySQL.
+    Returns (driver_conn_or_shim, kind) where kind is "python" | "cli" | None.
+    """
+    if _mysql_mod is not None:
+        conn, _err = connect_mysql(args, cfg)
+        if conn is not None:
+            return conn, "python"
+
+    binary = find_mysql_cli(getattr(args, "mysql_cli", None))
+    if binary is None:
+        return None, None
+
+    return _MysqlCliOptionsShim(binary, args, cfg), "cli"
+
+
+class _MysqlCliOptionsShim:
+    """Minimal duck-type that lets fetch_wp_options() work over the CLI binary
+    without changing its call signature."""
+
+    def __init__(self, binary, args, cfg):
+        self.binary = binary
+        self.args = args
+        self.cfg = cfg
+
+    def cursor(self):
+        return _MysqlCliCursor(self.binary, self.args, self.cfg)
+
+    def close(self):
+        pass
+
+
+class _MysqlCliCursor:
+    """Just enough of a DB-API cursor to satisfy fetch_wp_options(): supports
+    `execute(sql, params)` for the SELECT used to read wp_options, then
+    `fetchall()` returns a list of (name, value) tuples."""
+
+    def __init__(self, binary, args, cfg):
+        self.binary = binary
+        self.args = args
+        self.cfg = cfg
+        self._rows = []
+
+    def execute(self, sql, params=()):
+        host, port = _resolve_mysql_endpoint(self.args, self.cfg)
+        user = self.args.mysql_user or self.cfg.get("DB_USER") or "root"
+        password = self.args.mysql_password
+        if password is None:
+            password = self.cfg.get("DB_PASSWORD", "") or ""
+        database = self.args.mysql_db or self.cfg.get("DB_NAME") or ""
+
+        # Inline params as quoted strings. fetch_wp_options() is the only
+        # caller and always passes static option names — but we still
+        # escape with backslashes to be safe.
+        def _q(v):
+            if v is None:
+                return "NULL"
+            s = str(v).replace("\\", "\\\\").replace("'", "\\'")
+            return "'" + s + "'"
+
+        rendered = sql.replace("%s", "{}").format(*[_q(p) for p in params])
+
+        try:
+            text = _mysql_cli_invoke(
+                self.binary, host, port, user, password, database,
+                rendered, max(2, int(self.args.timeout)),
+            )
+        except RuntimeError:
+            self._rows = []
+            return
+
+        rows = []
+        for line in text.splitlines():
+            if "\t" in line:
+                parts = line.split("\t")
+                rows.append(tuple(parts))
+            elif line:
+                rows.append((line,))
+        self._rows = rows
+
+    def fetchall(self):
+        return self._rows
+
+    def close(self):
+        pass
 
 
 # ─── Rendering helpers ───────────────────────────────────────────────────────
@@ -1262,18 +1629,12 @@ def run_health(args, cfg):
                        "simultaneously (slow MISS path)."
             })
 
-    # MySQL saturation
+    # MySQL saturation (uses gather_mysql so the mariadb/mysql CLI fallback
+    # kicks in automatically when no Python driver is installed).
     mysql_block = None
     if not args.skip_mysql:
-        conn, err = connect_mysql(args, cfg)
-        if conn is not None:
-            try:
-                mysql_block = mysql_probe(conn)
-            finally:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+        mysql_block = gather_mysql(args, cfg)
+        if mysql_block and "error" not in mysql_block:
             sat = mysql_block.get("conn_saturation_pct")
             if isinstance(sat, (int, float)) and sat > args.mysql_sat_max:
                 alerts.append({
@@ -1294,11 +1655,11 @@ def run_health(args, cfg):
                            "since boot due to max_connections — site is "
                            "definitely failing under load."
                 })
-        elif err:
+        elif mysql_block:
             alerts.append({
                 "severity": "info",
                 "code": "mysql_skip",
-                "msg": f"MySQL probe skipped: {err}"
+                "msg": f"MySQL probe skipped: {mysql_block.get('error')}"
             })
 
     report = {
@@ -1334,15 +1695,7 @@ def cmd_snapshot(args, cfg):
 
     mysql_block = None
     if not args.skip_mysql:
-        conn, err = connect_mysql(args, cfg)
-        if conn is not None:
-            try:
-                mysql_block = mysql_probe(conn)
-            finally:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+        mysql_block = gather_mysql(args, cfg)
 
     if args.json:
         print(json.dumps({
@@ -1351,29 +1704,93 @@ def cmd_snapshot(args, cfg):
         return
 
     print(render_snapshot_text(snap, cb))
-    if mysql_block:
+    if mysql_block and "error" not in mysql_block:
         print()
         print(render_mysql_text(mysql_block))
+    elif mysql_block and "error" in mysql_block:
+        print()
+        print("─── MySQL ────────────────────────────────────────────")
+        print(f"  skipped: {mysql_block['error']}")
+
+
+def _resolve_sample_cap(raw, client, label=""):
+    """Turn --sample-cap string into a concrete integer cap.
+
+    Supports:
+      * integer                → returned as-is.
+      * "auto" | "all" | "0"   → DBSIZE (full scan).
+      * "pct:N"                → max(1000, DBSIZE * N / 100).
+      * "Nk" / "Nm"            → N * 1000 or N * 1_000_000 (e.g. "200k").
+
+    Returns (cap_int, dbsize_or_None). The dbsize is also surfaced so the
+    caller can include it in --json output for visibility.
+    """
+    s = str(raw).strip().lower()
+    dbsize = None
+
+    def _get_dbsize():
+        try:
+            return int(client.dbsize())
+        except Exception:
+            return None
+
+    if s in ("auto", "all", "max", "0"):
+        dbsize = _get_dbsize()
+        if dbsize is None or dbsize <= 0:
+            return 20000, dbsize
+        return dbsize, dbsize
+
+    if s.startswith("pct:"):
+        try:
+            pct = float(s[4:])
+        except ValueError:
+            pct = 100.0
+        dbsize = _get_dbsize() or 0
+        cap = int(max(1000, dbsize * pct / 100.0))
+        return cap, dbsize
+
+    # Handle 200k / 1m shorthand
+    mult = 1
+    if s.endswith("k"):
+        mult, s = 1000, s[:-1]
+    elif s.endswith("m"):
+        mult, s = 1_000_000, s[:-1]
+    try:
+        return int(float(s) * mult), None
+    except ValueError:
+        print(f"warn: could not parse --sample-cap={raw!r}, "
+              f"using 20000 ({label})", file=sys.stderr)
+        return 20000, None
 
 
 def cmd_breakdown(args, cfg):
     client, endpoint = connect_redis(args, cfg)
     pattern = (cfg.get("PIGCACHE_REDIS_PREFIX") or "") + "*"
+    cap, dbsize = _resolve_sample_cap(args.sample_cap, client, label="breakdown")
     b = scan_breakdown(client, pattern,
-                       cap=args.sample_cap,
+                       cap=cap,
                        sample_per_group=args.sample_per_group,
                        count=args.scan_count)
+    b["dbsize_total"] = dbsize
+    b["coverage_pct"] = (
+        round(b["scanned_keys"] / dbsize * 100, 2)
+        if dbsize and dbsize > 0 else None
+    )
     if args.json:
         print(json.dumps(b, indent=2, default=str))
     else:
+        if dbsize is not None:
+            print(f"# scanned {b['scanned_keys']:,} of {dbsize:,} keys "
+                  f"({b['coverage_pct']}% coverage)")
         print(render_breakdown_text(b))
 
 
 def cmd_hot_keys(args, cfg):
     client, _ = connect_redis(args, cfg)
     pattern = (cfg.get("PIGCACHE_REDIS_PREFIX") or "") + "*"
+    cap, _ = _resolve_sample_cap(args.sample_cap, client, label="hot-keys")
     h = scan_hot_keys(client, pattern,
-                      cap=args.sample_cap,
+                      cap=cap,
                       top_n=args.top,
                       count=args.scan_count)
     if args.json:
@@ -1385,7 +1802,8 @@ def cmd_hot_keys(args, cfg):
 def cmd_stampede(args, cfg):
     client, _ = connect_redis(args, cfg)
     pattern = (cfg.get("PIGCACHE_REDIS_PREFIX") or "") + "*pigcache_lock_*"
-    s = scan_stampede_locks(client, pattern, cap=args.sample_cap,
+    cap, _ = _resolve_sample_cap(args.sample_cap, client, label="stampede")
+    s = scan_stampede_locks(client, pattern, cap=cap,
                             count=args.scan_count)
     if args.json:
         print(json.dumps(s, indent=2, default=str))
@@ -1394,17 +1812,11 @@ def cmd_stampede(args, cfg):
 
 
 def cmd_mysql(args, cfg):
-    conn, err = connect_mysql(args, cfg)
-    if conn is None:
-        print(f"error: {err}", file=sys.stderr)
+    m = gather_mysql(args, cfg)
+    if m is None or "error" in (m or {}):
+        msg = (m or {}).get("error", "unknown error")
+        print(f"error: {msg}", file=sys.stderr)
         sys.exit(2)
-    try:
-        m = mysql_probe(conn)
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
     if args.json:
         print(json.dumps(m, indent=2, default=str))
     else:
@@ -1460,22 +1872,14 @@ def cmd_log_line(args, cfg):
 
     mysql_summary = ""
     if not args.skip_mysql:
-        conn, _err = connect_mysql(args, cfg)
-        if conn is not None:
-            try:
-                m = mysql_probe(conn)
-                mysql_summary = (
-                    f" mysql_conn={m['threads_connected']}/{m['max_connections']}"
-                    f" mysql_max_used={m['max_used_connections']}"
-                    f" mysql_aborted_c={m['aborted_clients']}"
-                )
-            except Exception:
-                pass
-            finally:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+        m = gather_mysql(args, cfg)
+        if m and "error" not in m:
+            mysql_summary = (
+                f" mysql_conn={m['threads_connected']}/{m['max_connections']}"
+                f" mysql_max_used={m['max_used_connections']}"
+                f" mysql_aborted_c={m['aborted_clients']}"
+                f" via={m.get('probe_via', '?')}"
+            )
 
     line = (
         f"{datetime.utcnow().isoformat()}Z"
@@ -1534,30 +1938,40 @@ def cmd_report(args, cfg):
     snap = redis_snapshot(client, endpoint)
     cb = circuit_breaker_state(endpoint["host"], endpoint["port"])
 
-    # ── Gather MySQL state (also needed for credential lookup) ─────────
+    # ── Gather MySQL state ────────────────────────────────────────────
+    # gather_mysql() transparently falls back to the mariadb/mysql CLI binary
+    # when no Python driver is installed (typical cPanel shared host).
     mysql_block = None
-    mysql_conn = None
     if not args.skip_mysql:
-        mysql_conn, err = connect_mysql(args, cfg)
-        if mysql_conn is not None:
-            try:
-                mysql_block = mysql_probe(mysql_conn)
-            except Exception as exc:
-                mysql_block = {"error": "probe failed: " + str(exc)}
-        elif err:
-            mysql_block = {"error": err}
+        mysql_block = gather_mysql(args, cfg)
+
+    # ── Open a separate handle for wp_options lookup (also CLI-aware) ─
+    # This is needed because the MySQL probe closes its own conn, and the
+    # API credential resolver wants a live cursor on wp_options.
+    mysql_conn_for_opts = None
+    if not args.skip_mysql:
+        mysql_conn_for_opts, _kind = _open_mysql_for_options(args, cfg)
 
     # ── Breakdown by group (optional) ─────────────────────────────────
     breakdown_block = None
     if not args.no_breakdown:
         pattern = (cfg.get("PIGCACHE_REDIS_PREFIX") or "") + "*"
         try:
+            cap, dbsize = _resolve_sample_cap(args.sample_cap, client,
+                                              label="report")
             breakdown_block = scan_breakdown(
                 client, pattern,
-                cap=args.sample_cap,
+                cap=cap,
                 sample_per_group=50,
                 count=args.scan_count,
             )
+            breakdown_block["dbsize_total"] = dbsize
+            breakdown_block["coverage_pct"] = (
+                round(breakdown_block["scanned_keys"] / dbsize * 100, 2)
+                if dbsize and dbsize > 0 else None
+            )
+            breakdown_block["sample_cap_requested"] = args.sample_cap
+            breakdown_block["sample_cap_resolved"] = cap
         except Exception as exc:
             breakdown_block = {"error": str(exc)}
 
@@ -1577,12 +1991,12 @@ def cmd_report(args, cfg):
 
     # ── Resolve API credentials (constants → wp_options, like cron) ───
     api_url, api_key, site_id, site_url = resolve_api_credentials(
-        args, cfg, mysql_conn=mysql_conn,
+        args, cfg, mysql_conn=mysql_conn_for_opts,
     )
 
-    if mysql_conn is not None:
+    if mysql_conn_for_opts is not None:
         try:
-            mysql_conn.close()
+            mysql_conn_for_opts.close()
         except Exception:
             pass
 
@@ -1754,6 +2168,10 @@ def _build_common_parent():
     parent.add_argument("--mysql-user")
     parent.add_argument("--mysql-password")
     parent.add_argument("--mysql-db")
+    parent.add_argument("--mysql-cli", metavar="PATH",
+                        help="Path to the mariadb/mysql CLI binary used when "
+                             "no Python MySQL driver is installed (auto-detected: "
+                             "mariadb, mysql, /usr/bin/mariadb, /opt/cpanel/...)")
     parent.add_argument("--timeout", type=float, default=3.0,
                         help="Socket timeout for Redis/MySQL in seconds "
                              "(default: 3)")
@@ -1761,8 +2179,12 @@ def _build_common_parent():
                         help="Emit JSON instead of text")
     parent.add_argument("--skip-mysql", action="store_true",
                         help="Skip MySQL probe (Redis-only run)")
-    parent.add_argument("--sample-cap", type=int, default=20000,
-                        help="Max keys to walk via SCAN (default: 20000)")
+    parent.add_argument("--sample-cap", default="20000", metavar="N|auto|all|pct:N",
+                        help="Max keys to walk via SCAN. Accepts: "
+                             "an integer (e.g. 50000), 'auto'/'all' (scan the "
+                             "WHOLE keyspace based on DBSIZE — slowest but most "
+                             "accurate), or 'pct:N' (sample N%% of DBSIZE, e.g. "
+                             "'pct:25'). Default: 20000.")
     parent.add_argument("--scan-count", type=int, default=500,
                         help="COUNT hint per SCAN iteration (default: 500)")
     return parent
