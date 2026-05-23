@@ -1,4 +1,595 @@
 #!/usr/bin/env python3
+# ════════════════════════════════════════════════════════════════════════════
+# API TODO — read this before working on the cloud-side ingestion code
+# ════════════════════════════════════════════════════════════════════════════
+#
+# This file is the SOURCE OF TRUTH for the wire format that PigCache Cloud
+# receives at  POST {API_URL}/api/sites/{site_id}/monitor  (the same endpoint
+# bin/pigcache-cron.php has always used). Anything documented below MUST be
+# implemented on the cloud side. The cron payload is the union of what
+# `cmd_report()` builds (see  "── Build payload ──"  at the bottom of this
+# file) plus everything `system_snapshot()` appends.
+#
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ 0. FULL PAYLOAD TREE — what the cloud receives on every report           │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+# This is the complete shape of the JSON body posted to
+#   POST {API_URL}/api/sites/{site_id}/monitor
+# every 5 min by cron. Fields marked (NEW) were added by this version of the
+# script; everything else has shipped since v1.0.0.  Optional fields are
+# `null` when the source isn't available on the host — never absent (the API
+# can rely on the keys existing, but must check value).
+#
+#   payload
+#   ├── schema_version            int     always 1 (bump only on breaking change)
+#   ├── monitor_version           str     "1.0.0"
+#   ├── captured_at               iso8601 UTC with trailing Z
+#   ├── site                              { site_url, site_id, table_prefix, wp_config_path }
+#   ├── monitor                           { python_version, redis_driver, hostname, user }
+#   ├── tenant                    (NEW)   per-cPanel-account fingerprint (§2)
+#   │   ├── tenant_id                     "<hostname>::<cpanel_user>"
+#   │   ├── hostname / cpanel_user
+#   │   ├── shared_hosting        bool
+#   │   ├── wp_site_count / pigcache_site_count / non_wp_site_count
+#   │   ├── sibling_folders[]             ["jalisciense","jaloy",...]
+#   │   ├── sibling_pigcache[]            subset of sibling_folders with PC installed
+#   │   ├── sibling_non_wp_folders[]
+#   │   └── account_quotas                { disk_quota_gb, mysql_disk_quota_gb,
+#   │                                       bandwidth_quota_gb }
+#   ├── redis                             snapshot — ping, hit ratio, mem, slowlog
+#   ├── redis_per_db              (NEW)   one row per Redis DB seen
+#   │   ├── available             bool
+#   │   ├── by_db                         { "0": {keys, expires, no_ttl_pct,
+#   │   │                                          wp_sites_pointing_here[],
+#   │   │                                          shared_with_other_tenants_possible },
+#   │   │                                   "4": {...}, ... }
+#   │   └── total_keys_across_dbs
+#   ├── circuit_breaker                   dropin → API failure flag
+#   ├── mysql                             saturation, slow_queries, aborted_*
+#   ├── breakdown                         per-PigCache-group memory + key counts
+#   ├── stampede                          active lock count
+#   ├── system
+#   │   ├── (load, cpu_cores, mem_*, swap_*, disk, net_*, uptime_*)
+#   │   ├── account_limits                LVE/cgroup (usually unavailable on CageFS)
+#   │   ├── account               (NEW)   cPanel UAPI ResourceUsage snapshot
+#   │   │   ├── available
+#   │   │   ├── disk_used_gb / disk_quota_gb / disk_used_pct
+#   │   │   ├── mysql_disk_used_gb / mysql_disk_quota_gb / mysql_disk_used_pct
+#   │   │   ├── bandwidth_used_gb / bandwidth_quota_gb / bandwidth_used_pct
+#   │   │   ├── addon_domains / subdomains / email_accounts / ...
+#   │   │   ├── bandwidth_by_domain[]    { domain, bandwidth_bytes/mb/gb }
+#   │   │   ├── bandwidth_by_domain_period   "YYYY-MM-01..YYYY-MM-DD"
+#   │   │   └── bandwidth_by_domain_total_gb
+#   │   ├── sites_inventory       (NEW)
+#   │   │   ├── layout                    cpanel | plesk | directadmin | manual | plesk-vhosts
+#   │   │   ├── scan_root
+#   │   │   ├── site_count / wp_site_count / pigcache_site_count / non_wp_count
+#   │   │   ├── sites_wp[]               { folder, table_prefix, redis_db,
+#   │   │   │                              redis_db_explicit, pigcache_installed,
+#   │   │   │                              pigcache_active_hint, wp_content_size_mb }
+#   │   │   ├── sites_other[]            non-WP folders
+#   │   │   ├── collisions[]             pigcache sites colliding on Redis DB
+#   │   │   └── risky_implicit_db[]      pigcache sites with no DB pin
+#   │   ├── account_by_domain     (NEW)
+#   │   │   ├── available
+#   │   │   ├── by_folder[]              { folder, procs, rss_mb, cpu_seconds,
+#   │   │   │                              io_read_mb, io_write_mb, threads, states }
+#   │   │   └── (totals)
+#   │   ├── scope                         "account" | "server_wide"
+#   │   ├── services                      port → service map
+#   │   ├── processes                     own PIDs from /proc
+#   │   └── environment
+#   │       ├── web_server               { server, php_handler[], handler_kind (NEW),
+#   │       │                              per_domain_attribution (NEW) }
+#   │       ├── lscache                  { available, cache_active, htaccess_cachelookup (NEW),
+#   │       │                              server_module_installed (NEW),
+#   │       │                              shard_subdirs_denied (NEW), conflict?, note? }
+#   │       ├── cagefs / imunify360 / wpcli / redis_rdb / awstats / access_logs
+#   │       ├── object_cache_dropin (NEW) { present, owner, plugin_name, mtime_iso }
+#   │       │                              owner ∈ { pigcache, redis-cache-till-kruss,
+#   │       │                                        w3-total-cache, memcached,
+#   │       │                                        redis-other, unknown }
+#   │       ├── competing_plugins        { found[], conflicts[], pigcache_installed,
+#   │       │                              object_cache_owner }
+#   │       └── vhost_logs        (NEW)  { layout, parsed, by_domain[] }
+#   └── alerts[]                         { severity, code, msg }
+#
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ 1. SCHEMA CONTRACT — new top-level / nested fields the API must accept   │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+# Payload is a single JSON object. All fields are OPTIONAL on read (older
+# clients/older script versions may omit any of them); the API must degrade
+# gracefully when a key is missing or null. `schema_version` is still 1 to
+# keep backward compatibility with the existing ingest pipeline; bump to 2
+# only when you DELETE or RENAME a field, never when adding new ones.
+#
+# NEW top-level keys added by this version of the script (everything else
+# is unchanged from the original cron payload):
+#
+#   tenant         {object}    Per-cPanel-account fingerprint. Lets the API
+#                              GROUP sites that share an OS user / disk /
+#                              bandwidth quota. See section 2 below.
+#
+#   redis_per_db   {object}    Keyspace counts for every Redis DB on the
+#                              instance, cross-referenced with which of THIS
+#                              user's WP sites point at each DB. Used to
+#                              detect cross-tenant DB sharing in shared Redis.
+#
+# NEW nested keys inside `system` (was already a top-level block):
+#
+#   system.account            {object}    cPanel UAPI ResourceUsage snapshot:
+#                                         disk / mysql_disk / bandwidth quota
+#                                         + usage, plus addon_domains, email_*
+#                                         counts, plus `bandwidth_by_domain`
+#                                         (current month, sorted desc).
+#
+#   system.account_by_domain  {object}    `scan_own_processes()` aggregated
+#                                         by `public_html/<folder>/`. Answers
+#                                         "which of my sibling sites is the
+#                                         CPU/RSS/IO hot spot RIGHT NOW".
+#                                         Includes a synthetic `_lsphp_master`
+#                                         bucket for the LSPHP pool parent
+#                                         that ALWAYS owns the largest IO
+#                                         read counter — do NOT attribute it
+#                                         to any real site.
+#
+#   system.sites_inventory    {object}    Every folder under ~/public_html/.
+#                                         Distinguishes:
+#                                           - sites_wp     : WordPress installs
+#                                           - sites_other  : non-WP folders
+#                                                            (static, frameworks,
+#                                                            uploads dirs)
+#                                         For each WP install: `pigcache_installed`
+#                                         (plugin file on disk), `pigcache_active_hint`
+#                                         ("yes" | "no" | "unknown"; "yes" means
+#                                         wp-content/advanced-cache.php mentions
+#                                         pigcache → cache is actually serving),
+#                                         and `redis_db` / `table_prefix` for
+#                                         collision detection.
+#
+# NEW nested key inside `system.environment`:
+#
+#   system.environment.vhost_logs  {object}    Per-domain access-log size summary
+#                                              from ~/logs/{vhost}*. One row per
+#                                              cPanel vhost. Useful when the
+#                                              account has dozens of subdomains
+#                                              and you need to see WHICH one is
+#                                              eating IO without parsing the logs.
+#
+# NEW alert codes (added by `_compute_alerts()`; severity ∈ {info, warn, critical}):
+#
+#   account_quota_disk_used_pct        ← disk approaching cPanel quota
+#   account_quota_mysql_disk_used_pct  ← MySQL DB usage approaching quota
+#   account_quota_bandwidth_used_pct   ← only when plan has a non-null cap
+#   redis_db_collision                 ← 2+ pigcache sites on same Redis DB
+#   redis_db_unset                     ← pigcache sites with no DB pin (DB 0)
+#   pigcache_no_db_pin                 ← per-site warning version of ↑
+#   redis_db0_shared_tenant            ← DB 0 has keys NOT owned by this account
+#                                         (= other cPanel tenants share this Redis)
+#   domain_io_read_hot                 ← one of MY sites read >1 GiB from disk
+#   pigcache_dropin_hijacked           ← wp-content/object-cache.php owned by
+#                                         another plugin → PigCache silently OFF
+#   lscache_stale                      ← informational: leftover ~/lscache/ files
+#                                         but LSCache not actually serving
+#
+# REFINED alert codes (stricter heuristics, fewer false positives):
+#
+#   lscache_conflict      now requires BOTH cache_active=true AND
+#                          environment.lscache.htaccess_cachelookup=true
+#                          (= leftover files alone no longer fire).
+#   competing_plugins     now emits ONE alert per real conflict found in
+#                          environment.competing_plugins.conflicts[]. The
+#                          on-disk presence of e.g. `redis-cache` is no
+#                          longer a conflict when PigCache owns the drop-in.
+#
+# NEW environment.* fields used by the refined logic:
+#
+#   environment.object_cache_dropin   {present, owner, plugin_name, mtime_iso}
+#       owner ∈ {pigcache, redis-cache-till-kruss, w3-total-cache,
+#                memcached, redis-other, unknown}
+#       The cloud should expose this directly so users can see WHICH cache
+#       plugin actually owns wp-content/object-cache.php.
+#
+#   environment.lscache.htaccess_cachelookup  bool   .htaccess has CacheLookup on
+#   environment.lscache.recent_files_24h      int    files touched in last 24h
+#   environment.lscache.newest_file_age_h     float  age of newest cache file
+#
+#   environment.competing_plugins.found[].likely_active  bool   inferred from
+#       drop-in ownership (true positive: this plugin is actually serving)
+#   environment.competing_plugins.found[].layers         ["page"|"object"]
+#   environment.competing_plugins.conflicts              [str, ...]
+#       Human-readable conflict descriptions (one per actual problem).
+#   environment.competing_plugins.pigcache_installed     bool
+#
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ 2. TENANT MODEL — the biggest cloud-side change                          │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+# Until now, the cloud treated each `site_id` as fully independent. On shared
+# cPanel hosting that's wrong: 5 sites can live in one OS user and SHARE the
+# disk / MySQL / bandwidth pie. The new `tenant` block lets the API model that.
+#
+# Wire shape:
+#   {
+#     "tenant_id":              "bh8972.banahosting.com::bvkegbla",
+#     "hostname":               "bh8972.banahosting.com",
+#     "cpanel_user":            "bvkegbla",
+#     "shared_hosting":         true,           // false when single-site account
+#     "wp_site_count":          5,
+#     "pigcache_site_count":    3,
+#     "non_wp_site_count":      1,
+#     "sibling_folders":        ["jalisciense","jaloy","mediacancha","nuevoleon","ridolimpieza"],
+#     "sibling_pigcache":       ["jaloy","mediacancha","nuevoleon"],
+#     "sibling_non_wp_folders": ["public_static"],
+#     "account_quotas": {
+#       "disk_quota_gb":       150,
+#       "mysql_disk_quota_gb": 89,
+#       "bandwidth_quota_gb":  null
+#     }
+#   }
+#
+# Cloud-side migration (recommended schema):
+#
+#   table `tenants`                       (NEW)
+#     tenant_id           VARCHAR(190) PRIMARY KEY  -- hostname::user, sha1 OK
+#     hostname            VARCHAR(190)
+#     cpanel_user         VARCHAR(64)
+#     shared_hosting      TINYINT(1)
+#     last_seen_at        DATETIME
+#     -- denormalised counts updated on each report:
+#     wp_site_count       INT
+#     pigcache_site_count INT
+#     disk_quota_gb       DECIMAL(10,2) NULL
+#     bandwidth_quota_gb  DECIMAL(10,2) NULL
+#     INDEX idx_last_seen (last_seen_at)
+#
+#   table `sites`  (EXISTING)
+#     + tenant_id         VARCHAR(190) NULL    -- FK to tenants.tenant_id
+#     + folder_in_account VARCHAR(64)  NULL    -- e.g. "jaloy"
+#     + pigcache_installed TINYINT(1)  NULL
+#     + pigcache_active   TINYINT(1)   NULL    -- from pigcache_active_hint='yes'
+#     INDEX idx_tenant     (tenant_id)
+#
+#   table `tenant_quota_snapshots`        (NEW, optional time-series)
+#     id                  BIGINT PRIMARY KEY AUTO_INCREMENT
+#     tenant_id           VARCHAR(190)
+#     captured_at         DATETIME
+#     disk_used_gb        DECIMAL(10,2)
+#     mysql_disk_used_gb  DECIMAL(10,2)
+#     bandwidth_used_gb   DECIMAL(10,2)
+#     INDEX (tenant_id, captured_at)
+#     -- DEDUPE: when N sibling sites report the same account block within a
+#     -- short window, store ONE row per (tenant_id, hour) — pick the highest
+#     -- value or the first arrival. The numbers are identical across siblings
+#     -- since they read the same UAPI.
+#
+#   table `tenant_bandwidth_by_domain`    (NEW)
+#     tenant_id    VARCHAR(190)
+#     period_start DATE                  -- first-of-month UTC
+#     domain       VARCHAR(190)
+#     bytes        BIGINT UNSIGNED
+#     PRIMARY KEY (tenant_id, period_start, domain)
+#     -- Upsert from `system.account.bandwidth_by_domain[]` on each report.
+#     -- Same dedupe note as above: siblings report identical numbers.
+#
+# Ingest pseudocode (in your existing ReportController::store action):
+#
+#   $payload = json_decode($request->getContent(), true);
+#   $siteId  = $request->header('X-Site-Id');
+#
+#   // 1) Upsert tenant if the payload has one
+#   if (!empty($payload['tenant']['tenant_id'])) {
+#       Tenant::upsertFromPayload($payload['tenant']);
+#       Site::find($siteId)->update([
+#           'tenant_id'         => $payload['tenant']['tenant_id'],
+#           'folder_in_account' => /* extract from sites_inventory.sites_wp
+#                                    where path matches payload['site']['wp_config_path'] */,
+#       ]);
+#   }
+#
+#   // 2) Idempotent quota snapshot (dedupe across siblings)
+#   if (!empty($payload['system']['account']['available'])) {
+#       TenantQuotaSnapshot::upsertForHour(
+#           $payload['tenant']['tenant_id'],
+#           $payload['system']['account']
+#       );
+#   }
+#
+#   // 3) Per-domain bandwidth (per month, dedupe across siblings)
+#   foreach ($payload['system']['account']['bandwidth_by_domain'] ?? [] as $row) {
+#       TenantBandwidthByDomain::upsertForMonth(
+#           $payload['tenant']['tenant_id'],
+#           $row['domain'],
+#           $row['bandwidth_bytes']
+#       );
+#   }
+#
+#   // 4) Persist alerts (existing flow — these will simply include new codes)
+#   foreach ($payload['alerts'] ?? [] as $alert) {
+#       Alert::record($siteId, $alert);
+#   }
+#
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ 3. NEW DASHBOARD VIEWS the cloud UI should expose                        │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+# (A) Tenant detail page  /tenants/{tenant_id}
+#       - lists all sibling sites (WP + non-WP)
+#       - shows account_quotas as ring/bar widgets
+#       - bandwidth-by-domain bar chart (current month)
+#       - per-site row with pigcache_installed badge + last-seen timestamp
+#       - UPSELL panel: "X sites on this account don't have pigcache yet"
+#         (driver: sibling_folders − sibling_pigcache − sibling_non_wp_folders)
+#
+# (B) Account-aware site detail page  /sites/{id}
+#       - if site.tenant_id IS NOT NULL, show a header banner:
+#           "This site shares its cPanel account with N other sites: [list]"
+#       - replaces the existing "server load is high" interpretation with the
+#         tenant-aware version when account_by_domain pinpoints which folder
+#         is the actual hot spot.
+#
+# (C) Redis-per-DB inspector  /sites/{id}/redis-dbs
+#       - render `redis_per_db.by_db` as a table
+#       - highlight rows where shared_with_other_tenants_possible=true AND
+#         wp_sites_pointing_here is empty (= someone else's keys in your Redis)
+#       - highlight rows in `sites_inventory.collisions` (= pigcache sites of
+#         the same account colliding on the same DB)
+#
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ 4. PORTABILITY MATRIX — what works on which hosting stack                │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+# The script targets cPanel + CloudLinux + LiteSpeed primarily, but the
+# CORE (Redis snapshot, MySQL probe, Redis breakdown, /proc-based system
+# metrics, alerts) works on any Linux + PHP + Redis/MySQL combo. The
+# per-account / per-domain attribution blocks degrade gracefully on
+# non-cPanel hosts.
+#
+# Per-block portability:
+#
+#   ALWAYS WORKS (any Linux + PHP + Redis/MySQL):
+#     redis, redis_per_db, breakdown, stampede, mysql, circuit_breaker,
+#     system.{cpu_cores, load, mem, swap, disk, net, uptime, services,
+#             processes, account_limits (returns unavailable on non-CloudLinux)},
+#     tenant.{tenant_id, hostname, cpanel_user}
+#
+#   CPANEL-ONLY:
+#     system.account               (uses `uapi` binary)
+#     system.environment.vhost_logs.parsed=true
+#                                  (cPanel filename convention)
+#     system.environment.lscache   (returns unavailable on non-LiteSpeed)
+#
+#   HANDLER-DEPENDENT (system.account_by_domain.by_folder):
+#     LSPHP:    full per-site attribution (script path in cmdline)
+#     PHP-FPM:  per-pool only (cmdline = "php-fpm: pool POOLNAME")
+#     mod_php:  not available — apache children give no per-vhost info
+#     CGI:      cwd_only (depends on web server passing the script path)
+#
+#     The cloud should READ `system.environment.web_server.handler_kind` AND
+#     `system.environment.web_server.per_domain_attribution` to know whether
+#     the per-domain breakdown can be trusted:
+#       per_domain_attribution = "reliable"     → all rows are accurate sites
+#       per_domain_attribution = "pool_name"    → rows are FPM pools, may
+#                                                 group multiple domains
+#       per_domain_attribution = "cwd_only"     → fallback, lower confidence
+#       per_domain_attribution = "unavailable"  → suppress the breakdown UI
+#
+#   LAYOUT-DEPENDENT (system.sites_inventory):
+#     `system.sites_inventory.layout` is one of:
+#       "cpanel"        → ~/public_html/<site>/
+#       "directadmin"   → ~/domains/<dom>/public_html/
+#       "plesk"         → ~/httpdocs/ (single-site)
+#       "plesk-vhosts"  → /var/www/vhosts/<dom>/httpdocs/
+#       "manual"        → /var/www/html/<site>/
+#     The cloud should NOT hardcode "public_html" anywhere — always use
+#     `sites_inventory.scan_root` and `sites_inventory.layout` to label
+#     paths for the user.
+#
+#   CLOUDLINUX-ONLY:
+#     system.account_limits     (LVE / cgroup data; usually unavailable
+#                                under CageFS — explained in `reason`)
+#     system.environment.cagefs
+#     system.environment.imunify360
+#
+# Practical advice for the API:
+#   - Default the per-tenant rollups (disk/BW/MySQL quotas) to "n/a" when
+#     `system.account.available == false`. Don't draw 0% — that's wrong.
+#   - When `per_domain_attribution != "reliable"`, render the
+#     account_by_domain table with a small badge explaining the granularity
+#     ("PHP-FPM pool-level", "Apache: not attributable", etc.).
+#   - When `sites_inventory.layout != "cpanel"`, hide the cPanel-specific
+#     upsell ("install PigCache on these sibling sites") because the user
+#     may not have administrative access to enable plugins on other sites.
+#
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ 5. BACKWARD COMPAT / DEFENSIVE PARSING                                   │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+# - Every new field is OPTIONAL on read. If `tenant` is missing, treat the
+#   report exactly like the old single-site reports (legacy ingest path).
+# - `system.account.available == false` means the host had no `uapi` binary
+#   (e.g. non-cPanel servers or Plesk). Do not warn; just skip quota widgets.
+# - `system.account_limits` (LVE/cgroup) is OFTEN unavailable on CageFS hosts.
+#   Always prefer `system.account` (UAPI) when both are present.
+# - `system.account.bandwidth_quota_gb == null` is normal — most shared plans
+#   sell "unlimited bandwidth". Show only `used_gb` in that case.
+# - `redis_per_db.by_db` keys are STRINGS ("0","1","7"), not integers, because
+#   they come from Redis's `INFO keyspace` section names (db0/db1/db7).
+# - Treat `_lsphp_master` and `_unknown` in `account_by_domain.by_folder[]` as
+#   special buckets. Render them but never charge their IO to a tenant site.
+# - `bandwidth_by_domain` keys may include `UNKNOWN` (mail/non-vhost traffic).
+#   Show it as "uncategorised" — it's normal.
+#
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ 6. SECURITY                                                              │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+# - `tenant_id` is derived from hostname + OS username. It is NOT secret but
+#   it MUST NOT be trusted from arbitrary clients — only from authenticated
+#   reports (the existing `Authorization: Bearer <api_key>` + `X-Site-Id`).
+# - A malicious site could spoof another tenant's tenant_id and pollute its
+#   sibling list. Mitigation: cross-validate that EVERY site reporting under
+#   the same tenant_id also uses the same `monitor.hostname` and `monitor.user`
+#   on first ingest; if they don't match later reports, raise a flag.
+# - Do NOT echo `account.bandwidth_by_domain` to any unauthenticated endpoint
+#   — it leaks the structure of a hosting account.
+# - `redis_per_db.by_db["0"].keys` count may include OTHER tenants' data on
+#   shared Redis hosting. Never expose raw key NAMES — only counts.
+#
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ 7. ALERT CATALOG — every code the script can emit                        │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+# Each alert in `payload.alerts[]` has shape:
+#     { "severity": "info" | "warn" | "critical", "code": <str>, "msg": <str> }
+#
+# Cloud should persist with the dedupe key below (one open alert per
+# (site_id, dedupe_key) pair). `related_field` tells the UI WHICH part of the
+# payload to highlight when the user clicks the alert. `fix_hint` is a short
+# action the user can take — show it as the call-to-action in the alert card.
+#
+# code                              severity   dedupe key                related_field                              fix_hint
+# ─────────────────────────────────  ─────────  ────────────────────────  ─────────────────────────────────────────  ─────────────────────────────────────────────
+# redis_unreachable                  critical   code                      redis.ping_error                           Check Redis service / host firewall
+# redis_high_latency                 warn       code                      redis.ping_latency_ms                      Reduce key payload size / network hops
+# redis_low_hit_ratio                warn       code                      redis.keyspace_hit_ratio                   Increase TTL / pre-warm cache
+# redis_evictions                    warn       code                      redis.evicted_keys                         Raise maxmemory or change policy
+# redis_no_maxmemory                 warn       code                      redis.maxmemory                            Set maxmemory + policy (cPanel: ask host)
+# redis_db_collision           (NEW) critical   code+db                   sites_inventory.collisions                 Pin each pigcache site to a unique DB
+# redis_db_unset               (NEW) warn       code+folder               sites_inventory.risky_implicit_db          Add PIGCACHE_REDIS_DATABASE constant
+# redis_db0_shared_tenant      (NEW) info       code                      redis_per_db.by_db.0                       Move OUR sites off DB 0
+# pigcache_no_db_pin           (NEW) info       code+folder               sites_inventory.sites_wp[].redis_db_explicit  Define PIGCACHE_REDIS_DATABASE
+# pigcache_dropin_hijacked     (NEW) critical   code                      environment.object_cache_dropin.owner      Re-install PigCache object-cache drop-in
+# mysql_connections_high             warn       code                      mysql.threads_connected_pct                Raise max_connections or fix leaks
+# mysql_aborted_connects             warn       code                      mysql.aborted_connects                     Check app DB credentials / network
+# mysql_slow_queries                 warn       code                      mysql.slow_queries                         Optimize indexes / queries
+# circuit_open                       critical   code                      circuit_breaker.open                       Cloud reachability / API key
+# stampede_locks_active              info       code                      stampede.locks                             Cache warm-up in progress
+# system_load_high                   warn       code                      system.load.1m                             Account for noisy neighbour / spike
+# system_mem_low                     warn       code                      system.mem_available_mb                    Free memory / scale up
+# system_swap_in_use                 warn       code                      system.swap_used_mb                        Trim memory hogs
+# system_disk_low                    warn       code                      system.disk.root_used_pct                  Free disk space
+# account_quota_disk_used_pct  (NEW) warn       code                      system.account.disk_used_pct               Free files / upgrade plan
+# account_quota_mysql_disk_used_pct  warn       code                      system.account.mysql_disk_used_pct         Drop unused tables / upgrade plan
+# account_quota_bandwidth_used_pct   warn       code                      system.account.bandwidth_used_pct          Enable CDN / optimize bandwidth
+# domain_io_read_hot           (NEW) info       code+folder               system.account_by_domain.by_folder[]       Profile that folder's PHP code
+# lscache_conflict                   warn       code                      environment.lscache + environment.competing_plugins  Disable LSCache OR PigCache page-cache
+# lscache_stale                (NEW) info       code                      environment.lscache.recent_files_24h       Purge stale cache or disable plugin
+# competing_plugins                  warn       code+plugin               environment.competing_plugins.conflicts[]  Disable / uninstall the listed plugin
+#
+# Suggested cloud-side dedupe / throttle:
+#   - One OPEN alert row per (site_id, dedupe_key). Update last_seen_at on
+#     each repeat. Auto-resolve after N consecutive reports without the code.
+#   - Notification throttle: 1 email/Slack per dedupe_key per 24h.
+#   - For `severity=critical`: do not throttle the first occurrence.
+#
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ 8. REST ENDPOINTS the cloud should expose for the new data               │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+# These are SUGGESTED routes derived from the new payload blocks. They are
+# additive — no existing endpoint changes shape. All routes are scoped to
+# the authenticated user / org.
+#
+#   GET /api/tenants
+#       List tenants the user has visibility on.
+#       Response item: { tenant_id, hostname, cpanel_user, wp_site_count,
+#                        pigcache_site_count, last_seen_at, alerts_count }
+#
+#   GET /api/tenants/{tenant_id}
+#       Detail view.
+#       Response: { ...tenant fields...,
+#                   sites: [ {site_id, folder, pigcache_installed, last_seen_at,
+#                             alerts_summary} ],
+#                   quotas: { disk: {used_gb, quota_gb, pct},
+#                             mysql_disk: {...}, bandwidth: {...} },
+#                   bandwidth_by_domain: [ {domain, gb, pct} ],   // current month
+#                   non_wp_folders: [...] }
+#
+#   GET /api/tenants/{tenant_id}/quota-history?from=&to=
+#       Time series from `tenant_quota_snapshots`.
+#       Response: [ {captured_at, disk_used_gb, mysql_disk_used_gb,
+#                    bandwidth_used_gb} ]
+#
+#   GET /api/sites/{site_id}/siblings
+#       Returns sibling sites within the same tenant. Drives the
+#       "this site shares its account with N others" banner.
+#
+#   GET /api/sites/{site_id}/redis-dbs
+#       Returns the latest `redis_per_db` block plus cross-reference with
+#       `sites_inventory`. Used by the Redis DB inspector view.
+#
+#   GET /api/sites/{site_id}/account-by-domain?limit=10
+#       Returns the latest `system.account_by_domain.by_folder[]` sorted by
+#       chosen metric (cpu_seconds | rss_mb | io_read_mb).
+#       MUST include `web_server.handler_kind` and `per_domain_attribution`
+#       so the UI can render the confidence badge.
+#
+#   GET /api/sites/{site_id}/cache-conflicts
+#       Returns the latest `environment.object_cache_dropin` +
+#       `environment.competing_plugins` so users see all cache layers.
+#
+# Webhook / async push (optional, future):
+#   POST /api/webhooks/alert-fired   payload: {site_id, tenant_id, code,
+#                                              severity, first_seen_at}
+#
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ 9. DIAGNOSTIC RECIPES — symptom → fields to inspect                      │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+# When a user opens a support ticket with a vague symptom, the cloud UI
+# should offer a one-click "diagnose" that highlights the relevant payload
+# fields. These are the canonical mappings:
+#
+#   "site is slow / partial loads"
+#     → system.load.1m, system.cpu_cores              (server load)
+#     → system.account_by_domain.by_folder[]          (which sibling is hot?)
+#     → redis.keyspace_hit_ratio                      (cache effective?)
+#     → environment.lscache.cache_active + .conflict  (page-cache conflict?)
+#     → mysql.threads_connected, mysql.slow_queries
+#
+#   "error establishing database connection"
+#     → mysql.threads_connected_pct                   (saturation?)
+#     → mysql.aborted_connects                        (credentials/limits?)
+#     → system.account.mysql_disk_used_pct            (quota reached?)
+#     → alerts[] for codes mysql_*                    (root cause flagged?)
+#
+#   "redis cache not working / hit ratio low"
+#     → redis.keyspace_hit_ratio                      (the metric itself)
+#     → redis.evicted_keys                            (maxmemory too low?)
+#     → environment.object_cache_dropin.owner        (we own it?)
+#     → environment.competing_plugins.conflicts[]    (someone else hijacked?)
+#     → sites_inventory.collisions / risky_implicit_db (DB pin missing?)
+#     → redis_per_db.by_db.0.shared_with_other_tenants_possible (noisy neighbour?)
+#
+#   "I'm hitting my disk/bandwidth quota"
+#     → system.account.disk_used_pct / bandwidth_used_pct
+#     → system.account.bandwidth_by_domain[]         (which domain leads?)
+#     → system.account_by_domain.by_folder[].io_*    (which folder writes the most?)
+#     → environment.vhost_logs.by_domain[]           (which vhost logs are huge?)
+#
+#   "another site on my account is the problem"
+#     → tenant.sibling_folders[] vs sibling_pigcache[]   (siblings without PC)
+#     → system.account_by_domain.by_folder[]             (current resource hog)
+#     → system.account.bandwidth_by_domain[]             (bandwidth hog this month)
+#     → sites_inventory.sites_other[]                    (non-WP folders eating space)
+#
+#   "page cache not serving"
+#     → environment.lscache.cache_active + .conflict
+#     → environment.object_cache_dropin.owner
+#     → environment.competing_plugins.conflicts[]
+#     → redis (advanced-cache.php uses Redis too — check redis health)
+#
+#   "I installed PigCache but nothing changed"
+#     → sites_inventory.sites_wp[N].pigcache_active_hint   ("yes" means serving)
+#     → environment.object_cache_dropin.owner              (should be "pigcache")
+#     → alert pigcache_dropin_hijacked                     (someone overwrote it)
+#     → alert pigcache_no_db_pin                           (sharing DB 0 with others)
+#
+# ════════════════════════════════════════════════════════════════════════════
+
 """
 PigCache Monitor — Redis + MySQL health/efficiency probe for cPanel cron.
 
@@ -1514,15 +2105,22 @@ def environment_scan(wp_root=None):
     home = os.path.expanduser("~")
     out  = {"home": home}
 
-    out["web_server"]      = _probe_web_server()
-    out["lscache"]         = _probe_lscache(home, wp_root)
-    out["cagefs"]          = _probe_cagefs(home)
-    out["imunify360"]      = _probe_imunify(home)
-    out["wpcli"]           = _probe_wpcli(home)
-    out["redis_rdb"]       = _probe_redis_rdb(home, wp_root)
-    out["awstats"]         = _probe_awstats(home, wp_root)
-    out["access_logs"]     = _probe_access_logs(home, wp_root)
-    out["competing_plugins"] = _probe_competing_plugins(wp_root)
+    out["web_server"]            = _probe_web_server()
+    out["lscache"]               = _probe_lscache(home, wp_root)
+    out["cagefs"]                = _probe_cagefs(home)
+    out["imunify360"]            = _probe_imunify(home)
+    out["wpcli"]                 = _probe_wpcli(home)
+    out["redis_rdb"]             = _probe_redis_rdb(home, wp_root)
+    out["awstats"]               = _probe_awstats(home, wp_root)
+    out["access_logs"]           = _probe_access_logs(home, wp_root)
+    # Inspect the WP drop-in BEFORE competing-plugin scan so the latter can
+    # use the drop-in owner to demote false positives (e.g. having Till Krüss
+    # redis-cache on disk but not active is harmless when PigCache owns the
+    # drop-in).
+    out["object_cache_dropin"]   = _probe_object_cache_dropin(wp_root)
+    out["competing_plugins"]     = _probe_competing_plugins(
+        wp_root, dropin_info=out["object_cache_dropin"],
+    )
 
     return out
 
@@ -1570,20 +2168,42 @@ def _probe_web_server():
         7443 if 7443 in listening else None
     )
 
-    # PHP handler hint from our own process names
+    # PHP handler hint from our own process names. Two outputs:
+    #   php_handler        : list of binary names seen (e.g. ["lsphp"])
+    #   handler_kind       : one of {"lsphp","php-fpm","mod_php","cgi","unknown"}
+    #                        — used by the cloud to decide whether per-domain
+    #                        attribution from /proc is reliable for this host.
     try:
         pids = [d for d in os.listdir("/proc") if d.isdigit()]
         php_handlers = set()
         for pid in pids:
             try:
                 name = open("/proc/%s/comm" % pid).read().strip()
-                if name in ("lsphp", "php-fpm", "php", "php8.1", "php8.2", "php8.3"):
+                if name in ("lsphp", "php-fpm", "php", "php-cgi",
+                            "php8.1", "php8.2", "php8.3", "php7.4"):
                     php_handlers.add(name)
             except OSError:
                 pass
-        result["php_handler"] = list(php_handlers) or ["unknown"]
+        result["php_handler"] = sorted(php_handlers) or ["unknown"]
     except OSError:
         result["php_handler"] = ["unknown"]
+
+    handlers = set(result["php_handler"])
+    if "lsphp" in handlers:
+        result["handler_kind"]            = "lsphp"
+        result["per_domain_attribution"]  = "reliable"     # paths in cmdline
+    elif "php-fpm" in handlers:
+        result["handler_kind"]            = "php-fpm"
+        result["per_domain_attribution"]  = "pool_name"    # only pool granularity
+    elif "php-cgi" in handlers:
+        result["handler_kind"]            = "cgi"
+        result["per_domain_attribution"]  = "cwd_only"
+    elif server == "apache" and not handlers - {"unknown"}:
+        result["handler_kind"]            = "mod_php"
+        result["per_domain_attribution"]  = "unavailable"
+    else:
+        result["handler_kind"]            = "unknown"
+        result["per_domain_attribution"]  = "unknown"
 
     return result
 
@@ -1591,11 +2211,22 @@ def _probe_web_server():
 # ── LiteSpeed Cache (LSCache) ─────────────────────────────────────────────────
 
 def _probe_lscache(home, wp_root):
-    """Detect LiteSpeed's built-in page cache.
+    """Detect LiteSpeed's built-in page cache (the web-server module, not the
+    WP plugin).
 
-    LSCache operates at the web-server level — BEFORE advanced-cache.php runs.
-    If active for HTML pages, PigCache's HTML cache is bypassed entirely.
-    The cache files live in ~/lscache/ on cPanel installs.
+    Three independent signals decide whether LSCache is actually SERVING
+    pages (= real conflict with PigCache HTML cache) versus just having a
+    few leftover files from when it was last enabled:
+
+      1. cache_dir       → ~/lscache/ exists at all (necessary, not sufficient)
+      2. cache_active    → has files AND they have been touched recently
+                           (mtime within last 24 h)
+      3. htaccess_lookup → wp_root/.htaccess contains `CacheLookup on|public`
+                           (= LiteSpeed is configured to actually use the cache)
+
+    Conflict is reported ONLY when BOTH (2) and (3) are true. A single stale
+    file from months ago no longer trips the alert (this was a false positive
+    on accounts that had LSCache enabled in the past but later disabled it).
     """
     result = {"available": False}
 
@@ -1604,24 +2235,66 @@ def _probe_lscache(home, wp_root):
     if os.path.isdir(lscache_dir):
         result["available"]  = True
         result["cache_dir"]  = lscache_dir
+        now = time.time()
+        recent_threshold = now - 24 * 3600   # files touched in the last 24h
+
+        # LiteSpeed shards its cache into 16 hex subdirs (0..f). These dirs
+        # are typically owned by the LS daemon user (`nobody`/`lsadm`), not
+        # by the cPanel user, so walking them yields permission-denied for
+        # everything except `.cm.log`. We need to distinguish:
+        #   - "no files"     = directory empty, no cache activity
+        #   - "permission denied" = LS owns the subdirs, files DO exist but
+        #     we can't see them; ABSENCE of files is not evidence of inactivity
+        denied_subdirs = 0
         try:
-            total_files = 0
-            total_bytes = 0
+            for entry in os.listdir(lscache_dir):
+                full = os.path.join(lscache_dir, entry)
+                if os.path.isdir(full):
+                    try:
+                        os.listdir(full)
+                    except PermissionError:
+                        denied_subdirs += 1
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        result["shard_subdirs_denied"] = denied_subdirs
+        # 16 hex shards (0..9, a..f) all permission-denied = clear LS fingerprint
+        result["server_module_installed"] = denied_subdirs >= 8
+
+        try:
+            total_files  = 0
+            total_bytes  = 0
+            recent_files = 0
+            newest_mtime = 0
             for root, _dirs, files in os.walk(lscache_dir):
                 for f in files:
                     total_files += 1
+                    full = os.path.join(root, f)
                     try:
-                        total_bytes += os.path.getsize(os.path.join(root, f))
+                        st = os.stat(full)
                     except OSError:
-                        pass
-                if total_files > 5000:   # stop counting on huge caches
+                        continue
+                    total_bytes += st.st_size
+                    if st.st_mtime > recent_threshold:
+                        recent_files += 1
+                    if st.st_mtime > newest_mtime:
+                        newest_mtime = st.st_mtime
+                if total_files > 5000:
                     result["cached_files_approx"] = ">5000"
                     result["cached_bytes_approx"] = ">estimate"
                     break
             else:
-                result["cached_files"] = total_files
-                result["cached_bytes"] = total_bytes
-            result["cache_active"] = total_files > 0
+                result["cached_files"]   = total_files
+                result["cached_bytes"]   = total_bytes
+                result["recent_files_24h"] = recent_files
+                result["newest_file_age_h"] = (
+                    round((now - newest_mtime) / 3600, 1) if newest_mtime else None
+                )
+            # Activity heuristic — "files we CAN see" is a lower bound when
+            # LS owns the subdirs. Bump it up if our user actually owns some
+            # of the shards (rare on cPanel, but signals user-mode caching).
+            result["cache_active"] = recent_files >= 10 or total_files >= 50
         except OSError as exc:
             result["cache_dir_err"] = str(exc)
 
@@ -1629,24 +2302,140 @@ def _probe_lscache(home, wp_root):
     lscm_dir = os.path.join(home, "lscmData")
     result["lscm_data_dir"] = lscm_dir if os.path.isdir(lscm_dir) else None
 
-    # 3. WordPress plugin on disk
+    # 3. WordPress plugin on disk (the optional WP companion plugin)
     if wp_root:
         plugin_path = os.path.join(
             wp_root, "wp-content", "plugins", "litespeed-cache", "litespeed-cache.php"
         )
         result["wp_plugin_installed"] = os.path.isfile(plugin_path)
 
-    # 4. Conflict assessment
-    if result["available"] and result.get("cache_active"):
+    # 4. .htaccess directive lookup — this is the authoritative "is it on?"
+    result["htaccess_cachelookup"] = False
+    if wp_root:
+        htaccess = os.path.join(wp_root, ".htaccess")
+        if os.path.isfile(htaccess):
+            try:
+                with open(htaccess, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read(50000)  # cap read; .htaccess is small
+                # Match `CacheLookup on` or `CacheLookup public` not inside a
+                # commented line.
+                for line in content.splitlines():
+                    stripped = line.strip()
+                    if stripped.startswith("#"):
+                        continue
+                    if re.search(r"\bCacheLookup\s+(on|public)\b", stripped, re.I):
+                        result["htaccess_cachelookup"] = True
+                        break
+            except OSError:
+                pass
+
+    # 5. Conflict assessment — strict: needs cache_active AND htaccess directive
+    cache_active     = bool(result.get("cache_active"))
+    htaccess_enabled = bool(result.get("htaccess_cachelookup"))
+    server_module    = bool(result.get("server_module_installed"))
+    cached_files     = result.get("cached_files", 0)
+
+    if result["available"] and cache_active and htaccess_enabled:
         result["conflict"] = (
-            "LSCache is active and has cached files. LiteSpeed serves these pages "
-            "before advanced-cache.php runs, so PigCache HTML cache entries in Redis "
+            "LSCache is actively serving pages (.htaccess CacheLookup on + "
+            "recent cache files). LiteSpeed serves these pages before "
+            "advanced-cache.php runs, so PigCache HTML cache entries in Redis "
             "are never populated or served for those URLs. "
-            "Disable LSCache full-page caching OR disable PigCache HTML cache "
-            "to avoid serving from two competing page caches."
+            "Disable LSCache (CacheLookup off in .htaccess OR cPanel → "
+            "LiteSpeed Web Cache Manager → Disable) OR disable PigCache "
+            "HTML cache — pick one."
+        )
+    elif result["available"] and server_module and not htaccess_enabled:
+        # LS module installed at server-level (shard subdirs exist), but THIS
+        # site's .htaccess doesn't ask for cache → safe (per-site only).
+        result["note"] = (
+            "LSCache module is installed at server-level (shard subdirs "
+            f"{denied_subdirs}/16 are owned by the LS daemon and not "
+            "readable from user-space), but this site's .htaccess has no "
+            "`CacheLookup on/public` directive, so LSCache is NOT serving "
+            "pages for this site. No conflict."
+        )
+    elif result["available"] and cache_active and not htaccess_enabled:
+        result["note"] = (
+            "Found cached files in ~/lscache/ but no `CacheLookup on` directive "
+            "in .htaccess — LSCache is likely disabled and those files are "
+            "leftovers. Safe to ignore (or `rm -rf ~/lscache/*` to clean)."
+        )
+    elif result["available"] and not cache_active and cached_files > 0:
+        result["note"] = (
+            f"Stale ~/lscache/ — only {cached_files} file(s) and none "
+            "touched in the last 24h. Not actively serving."
         )
 
     return result
+
+
+# ── WP object cache drop-in (wp-content/object-cache.php) detection ──────────
+
+def _probe_object_cache_dropin(wp_root):
+    """Identify which plugin owns wp-content/object-cache.php.
+
+    The drop-in is what WordPress actually loads — whichever plugin's name is
+    in this file is the ONE serving object cache, regardless of how many
+    object-cache plugins are installed on disk. This is the single most
+    reliable signal for "is there a real conflict between cache plugins?".
+
+    Returns dict with:
+        present       (bool)
+        path          (str|None)
+        owner         ("pigcache"|"redis-cache-till-kruss"|"w3-total-cache"|
+                       "memcached"|"other"|"unknown"|None)
+        plugin_name   (str|None) — first 'Plugin Name:' / heading line found
+        size_bytes    (int|None)
+        mtime_iso     (str|None)
+    """
+    out = {"present": False, "path": None, "owner": None,
+           "plugin_name": None, "size_bytes": None, "mtime_iso": None}
+
+    if not wp_root:
+        return out
+
+    dropin = os.path.join(wp_root, "wp-content", "object-cache.php")
+    if not os.path.isfile(dropin):
+        return out
+
+    out["present"] = True
+    out["path"]    = dropin
+    try:
+        st = os.stat(dropin)
+        out["size_bytes"] = st.st_size
+        out["mtime_iso"]  = (datetime.utcfromtimestamp(st.st_mtime).isoformat() + "Z")
+    except OSError:
+        pass
+
+    try:
+        with open(dropin, "r", encoding="utf-8", errors="ignore") as f:
+            head = f.read(8000)
+    except OSError:
+        return out
+
+    head_l = head.lower()
+    # Fingerprints, ordered most→least specific.
+    if "pigcache" in head_l:
+        out["owner"] = "pigcache"
+    elif "till krüss" in head_l or "till kruss" in head_l or \
+         "rhubarbgroup/redis-cache" in head_l or "tillkruss/redis-cache" in head_l:
+        out["owner"] = "redis-cache-till-kruss"
+    elif "w3 total cache" in head_l or "w3tc" in head_l:
+        out["owner"] = "w3-total-cache"
+    elif "memcached" in head_l and "redis" not in head_l:
+        out["owner"] = "memcached"
+    elif "redis" in head_l:
+        out["owner"] = "redis-other"   # could be Rocket / WordPress.com etc.
+    else:
+        out["owner"] = "unknown"
+
+    # Best-effort plugin name from the PHP doc header
+    m = re.search(r"Plugin\s*Name\s*:\s*([^\n\r*]+)", head, re.I)
+    if m:
+        out["plugin_name"] = m.group(1).strip()[:120]
+
+    return out
 
 
 # ── CageFS ────────────────────────────────────────────────────────────────────
@@ -1844,32 +2633,54 @@ def _probe_access_logs(home, wp_root):
 
 # Plugins that implement full-page HTML caching and/or object cache replacement.
 # If active alongside PigCache they conflict at the same cache layer.
+# Cache plugins that PigCache is known to conflict with. Each entry says
+# which cache LAYER the plugin owns (page = full-HTML, object = WP object
+# cache, both = does both). The on-disk presence of any of these only
+# matters when the WP object-cache.php / advanced-cache.php drop-ins are
+# also pointing at them — see `_probe_competing_plugins` below.
 _COMPETING_CACHE_PLUGINS = {
-    "w3-total-cache":          "W3 Total Cache",
-    "wp-super-cache":          "WP Super Cache",
-    "wp-rocket":               "WP Rocket",
-    "litespeed-cache":         "LiteSpeed Cache (LSCache)",
-    "swift-performance-lite":  "Swift Performance Lite",
-    "swift-performance":       "Swift Performance",
-    "cache-enabler":           "Cache Enabler",
-    "comet-cache":             "Comet Cache",
-    "hyper-cache":             "Hyper Cache",
-    "sg-cachepress":           "SiteGround Optimizer",
-    "hummingbird-performance": "Hummingbird",
-    "wp-fastest-cache":        "WP Fastest Cache",
-    "breeze":                  "Breeze (Cloudways)",
-    "redis-cache":             "Redis Object Cache (Till Krüss)",
+    "w3-total-cache":          {"name": "W3 Total Cache",                  "layers": ["page", "object"]},
+    "wp-super-cache":          {"name": "WP Super Cache",                  "layers": ["page"]},
+    "wp-rocket":               {"name": "WP Rocket",                       "layers": ["page"]},
+    "litespeed-cache":         {"name": "LiteSpeed Cache (LSCache)",       "layers": ["page", "object"]},
+    "swift-performance-lite":  {"name": "Swift Performance Lite",          "layers": ["page"]},
+    "swift-performance":       {"name": "Swift Performance",               "layers": ["page"]},
+    "cache-enabler":           {"name": "Cache Enabler",                   "layers": ["page"]},
+    "comet-cache":             {"name": "Comet Cache",                     "layers": ["page"]},
+    "hyper-cache":             {"name": "Hyper Cache",                     "layers": ["page"]},
+    "sg-cachepress":           {"name": "SiteGround Optimizer",            "layers": ["page"]},
+    "hummingbird-performance": {"name": "Hummingbird",                     "layers": ["page"]},
+    "wp-fastest-cache":        {"name": "WP Fastest Cache",                "layers": ["page"]},
+    "breeze":                  {"name": "Breeze (Cloudways)",              "layers": ["page", "object"]},
+    "redis-cache":             {"name": "Redis Object Cache (Till Krüss)", "layers": ["object"],
+                                "note": "PigCache is a fork of this plugin. Having both on disk is "
+                                        "fine; the conflict only matters when the object-cache.php "
+                                        "drop-in is owned by Till Krüss's version (see "
+                                        "environment.object_cache_dropin.owner)."},
 }
 
 
-def _probe_competing_plugins(wp_root):
-    """Scan wp-content/plugins/ for known competing cache plugins.
+def _probe_competing_plugins(wp_root, dropin_info=None):
+    """Scan wp-content/plugins/ for cache plugins and classify the result
+    against the actual object-cache.php drop-in owner.
 
-    Returns a list of plugins found on disk (not necessarily active in WP —
-    disk presence is enough to warn because deactivated plugins can leave
-    drop-ins behind).
+    Behaviour change vs. the prior version:
+
+      * On-disk presence is now INFORMATIONAL, not a conflict in itself.
+      * The drop-in owner (from _probe_object_cache_dropin) decides who's
+        actually serving the object cache. If the owner is pigcache, having
+        Till Krüss's redis-cache plugin folder on disk too is harmless.
+      * A real conflict is raised only when:
+          - drop-in owner is NOT pigcache, OR
+          - 2+ "page" layer plugins are installed AND no drop-in clarifies
+            who owns the HTML cache.
     """
-    result = {"available": False, "found": [], "plugins_dir_readable": False}
+    result = {
+        "available":           False,
+        "found":               [],
+        "plugins_dir_readable": False,
+        "object_cache_owner":  (dropin_info or {}).get("owner"),
+    }
 
     if not wp_root:
         return result
@@ -1886,22 +2697,85 @@ def _probe_competing_plugins(wp_root):
         result["error"] = str(exc)
         return result
 
-    for slug, name in _COMPETING_CACHE_PLUGINS.items():
+    # Also detect PigCache itself so the report shows what's actually present.
+    pigcache_present = "pigcache" in installed and os.path.isfile(
+        os.path.join(plugins_dir, "pigcache", "pigcache.php")
+    )
+    result["pigcache_installed"] = pigcache_present
+
+    for slug, meta in _COMPETING_CACHE_PLUGINS.items():
         if slug in installed:
             plugin_file = os.path.join(plugins_dir, slug, slug + ".php")
-            result["found"].append({
-                "slug":      slug,
-                "name":      name,
+            row = {
+                "slug":       slug,
+                "name":       meta["name"],
+                "layers":     meta["layers"],
                 "php_exists": os.path.isfile(plugin_file),
-            })
+            }
+            if "note" in meta:
+                row["note"] = meta["note"]
+
+            # Heuristic: is this plugin REALLY serving (vs. just sitting in
+            # the folder)?  We don't have DB access here, so use file mtime
+            # of the plugin's main PHP file vs. the drop-in mtime.
+            row["likely_active"] = False
+            if slug == "redis-cache":
+                # The original Till Krüss plugin is "in use" only if it owns
+                # the drop-in. Otherwise the folder is just legacy artifacts.
+                row["likely_active"] = (
+                    (dropin_info or {}).get("owner") == "redis-cache-till-kruss"
+                )
+            elif slug == "litespeed-cache":
+                row["likely_active"] = (
+                    (dropin_info or {}).get("owner") == "litespeed-cache"
+                )
+            elif slug == "w3-total-cache":
+                row["likely_active"] = (
+                    (dropin_info or {}).get("owner") == "w3-total-cache"
+                )
+            # For page-only plugins we can't infer activity from drop-ins.
+
+            result["found"].append(row)
 
     result["available"] = bool(result["found"])
-    if result["available"]:
-        result["warning"] = (
-            "Found %d competing cache plugin(s) on disk. "
-            "If active, they may conflict with PigCache at the HTML cache or "
-            "object cache layer. Check which are truly active in WP admin."
-            % len(result["found"])
+
+    # Conflict assessment
+    conflicts = []
+    drop_owner = (dropin_info or {}).get("owner")
+    obj_competitors = [
+        p for p in result["found"]
+        if "object" in p["layers"] and p["likely_active"]
+    ]
+    page_competitors = [p for p in result["found"] if "page" in p["layers"]]
+
+    if drop_owner and drop_owner != "pigcache" and pigcache_present:
+        conflicts.append(
+            f"PigCache is installed but the active object-cache.php drop-in "
+            f"is owned by '{drop_owner}', so PigCache's object cache is NOT "
+            f"in use. Replace the drop-in (PigCache settings → re-enable "
+            f"object cache) or uninstall the other plugin."
+        )
+    if len(obj_competitors) > 1:
+        names = ", ".join(p["name"] for p in obj_competitors)
+        conflicts.append(
+            f"Multiple object-cache plugins active simultaneously: {names}. "
+            f"Only one can own the drop-in at a time — keep one."
+        )
+    if len(page_competitors) > 1:
+        names = ", ".join(p["name"] for p in page_competitors)
+        conflicts.append(
+            f"{len(page_competitors)} HTML page-cache plugins installed: "
+            f"{names}. They may compete with each other (and with PigCache "
+            f"HTML cache, if enabled)."
+        )
+
+    result["conflicts"] = conflicts
+    if conflicts:
+        result["warning"] = " | ".join(conflicts)
+    elif result["found"]:
+        result["info"] = (
+            f"{len(result['found'])} cache plugin folder(s) present on disk "
+            "but no active conflict detected (drop-in owner verified)."
         )
 
     return result
@@ -2120,8 +2994,21 @@ def system_snapshot(wp_root=None):
     # Per-account LVE / cgroup limits (CloudLinux shared hosting)
     snap["account_limits"] = _lve_snapshot()
 
-    # Clarify scope so the dashboard can show a warning on shared hosts
-    snap["scope"] = "server_wide" if not snap["account_limits"].get("available") else "account"
+    # Per-cPanel-account quotas via UAPI (works under CageFS where /proc/lve
+    # and /sys/fs/cgroup are blocked). This is the *real* account-scoped data.
+    snap["account"] = _account_snapshot()
+
+    # Inventory of every WordPress install under ~/public_html (table_prefix
+    # + Redis DB mapping). Used by the alert layer to spot DB collisions.
+    home_dir = os.environ.get("HOME") or os.path.expanduser("~")
+    snap["sites_inventory"] = _scan_account_wp_configs(home_dir)
+
+    # Scope:
+    #   "account"     → either LVE/cgroup OR cPanel UAPI gave us per-account data
+    #   "server_wide" → only /proc-derived numbers (shared totals)
+    has_lve_data = snap["account_limits"].get("available")
+    has_uapi     = snap["account"].get("available")
+    snap["scope"] = "account" if (has_lve_data or has_uapi) else "server_wide"
 
     # Services listening on this server (detected from /proc/net/tcp)
     snap["services"] = detect_services()
@@ -2129,8 +3016,18 @@ def system_snapshot(wp_root=None):
     # Our own visible processes with resource usage
     snap["processes"] = scan_own_processes()
 
+    # Per-domain breakdown of those processes (CPU / RSS / IO grouped by the
+    # public_html/<folder> they belong to). Answers "which of MY sites is
+    # eating I/O right now?" on a shared host.
+    snap["account_by_domain"] = _breakdown_procs_by_domain(snap["processes"])
+
     # Full environment scan (web server, LSCache, CageFS, plugins, logs…)
     snap["environment"] = environment_scan(wp_root)
+
+    # Per-vhost access-log size summary (uses ~/logs/*.gz that cPanel writes).
+    # Added under environment.* to keep all log-related stuff in one place.
+    if isinstance(snap.get("environment"), dict):
+        snap["environment"]["vhost_logs"] = _vhost_logs_summary(home_dir)
 
     return snap
 
@@ -2276,6 +3173,941 @@ def _read_self_cgroup_name():
     except Exception:
         pass
     return ""
+
+
+# ─── Per-account snapshot (cPanel UAPI + WP sites inventory) ────────────────
+#
+# CageFS blocks /proc/lve/list and /sys/fs/cgroup/ on shared hosts, so the
+# `_lve_snapshot()` path above returns `available: False`. To still give the
+# user account-scoped numbers we shell out to cPanel's UAPI which is exposed
+# to every cPanel user via the `uapi` binary in $PATH. Three calls:
+#
+#   uapi ResourceUsage get_usages
+#       → disk_usage, mysql_disk_usage, bandwidth, addon_domains, email_accounts
+#         (with maximum quotas where applicable)
+#
+#   uapi StatsBar       get_stats display='diskusage|bandwidthusage|...'
+#       → same numbers but with `is_maxed`, `percent`, normalised units
+#         (used as fallback / to fill metrics ResourceUsage omits)
+#
+#   uapi Bandwidth      query grouping=domain interval=daily
+#       → bandwidth by VHOST so the user knows which domain in their cPanel
+#         account is eating bandwidth
+#
+# All three failures are non-fatal: the block stays `available: False` with a
+# short `reason`, and `cmd_report` keeps working exactly like before.
+
+
+def _uapi_call(module, func, params=None, timeout=8):
+    """Invoke `uapi --output=json <module> <func> [k=v ...]` and parse stdout.
+
+    Returns the parsed `result` payload on success, or a dict
+    `{"_error": "..."}` on any kind of failure (missing binary, timeout,
+    non-zero exit, invalid JSON, API-level errors[]).
+    """
+    import subprocess
+    import shutil
+
+    binary = shutil.which("uapi")
+    if not binary:
+        return {"_error": "uapi binary not in PATH"}
+
+    cmd = [binary, "--output=json", module, func]
+    if params:
+        for k, v in params.items():
+            cmd.append(f"{k}={v}")
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=timeout, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {"_error": f"uapi timeout after {timeout}s"}
+    except (FileNotFoundError, OSError) as exc:
+        return {"_error": f"uapi exec failed: {exc}"}
+
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", "replace").strip()[:200]
+        return {"_error": f"uapi exit {proc.returncode}: {err}"}
+
+    try:
+        payload = json.loads(proc.stdout.decode("utf-8", "replace"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        return {"_error": f"uapi non-JSON output: {exc}"}
+
+    result = payload.get("result") or {}
+    if result.get("errors"):
+        return {"_error": "; ".join(str(e) for e in result["errors"])[:200]}
+    return result
+
+
+def _account_snapshot():
+    """Per-cPanel-account resource usage via UAPI (works under CageFS).
+
+    Returns a flat dict suitable for `system.account`. When `uapi` is not
+    available (e.g. non-cPanel host) returns {"available": False, ...} so the
+    rest of the report keeps working unchanged.
+    """
+    snap = {"available": False, "source": "uapi"}
+
+    ru = _uapi_call("ResourceUsage", "get_usages")
+    if "_error" in ru:
+        snap["reason"] = ru["_error"]
+        return snap
+
+    snap["available"] = True
+
+    # ResourceUsage returns a list of {id, usage, maximum, description, ...}.
+    by_id = {}
+    for row in (ru.get("data") or []):
+        rid = row.get("id")
+        if rid:
+            by_id[rid] = row
+
+    def _num(row, key):
+        """Coerce '161061273600' / 161061273600 / null → int|None."""
+        v = row.get(key) if row else None
+        if v in (None, "", "unlimited"):
+            return None
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            try:
+                return int(float(v))
+            except (TypeError, ValueError):
+                return None
+
+    def _bytes_to_gb(b):
+        return round(b / (1024 ** 3), 2) if b is not None else None
+
+    def _pct(used, maximum):
+        if used is None or not maximum:
+            return None
+        try:
+            return round(used / maximum * 100, 1)
+        except ZeroDivisionError:
+            return None
+
+    # Disk
+    disk = by_id.get("disk_usage", {})
+    snap["disk_used_bytes"]    = _num(disk, "usage")
+    snap["disk_quota_bytes"]   = _num(disk, "maximum")
+    snap["disk_used_gb"]       = _bytes_to_gb(snap["disk_used_bytes"])
+    snap["disk_quota_gb"]      = _bytes_to_gb(snap["disk_quota_bytes"])
+    snap["disk_used_pct"]      = _pct(snap["disk_used_bytes"], snap["disk_quota_bytes"])
+
+    # MySQL disk
+    mdb = by_id.get("cachedmysqldiskusage", {}) or by_id.get("mysqldiskusage", {})
+    snap["mysql_disk_used_bytes"]  = _num(mdb, "usage")
+    snap["mysql_disk_quota_bytes"] = _num(mdb, "maximum")
+    snap["mysql_disk_used_gb"]     = _bytes_to_gb(snap["mysql_disk_used_bytes"])
+    snap["mysql_disk_quota_gb"]    = _bytes_to_gb(snap["mysql_disk_quota_bytes"])
+    snap["mysql_disk_used_pct"]    = _pct(snap["mysql_disk_used_bytes"],
+                                          snap["mysql_disk_quota_bytes"])
+
+    # Bandwidth (monthly)
+    bw = by_id.get("bandwidth", {})
+    snap["bandwidth_used_bytes"]  = _num(bw, "usage")
+    snap["bandwidth_quota_bytes"] = _num(bw, "maximum")
+    snap["bandwidth_used_gb"]     = _bytes_to_gb(snap["bandwidth_used_bytes"])
+    snap["bandwidth_quota_gb"]    = _bytes_to_gb(snap["bandwidth_quota_bytes"])
+    snap["bandwidth_used_pct"]    = _pct(snap["bandwidth_used_bytes"],
+                                         snap["bandwidth_quota_bytes"])
+
+    # Domain / email counts (no maximum on most shared plans)
+    for cid, key in (
+        ("addon_domains",  "addon_domains"),
+        ("subdomains",     "subdomains"),
+        ("aliases",        "alias_domains"),
+        ("email_accounts", "email_accounts"),
+        ("mailing_lists",  "mailing_lists"),
+    ):
+        snap[key] = _num(by_id.get(cid, {}), "usage")
+
+    # ── Bandwidth broken down by domain (CURRENT MONTH only) ──────────
+    # Without an explicit start/end, cPanel's Bandwidth::query returns
+    # cumulative-since-tracking-began (i.e. potentially years worth of TB),
+    # not the current month. ResourceUsage's bandwidth counter IS the current
+    # month, so we constrain Bandwidth::query to match. We use UTC epoch
+    # seconds for the first-of-month and now; timezone=UTC keeps the buckets
+    # aligned with what cPanel itself reports in its UI.
+    now = datetime.utcnow()
+    month_start = int(datetime(now.year, now.month, 1).timestamp())
+    now_ts = int(now.timestamp())
+    bw_dom = _uapi_call(
+        "Bandwidth", "query",
+        params={
+            "grouping": "domain",
+            "interval": "daily",
+            "timezone": "UTC",
+            "start":    month_start,
+            "end":      now_ts,
+        },
+    )
+    period = f"{now.strftime('%Y-%m-01')}..{now.strftime('%Y-%m-%d')}"
+    if "_error" not in bw_dom:
+        data = (bw_dom.get("data") or {})
+        items = []
+        for dom, raw in data.items():
+            try:
+                b = int(raw)
+            except (TypeError, ValueError):
+                continue
+            items.append({
+                "domain":          dom,
+                "bandwidth_bytes": b,
+                "bandwidth_mb":    round(b / (1024 ** 2), 1),
+                "bandwidth_gb":    round(b / (1024 ** 3), 2),
+            })
+        items.sort(key=lambda x: x["bandwidth_bytes"], reverse=True)
+        snap["bandwidth_by_domain"]        = items[:30]
+        snap["bandwidth_by_domain_period"] = period
+        snap["bandwidth_by_domain_total_gb"] = round(
+            sum(i["bandwidth_bytes"] for i in items) / (1024 ** 3), 2
+        )
+    else:
+        snap["bandwidth_by_domain_error"]  = bw_dom["_error"]
+        snap["bandwidth_by_domain_period"] = period
+
+    return snap
+
+
+def _detect_site_kind(folder_path):
+    """Inspect a directory under public_html and classify what's running.
+
+    Returns a dict with:
+        kind:                "wordpress" | "non_wordpress" | "empty"
+        wp_config_path:      str|None
+        pigcache_installed:  bool       (pigcache/ folder + pigcache.php exists)
+        pigcache_active_hint: "yes"|"no"|"unknown"
+            - "yes"     when wp-content/advanced-cache.php contains "pigcache"
+                        (the dropin that pigcache writes when its HTML cache
+                        is enabled; reliable on-disk indicator).
+            - "no"      when neither the plugin folder nor the dropin exist
+                        even though it's a WP install.
+            - "unknown" when the plugin folder is present but no dropin (e.g.
+                        installed but never activated, or object-cache only).
+        wp_content_size_mb:  int|None
+    """
+    out = {
+        "kind":                "non_wordpress",
+        "wp_config_path":      None,
+        "pigcache_installed":  False,
+        "pigcache_active_hint":"unknown",
+        "wp_content_size_mb":  None,
+    }
+
+    if not os.path.isdir(folder_path):
+        return out
+    try:
+        entries = os.listdir(folder_path)
+    except OSError:
+        return out
+    if not entries:
+        out["kind"] = "empty"
+        return out
+
+    # WP-config can live at any of these layouts depending on the panel /
+    # install style:
+    #   <folder>/wp-config.php              cPanel, manual installs
+    #   <folder>/wp/wp-config.php           classic split (rare)
+    #   <folder>/web/wp-config.php          Bedrock
+    #   <folder>/public_html/wp-config.php  DirectAdmin (domains/<dom>/public_html)
+    #   <folder>/httpdocs/wp-config.php     Plesk (vhosts/<dom>/httpdocs)
+    wp_cfg = None
+    for candidate in (
+        os.path.join(folder_path, "wp-config.php"),
+        os.path.join(folder_path, "wp", "wp-config.php"),
+        os.path.join(folder_path, "web", "wp-config.php"),
+        os.path.join(folder_path, "public_html", "wp-config.php"),
+        os.path.join(folder_path, "httpdocs", "wp-config.php"),
+    ):
+        if os.path.isfile(candidate):
+            wp_cfg = candidate
+            break
+    if not wp_cfg:
+        return out
+
+    out["kind"]           = "wordpress"
+    out["wp_config_path"] = wp_cfg
+
+    wp_root = os.path.dirname(wp_cfg)
+    plugin_dir = os.path.join(wp_root, "wp-content", "plugins", "pigcache")
+    plugin_php = os.path.join(plugin_dir, "pigcache.php")
+    out["pigcache_installed"] = os.path.isfile(plugin_php)
+
+    # `advanced-cache.php` is the WP dropin file. Pigcache replaces it when
+    # the user enables HTML page caching, and the file contains the literal
+    # string 'pigcache' in its header. This is the cleanest on-disk signal
+    # that pigcache is not just installed but actively serving pages.
+    dropin = os.path.join(wp_root, "wp-content", "advanced-cache.php")
+    try:
+        if os.path.isfile(dropin):
+            with open(dropin, "r", encoding="utf-8", errors="ignore") as f:
+                head = f.read(2048)
+            if "pigcache" in head.lower():
+                out["pigcache_active_hint"] = "yes"
+            elif out["pigcache_installed"]:
+                out["pigcache_active_hint"] = "unknown"
+            else:
+                out["pigcache_active_hint"] = "no"
+        else:
+            out["pigcache_active_hint"] = (
+                "unknown" if out["pigcache_installed"] else "no"
+            )
+    except OSError:
+        out["pigcache_active_hint"] = "unknown"
+
+    # Best-effort wp-content size (only the top of the tree, cheap shallow stat).
+    wp_content = os.path.join(wp_root, "wp-content")
+    if os.path.isdir(wp_content):
+        try:
+            total = 0
+            for root, _dirs, files in os.walk(wp_content):
+                # cap depth implicitly via early exit on very large trees
+                if total > 10 * 1024 ** 3:  # >10 GiB, give up
+                    break
+                for f in files:
+                    try:
+                        total += os.path.getsize(os.path.join(root, f))
+                    except OSError:
+                        pass
+            out["wp_content_size_mb"] = round(total / (1024 ** 2), 1)
+        except OSError:
+            pass
+
+    return out
+
+
+def _scan_account_wp_configs(home):
+    """Inventory every folder under ~/public_html/, not just WP ones.
+
+    Returns a dict with:
+        sites_wp        : [{folder, path, table_prefix, redis_db, ...}, ...]
+        sites_other     : [{folder, kind, reason}, ...]   (non-WP folders)
+        collisions      : [{redis_db, sites, any_implicit_db}, ...]
+        pigcache_active : count of WP sites where pigcache is wired in
+
+    This expanded scope is what lets the user answer "is the resource hog a
+    site WITHOUT pigcache?". The proc / bandwidth breakdowns already capture
+    every domain regardless of plugin; this inventory tells the reader which
+    of those domains is even a candidate for pigcache benefit / blame.
+    """
+    if not home:
+        return {"available": False, "reason": "no $HOME"}
+
+    # Try every well-known docroot layout in order of how common they are
+    # for WordPress hosting. The first one that exists wins; the others
+    # are reported in `searched_layouts` so the consumer knows we looked.
+    layout_candidates = [
+        ("cpanel",      os.path.join(home, "public_html")),
+        ("plesk",       os.path.join(home, "httpdocs")),
+        ("directadmin", os.path.join(home, "domains")),  # nested → handled below
+        ("manual",      "/var/www/html"),
+        ("plesk-vhosts","/var/www/vhosts"),
+    ]
+    public_html = None
+    layout      = None
+    searched    = []
+    for label, path in layout_candidates:
+        searched.append({"layout": label, "path": path})
+        if os.path.isdir(path):
+            public_html = path
+            layout      = label
+            break
+
+    if not public_html:
+        return {
+            "available": False,
+            "reason": "no known docroot layout found",
+            "searched_layouts": searched,
+        }
+
+    try:
+        top_entries = sorted(os.listdir(public_html))
+    except OSError as exc:
+        return {"available": False, "reason": str(exc), "layout": layout}
+
+    sites_wp    = []
+    sites_other = []
+
+    # Also handle the case where public_html itself IS the WP root.
+    if os.path.isfile(os.path.join(public_html, "wp-config.php")):
+        top_entries = ["."] + top_entries
+
+    for entry in top_entries:
+        folder_path = public_html if entry == "." else os.path.join(public_html, entry)
+        folder_name = "_root" if entry == "." else entry
+
+        # Skip dotfiles, files (not directories), and obvious non-site dirs
+        if entry not in (".",):
+            if not os.path.isdir(folder_path):
+                continue
+            if entry.startswith(".") or entry in ("cgi-bin", "_vti_bin"):
+                continue
+
+        kind_info = _detect_site_kind(folder_path)
+        wp_cfg = kind_info["wp_config_path"]
+
+        if kind_info["kind"] != "wordpress" or not wp_cfg:
+            sites_other.append({
+                "folder": folder_name,
+                "path":   folder_path,
+                "kind":   kind_info["kind"],
+            })
+            continue
+
+        try:
+            cfg = parse_wp_config(wp_cfg)
+        except Exception as exc:
+            sites_other.append({
+                "folder": folder_name,
+                "path":   folder_path,
+                "kind":   "wordpress_unreadable",
+                "error":  str(exc),
+            })
+            continue
+
+        redis_db_raw = cfg.get("PIGCACHE_REDIS_DATABASE")
+        try:
+            redis_db = int(redis_db_raw) if redis_db_raw not in (None, "") else None
+        except (TypeError, ValueError):
+            redis_db = None
+
+        sites_wp.append({
+            "folder":               folder_name,
+            "path":                 wp_cfg,
+            "kind":                 "wordpress",
+            "table_prefix":         cfg.get("table_prefix"),
+            "db_name":              cfg.get("DB_NAME"),
+            "redis_db":             redis_db,
+            "redis_db_explicit":    redis_db is not None,
+            "redis_prefix":         cfg.get("PIGCACHE_REDIS_PREFIX") or "",
+            "redis_password_set":   bool(cfg.get("PIGCACHE_REDIS_PASSWORD")),
+            "redis_host":           cfg.get("PIGCACHE_REDIS_HOST") or "127.0.0.1",
+            "redis_port":           cfg.get("PIGCACHE_REDIS_PORT") or "6379",
+            "pigcache_installed":   kind_info["pigcache_installed"],
+            "pigcache_active_hint": kind_info["pigcache_active_hint"],
+            "wp_content_size_mb":   kind_info["wp_content_size_mb"],
+        })
+
+    # Collision detection: ONLY between sites that actually have pigcache
+    # installed. A WP site without pigcache won't read or write any keys in
+    # Redis, so its `table_prefix` matching another site is irrelevant.
+    pc_sites = [s for s in sites_wp if s["pigcache_installed"]]
+
+    by_db = defaultdict(list)
+    for s in pc_sites:
+        db = s["redis_db"] if s["redis_db"] is not None else 0
+        by_db[db].append(s["folder"])
+
+    collisions = []
+    for db, folders in sorted(by_db.items()):
+        if len(folders) > 1:
+            implicit = any(
+                s for s in pc_sites
+                if s["folder"] in folders and not s["redis_db_explicit"]
+            )
+            same_prefix = len({s["table_prefix"] for s in pc_sites
+                               if s["folder"] in folders}) < len(folders)
+            collisions.append({
+                "redis_db":             db,
+                "sites":                folders,
+                "any_implicit_db":      implicit,
+                "same_table_prefix":    same_prefix,
+            })
+
+    # Also call out: a pigcache site WITHOUT an explicit PIGCACHE_REDIS_DATABASE
+    # is risky on shared hosting (it falls to DB 0 which is the cPanel default
+    # and is most likely to be shared with other tenants). Surface as its own
+    # list so the alerts layer can fire on each one individually.
+    risky_implicit_db = [
+        s["folder"] for s in pc_sites
+        if not s["redis_db_explicit"]
+    ]
+
+    return {
+        "available":          True,
+        "home":                home,
+        "scan_root":           public_html,
+        "layout":              layout,   # cpanel | plesk | directadmin | manual | plesk-vhosts
+        "site_count":          len(sites_wp) + len(sites_other),
+        "wp_site_count":       len(sites_wp),
+        "pigcache_site_count": len(pc_sites),
+        "non_wp_count":        len(sites_other),
+        "sites":               sites_wp,         # backwards-compat alias
+        "sites_wp":            sites_wp,
+        "sites_other":         sites_other,
+        "collisions":          collisions,
+        "risky_implicit_db":   risky_implicit_db,
+    }
+
+
+def _redis_keyspace_per_db(client, sites_inventory=None):
+    """Run `INFO keyspace` and (optionally) cross-reference with wp-configs.
+
+    Output:
+        {
+            "available": True,
+            "by_db": {
+                "0": {"keys": 148893, "expires": 1553, "avg_ttl": 115572705,
+                      "wp_sites_pointing_here": ["jalisciense", "ridolimpieza"],
+                      "implicit_db_pointers": true,
+                      "shared_with_other_tenants_possible": true},
+                "7": {"keys": 766663, "expires": 4645, "avg_ttl": 746199532,
+                      "wp_sites_pointing_here": ["jaloy"]},
+                ...
+            },
+            "total_keys_across_dbs": 1266253
+        }
+    """
+    out = {"available": False}
+    try:
+        ks = client.info("keyspace") or {}
+    except Exception as exc:
+        out["reason"] = f"INFO keyspace failed: {exc}"
+        return out
+
+    # ks looks like: {"db0": "keys=148893,expires=1553,avg_ttl=115572705", ...}
+    # (Both the bare client and redis-py give us the same shape because the
+    # value contains commas → not coercible to int/float by either parser.)
+    by_db = {}
+    total = 0
+    for k, v in ks.items():
+        if not isinstance(k, str) or not k.startswith("db"):
+            continue
+        # redis-py returns {"db0": {"keys": 148893, ...}} — already parsed.
+        if isinstance(v, dict):
+            fields = v
+        else:
+            fields = {}
+            for kv in str(v).split(","):
+                if "=" in kv:
+                    kk, vv = kv.split("=", 1)
+                    try:
+                        fields[kk] = int(vv)
+                    except ValueError:
+                        fields[kk] = vv
+        db_index = k[2:]
+        keys = int(fields.get("keys", 0) or 0)
+        total += keys
+        by_db[db_index] = {
+            "keys":    keys,
+            "expires": int(fields.get("expires", 0) or 0),
+            "avg_ttl": int(fields.get("avg_ttl", 0) or 0),
+            "no_ttl_pct": (round((keys - int(fields.get("expires", 0) or 0)) / keys * 100, 1)
+                           if keys else None),
+        }
+
+    if sites_inventory and sites_inventory.get("available"):
+        # Map each DB → list of WP sites pointing at it.
+        site_map = defaultdict(list)
+        implicit_map = defaultdict(bool)
+        for s in sites_inventory.get("sites") or []:
+            if "folder" not in s:
+                continue
+            db = s["redis_db"] if s["redis_db"] is not None else 0
+            site_map[str(db)].append(s["folder"])
+            if not s["redis_db_explicit"]:
+                implicit_map[str(db)] = True
+
+        # Annotate each DB row.
+        for db, info in by_db.items():
+            info["wp_sites_pointing_here"]   = site_map.get(db, [])
+            info["implicit_db_pointers"]     = implicit_map.get(db, False)
+            # On shared hosts ANY DB can be touched by other cPanel users that
+            # also point at the same Redis instance — but the risk is highest
+            # on DB 0 (the default), where ours is mixed with theirs.
+            info["shared_with_other_tenants_possible"] = (db == "0")
+
+    out["available"]              = True
+    out["by_db"]                  = by_db
+    out["total_keys_across_dbs"]  = total
+    return out
+
+
+# ── Per-process → per-domain attribution ────────────────────────────────────
+#
+# Different PHP handlers expose the script path / pool name differently in
+# /proc/PID/cmdline. We try them all in order of specificity:
+#
+#   LSPHP (LiteSpeed):
+#     cmdline = "lsphp:/home/USER/public_html/SITE/index.php"
+#     or truncated form  "lsphp:lic_html/SITE/index.php" (LS cuts the leading
+#     "pub" of public_html to fit the title size limit).
+#
+#   PHP-FPM:
+#     cmdline = "php-fpm: pool POOLNAME"
+#     or       "php-fpm: pool POOLNAME [idle]"
+#     POOLNAME is set in the FPM pool config; on cPanel/EA-PHP it's the
+#     cPanel username; on per-site pools (some setups) it's the site folder.
+#
+#   Apache mod_php / Nginx + php-fpm worker:
+#     cmdline = "httpd -DFOREGROUND" / "apache2 -k start" / "nginx: worker"
+#     → no per-site info in cmdline; only `cwd` may have it (rare).
+#
+#   CGI/FastCGI:
+#     cmdline = "php-cgi"  (no path; depends on web server passing it)
+#
+# Hosting layout differs too — handlers writes paths anchored on the docroot:
+#   cPanel       :  /home/USER/public_html/<site>/
+#   DirectAdmin  :  /home/USER/domains/<domain>/public_html/
+#   Plesk        :  /var/www/vhosts/<domain>/httpdocs/
+#   ISPConfig    :  /var/www/clients/clientN/webM/web/
+#   Manual VPS   :  /var/www/html/<site>/  (no convention)
+#
+# Each layout has its own DOCROOT pattern; we match all of them so the
+# breakdown works on any of these stacks.
+
+# cPanel layouts (the most common pigcache target)
+_LSPHP_PATH_RE  = re.compile(r"/(?:home/[^/]+/)?public_html/([^/]+)/")
+_LSPHP_TAIL_RE  = re.compile(r"public_html/([^/]+)/")
+# LSPHP truncates the process title — "pub" of public_html gets sliced
+_LSPHP_TRUNC_RE = re.compile(r"(?:lic_html|ic_html|c_html|_html)/([^/]+)/")
+# DirectAdmin / older shared layouts
+_DA_PATH_RE     = re.compile(r"/(?:home/[^/]+/)?domains/([^/]+)/public_html/")
+# Plesk
+_PLESK_PATH_RE  = re.compile(r"/var/www/vhosts/([^/]+)/httpdocs/")
+# ISPConfig
+_ISP_PATH_RE    = re.compile(r"/var/www/clients/client\d+/(web\d+)/")
+# PHP-FPM pool name
+_FPM_POOL_RE    = re.compile(r"php-fpm:\s*(?:pool\s+)?([\w\-\.]+)")
+
+
+def _try_layout_patterns(text):
+    """Try every known docroot regex against `text`. Returns the matched
+    folder/site name or None. Order = most specific first."""
+    for rx in (_LSPHP_PATH_RE, _LSPHP_TAIL_RE, _LSPHP_TRUNC_RE,
+               _DA_PATH_RE,    _PLESK_PATH_RE,  _ISP_PATH_RE):
+        m = rx.search(text)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _classify_proc_to_domain(proc):
+    """Map one process dict (from scan_own_processes) to a domain folder.
+
+    Tries (in order):
+      1. cmdline against every known docroot pattern (cPanel/DA/Plesk/ISPConfig)
+      2. cmdline against PHP-FPM pool name
+      3. /proc/PID/cwd against same docroot patterns
+      4. /proc/PID/cwd against PHP-FPM pool name detection via FPM master
+      5. Special-case the LSPHP pool master (cmdline=='lsphp', cwd=/opt/cpanel/ea-php*)
+      6. Special-case Apache children (no per-site info available → _httpd_worker)
+      7. Fallback: "_unknown"
+    """
+    cmd  = proc.get("cmdline") or ""
+    name = (proc.get("name") or "").lower()
+
+    # 1) cmdline → docroot (works for LSPHP and any handler that includes
+    # the script path in its argv).
+    hit = _try_layout_patterns(cmd)
+    if hit:
+        return hit
+
+    # 2) cmdline → PHP-FPM pool name. Pool name is usually the cPanel user
+    # OR the site folder (depends on the pool config). Treat it as the site
+    # bucket; downstream the user can rename via tenant.sibling_folders.
+    if "php-fpm" in cmd or name == "php-fpm":
+        m = _FPM_POOL_RE.search(cmd)
+        if m:
+            pool = m.group(1)
+            if pool not in ("master", "process"):
+                return f"fpm:{pool}"
+
+    # 3) cwd → docroot. Works for handlers that don't expose the script in
+    # cmdline (mod_php under Apache, php-fpm idle workers, etc.).
+    pid = proc.get("pid")
+    cwd = ""
+    if pid:
+        try:
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+        except OSError:
+            cwd = ""
+    if cwd:
+        hit = _try_layout_patterns(cwd + "/")
+        if hit:
+            return hit
+
+    # 4) Pool/worker special cases anchored on cwd or comm
+    if cwd and "ea-php" in cwd and name == "lsphp":
+        return "_lsphp_master"
+    if (name == "lsphp"
+            and cmd.strip() in ("lsphp", "lsphp:", "")):
+        return "_lsphp_master"
+    if name in ("httpd", "apache2"):
+        # Apache children don't expose the per-vhost they're serving.
+        # All Apache MPM workers fall into one bucket so the report at
+        # least surfaces the aggregate.
+        return "_httpd_worker"
+    if name == "nginx":
+        return "_nginx_worker"
+    if name == "php-fpm":
+        return "_fpm_master"
+
+    return "_unknown"
+
+
+def _breakdown_procs_by_domain(processes):
+    """Aggregate per-process CPU / RSS / IO into per-domain totals.
+
+    `processes` is the list produced by `scan_own_processes()`. This function
+    is the answer to "which of my sites is hammering disk IO?" on shared hosts
+    where you can see your own PIDs but the rest of the OS counters are pooled.
+    """
+    if not processes:
+        return {"available": False, "reason": "no processes visible"}
+
+    buckets = defaultdict(lambda: {
+        "procs":         0,
+        "rss_mb":        0.0,
+        "cpu_seconds":   0.0,
+        "io_read_mb":    0.0,
+        "io_write_mb":   0.0,
+        "threads":       0,
+        "states":        defaultdict(int),
+        "top_cmdlines":  [],
+    })
+
+    for p in processes:
+        bucket_key = _classify_proc_to_domain(p)
+        b = buckets[bucket_key]
+        b["procs"] += 1
+        b["rss_mb"]      += float(p.get("rss_mb", 0) or 0)
+        b["cpu_seconds"] += float(p.get("cpu_seconds", 0) or 0)
+        b["io_read_mb"]  += float(p.get("io_read_mb", 0) or 0)
+        b["io_write_mb"] += float(p.get("io_write_mb", 0) or 0)
+        b["threads"]     += int(p.get("threads", 0) or 0)
+        state = p.get("state", "?")
+        b["states"][state] += 1
+        if len(b["top_cmdlines"]) < 3:
+            cmd = (p.get("cmdline") or p.get("name") or "")[:80]
+            if cmd:
+                b["top_cmdlines"].append(cmd)
+
+    rows = []
+    for folder, b in buckets.items():
+        rows.append({
+            "folder":      folder,
+            "procs":       b["procs"],
+            "rss_mb":      round(b["rss_mb"], 1),
+            "cpu_seconds": round(b["cpu_seconds"], 2),
+            "io_read_mb":  round(b["io_read_mb"], 1),
+            "io_write_mb": round(b["io_write_mb"], 1),
+            "threads":     b["threads"],
+            "states":      dict(b["states"]),
+            "samples":     b["top_cmdlines"],
+        })
+
+    # Sort by composite "pain score": IO read first (the user's main concern),
+    # then RSS, then CPU. _lsphp_master is informational only, push to bottom.
+    def _sort_key(r):
+        is_special = r["folder"].startswith("_")
+        return (
+            is_special,
+            -r["io_read_mb"],
+            -r["rss_mb"],
+            -r["cpu_seconds"],
+        )
+    rows.sort(key=_sort_key)
+
+    return {
+        "available":      True,
+        "by_folder":      rows,
+        "total_procs":    sum(r["procs"] for r in rows),
+        "total_rss_mb":   round(sum(r["rss_mb"] for r in rows), 1),
+        "total_cpu_s":   round(sum(r["cpu_seconds"] for r in rows), 2),
+        "total_io_read_mb":  round(sum(r["io_read_mb"] for r in rows), 1),
+        "total_io_write_mb": round(sum(r["io_write_mb"] for r in rows), 1),
+    }
+
+
+def _build_tenant_fingerprint(hostname, user, sites_inventory=None,
+                               account_snapshot=None):
+    """Build a stable identifier so the cloud API can group sibling sites.
+
+    On shared cPanel hosting the same OS user owns multiple WP installs that
+    SHARE the disk / RAM / bandwidth / Redis quotas. Without a tenant id, the
+    cloud sees N independent sites and cannot tell that they all draw from
+    one pie. With it, the cloud can render a "this account hosts N sites,
+    M with pigcache, sharing X GB disk and Y GB bandwidth" view.
+
+    The id is deliberately readable (`hostname::user`) so admins can match
+    it to their server in one glance; for hashed-id requirements the cloud
+    can sha1 it server-side. Returns a dict suitable for top-level
+    `payload["tenant"]`.
+    """
+    out = {
+        "tenant_id":   f"{hostname or '?'}::{user or '?'}",
+        "hostname":    hostname,
+        "cpanel_user": user,
+    }
+
+    inv = sites_inventory or {}
+    if inv.get("available"):
+        wp = inv.get("sites_wp") or []
+        pc = [s for s in wp if s.get("pigcache_installed")]
+        out["wp_site_count"]            = len(wp)
+        out["pigcache_site_count"]      = len(pc)
+        out["non_wp_site_count"]        = inv.get("non_wp_count", 0)
+        out["shared_hosting"]           = (
+            (len(wp) + (inv.get("non_wp_count") or 0)) > 1
+        )
+        out["sibling_folders"]          = [s["folder"] for s in wp]
+        out["sibling_pigcache"]         = [s["folder"] for s in pc]
+        out["sibling_non_wp_folders"]   = [s["folder"]
+                                           for s in (inv.get("sites_other") or [])]
+    else:
+        out["shared_hosting"] = None  # unknown — cloud should treat as 1-tenant
+
+    acct = account_snapshot or {}
+    if acct.get("available"):
+        out["account_quotas"] = {
+            "disk_quota_gb":       acct.get("disk_quota_gb"),
+            "mysql_disk_quota_gb": acct.get("mysql_disk_quota_gb"),
+            "bandwidth_quota_gb":  acct.get("bandwidth_quota_gb"),
+        }
+
+    return out
+
+
+_VHOST_LOG_FILENAME_RE = re.compile(
+    r"^(?P<domain>.+?)"
+    r"(?:-ssl_log)?"
+    r"-(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+    r"-\d{4}"
+    r"(?:\.gz)?$"
+)
+
+
+def _vhost_logs_summary(home):
+    """Summarise ~/logs/ per VHOST (cPanel writes one log per domain).
+
+    cPanel rotates these files monthly and gzips them in place daily, so the
+    "live" log for the current month is the largest non-gzip file (or, when
+    the host gzips daily, the largest .gz). We don't parse the log contents
+    (would burn CPU on every cron run); we just group by domain so the user
+    can see which one is eating I/O.
+
+    NOTE: filenames look like:
+        jaliscohoy.com.tocinoprime.com-ssl_log-May-2026.gz
+        jaliscohoy.com.tocinoprime.com-May-2026.gz
+        ftp.tocinoprime.com-ftp_log-Aug-2024.gz
+    where everything before the month name is the vhost. The ".tocinoprime.com"
+    tail is the cPanel "main domain" suffix and is harmless; we keep it intact
+    so the keys match what `Bandwidth query grouping=domain` returns.
+    """
+    if not home:
+        return {"available": False, "reason": "no $HOME"}
+
+    # Try every known per-vhost log layout:
+    #   cPanel       : ~/logs/<vhost>(-ssl_log|-ftp_log)?-MMM-YYYY(.gz)?
+    #   Plesk        : /var/www/vhosts/<domain>/logs/access_log
+    #   DirectAdmin  : /var/log/httpd/domains/<domain>.log
+    log_candidates = [
+        ("cpanel", os.path.join(home, "logs")),
+        ("plesk",  "/var/www/vhosts"),     # parsed differently below
+        ("directadmin", "/var/log/httpd/domains"),
+    ]
+    logs_dir = None
+    layout   = None
+    for label, path in log_candidates:
+        if os.path.isdir(path):
+            logs_dir = path
+            layout   = label
+            break
+    if not logs_dir:
+        return {"available": False, "reason": "no per-vhost log directory found"}
+
+    # Plesk and DirectAdmin layouts have a different structure (one
+    # access_log per vhost, not monthly rotated). Full parsing for those
+    # is TODO — for now we surface the layout so the API knows the data
+    # is partial and can suggest the user install logrotate-monthly hooks
+    # OR run a separate per-vhost log probe.
+    if layout != "cpanel":
+        return {
+            "available": True,
+            "dir":       logs_dir,
+            "layout":    layout,
+            "parsed":    False,
+            "reason":    (
+                f"Detected {layout} layout but per-vhost parsing is only "
+                "implemented for cPanel-style filenames; PR welcome."
+            ),
+        }
+
+    try:
+        entries = os.listdir(logs_dir)
+    except OSError as exc:
+        return {"available": False, "reason": str(exc), "layout": layout}
+
+    by_domain = defaultdict(lambda: {
+        "files":           0,
+        "bytes_total":     0,
+        "latest_mtime":    0,
+        "latest_filename": None,
+        "ssl_bytes":       0,
+        "plain_bytes":     0,
+        "ftp_bytes":       0,
+    })
+
+    for name in entries:
+        full = os.path.join(logs_dir, name)
+        try:
+            st = os.stat(full)
+        except OSError:
+            continue
+        if not (st.st_mode & 0o170000) == 0o100000:  # only regular files
+            continue
+
+        m = _VHOST_LOG_FILENAME_RE.match(name)
+        if not m:
+            continue
+        domain = m.group("domain")
+        is_ssl = "-ssl_log" in name
+        is_ftp = "-ftp_log" in name
+
+        b = by_domain[domain]
+        b["files"] += 1
+        b["bytes_total"] += st.st_size
+        if is_ssl:
+            b["ssl_bytes"]   += st.st_size
+        elif is_ftp:
+            b["ftp_bytes"]   += st.st_size
+        else:
+            b["plain_bytes"] += st.st_size
+        if st.st_mtime > b["latest_mtime"]:
+            b["latest_mtime"]    = st.st_mtime
+            b["latest_filename"] = name
+
+    rows = []
+    for dom, b in by_domain.items():
+        rows.append({
+            "domain":            dom,
+            "files":             b["files"],
+            "bytes_total":       b["bytes_total"],
+            "size_total_mb":     round(b["bytes_total"] / (1024 ** 2), 1),
+            "ssl_size_mb":       round(b["ssl_bytes"]   / (1024 ** 2), 1),
+            "plain_size_mb":     round(b["plain_bytes"] / (1024 ** 2), 1),
+            "ftp_size_mb":       round(b["ftp_bytes"]   / (1024 ** 2), 1),
+            "latest_filename":   b["latest_filename"],
+            "latest_mtime_iso":  (datetime.utcfromtimestamp(b["latest_mtime"])
+                                  .isoformat() + "Z") if b["latest_mtime"] else None,
+        })
+    rows.sort(key=lambda r: r["bytes_total"], reverse=True)
+
+    return {
+        "available":      True,
+        "dir":            logs_dir,
+        "layout":         layout,
+        "parsed":         True,
+        "domain_count":   len(rows),
+        "by_domain":      rows[:30],
+        "bytes_total":    sum(r["bytes_total"] for r in rows),
+    }
 
 
 # ─── Rendering helpers ───────────────────────────────────────────────────────
@@ -2524,6 +4356,156 @@ def render_system_text(sys_snap):
     if scope == "server_wide":
         out.append("  ─ metrics above = server totals, not your account quota ─")
 
+    # ── Per-cPanel-account UAPI quotas ────────────────────────────────
+    account = sys_snap.get("account", {}) or {}
+    out.append("")
+    out.append("─── Account (cPanel UAPI) ────────────────────────────")
+    if not account.get("available"):
+        out.append(f"  status                  : not available  ({account.get('reason', '?')})")
+    else:
+        def _line(label, used_gb, quota_gb, pct):
+            qstr = f"{quota_gb} GiB" if quota_gb else "unlimited"
+            pstr = f"  {_fmt_pct(pct)}  {_ascii_bar(pct)}" if pct is not None else ""
+            out.append(f"  {label:<24}: {used_gb} / {qstr}{pstr}")
+
+        _line("disk",        account.get("disk_used_gb"),
+                              account.get("disk_quota_gb"),
+                              account.get("disk_used_pct"))
+        _line("mysql_disk",  account.get("mysql_disk_used_gb"),
+                              account.get("mysql_disk_quota_gb"),
+                              account.get("mysql_disk_used_pct"))
+        _line("bandwidth_month", account.get("bandwidth_used_gb"),
+                                  account.get("bandwidth_quota_gb"),
+                                  account.get("bandwidth_used_pct"))
+        for k, label in (("addon_domains",  "addon_domains"),
+                         ("subdomains",     "subdomains"),
+                         ("alias_domains",  "alias_domains"),
+                         ("email_accounts", "email_accounts"),
+                         ("mailing_lists",  "mailing_lists")):
+            v = account.get(k)
+            if v is not None:
+                out.append(f"  {label:<24}: {v}")
+
+        bw_dom = account.get("bandwidth_by_domain") or []
+        if bw_dom:
+            out.append("")
+            out.append("  bandwidth_by_domain (monthly, top 10):")
+            for row in bw_dom[:10]:
+                out.append(
+                    f"    {row['domain']:<48}  "
+                    f"{row['bandwidth_gb']:>7.2f} GiB"
+                )
+
+    # ── Per-domain process breakdown ──────────────────────────────────
+    abd = sys_snap.get("account_by_domain", {}) or {}
+    if abd.get("available"):
+        out.append("")
+        out.append("─── My sites: live processes by folder ───────────────")
+        out.append("  {:<20} {:>5} {:>10} {:>10} {:>14} {:>14}".format(
+            "folder", "procs", "rss MiB", "cpu sec", "io read MiB", "io write MiB",
+        ))
+        out.append("  " + "-" * 80)
+        for r in abd.get("by_folder") or []:
+            tag = r["folder"]
+            if tag == "_lsphp_master":
+                tag = "_lsphp_pool"
+            out.append("  {:<20} {:>5} {:>10} {:>10} {:>14} {:>14}".format(
+                tag[:20],
+                r["procs"],
+                r["rss_mb"],
+                r["cpu_seconds"],
+                r["io_read_mb"],
+                r["io_write_mb"],
+            ))
+        out.append(
+            f"  totals (excl. _lsphp_pool counted separately): "
+            f"{abd['total_procs']} procs, "
+            f"{abd['total_rss_mb']} MiB RSS, "
+            f"{abd['total_io_read_mb']} MiB read"
+        )
+
+    # ── Sites inventory + collisions ──────────────────────────────────
+    inv = sys_snap.get("sites_inventory", {}) or {}
+    if inv.get("available"):
+        out.append("")
+        out.append(
+            f"─── My sites under ~/public_html  "
+            f"({inv.get('wp_site_count', 0)} WP, "
+            f"{inv.get('pigcache_site_count', 0)} with pigcache, "
+            f"{inv.get('non_wp_count', 0)} non-WP) ─"
+        )
+        out.append("  {:<20} {:<14} {:>10} {:>11} {:>11}  {}".format(
+            "folder", "kind", "tbl_prefix", "redis_db", "pigcache", "size",
+        ))
+        out.append("  " + "-" * 80)
+        for s in inv.get("sites_wp") or []:
+            db_label = (
+                "(default→0)" if not s["redis_db_explicit"] else str(s["redis_db"])
+            )
+            if s["pigcache_installed"]:
+                pc_label = s.get("pigcache_active_hint", "unknown")
+            else:
+                pc_label = "no"
+            size = (f"{s['wp_content_size_mb']} MiB"
+                    if s.get("wp_content_size_mb") is not None else "?")
+            out.append("  {:<20} {:<14} {:>10} {:>11} {:>11}  {}".format(
+                (s["folder"] or "_root")[:20],
+                "wordpress",
+                (s["table_prefix"] or "?")[:10],
+                db_label,
+                pc_label,
+                size,
+            ))
+        for s in inv.get("sites_other") or []:
+            out.append("  {:<20} {:<14} {:>10} {:>11} {:>11}".format(
+                s["folder"][:20],
+                s.get("kind", "?")[:14],
+                "—", "—", "—",
+            ))
+        if inv.get("collisions"):
+            out.append("  ⚠ redis-db collisions among pigcache sites:")
+            for c in inv["collisions"]:
+                marks = []
+                if c.get("any_implicit_db") and c["redis_db"] == 0:
+                    marks.append("DB 0 implicit")
+                if c.get("same_table_prefix"):
+                    marks.append("same table_prefix")
+                mark = "  (" + ", ".join(marks) + ")" if marks else ""
+                out.append(
+                    f"    db={c['redis_db']}  sites={c['sites']}{mark}"
+                )
+        if inv.get("risky_implicit_db"):
+            out.append(
+                f"  ⚠ pigcache sites with no PIGCACHE_REDIS_DATABASE pin: "
+                f"{inv['risky_implicit_db']}"
+            )
+
+    return "\n".join(out)
+
+
+def render_redis_per_db_text(rpd):
+    """Render the redis_per_db block as a small dashboard table."""
+    out = ["─── Redis per-DB keyspace ────────────────────────────"]
+    if not rpd or not rpd.get("available"):
+        out.append(f"  status                  : not available  ({(rpd or {}).get('reason', '?')})")
+        return "\n".join(out)
+    out.append("  {:<5} {:>10} {:>10} {:>8}  {}".format(
+        "db", "keys", "with TTL", "no_ttl%", "my sites pointing here",
+    ))
+    out.append("  " + "-" * 76)
+    for db_idx in sorted(rpd.get("by_db") or {}, key=lambda k: int(k)):
+        row = rpd["by_db"][db_idx]
+        sites = row.get("wp_sites_pointing_here") or []
+        warn = "  ← shared w/ other tenants" if row.get("shared_with_other_tenants_possible") and not sites else ""
+        out.append("  {:<5} {:>10} {:>10} {:>7}%  {}{}".format(
+            db_idx,
+            row.get("keys", 0),
+            row.get("expires", 0),
+            row.get("no_ttl_pct") if row.get("no_ttl_pct") is not None else "?",
+            ", ".join(sites) if sites else "—",
+            warn,
+        ))
+    out.append(f"  total keys              : {rpd.get('total_keys_across_dbs', 0):,}")
     return "\n".join(out)
 
 
@@ -2593,17 +4575,35 @@ def render_environment_text(env):
     lsc = env.get("lscache", {})
     if lsc.get("available"):
         files = lsc.get("cached_files", lsc.get("cached_files_approx", "?"))
+        recent = lsc.get("recent_files_24h", 0)
         size_b = lsc.get("cached_bytes")
         size_str = _fmt_bytes(size_b) if isinstance(size_b, int) else "?"
-        out.append(f"  lscache                 : ACTIVE  {files} files  {size_str}")
+        htaccess = lsc.get("htaccess_cachelookup")
+        active = lsc.get("cache_active")
+        if active and htaccess:
+            status = "⚠ ACTIVE (CacheLookup on + recent files)"
+        elif active and not htaccess:
+            status = "files present, but .htaccess CacheLookup off → idle"
+        elif files and not active:
+            age_h = lsc.get("newest_file_age_h", "?")
+            status = f"stale ({files} files, newest {age_h}h old)"
+        else:
+            status = "directory exists, no cached files"
+        out.append(f"  lscache                 : {status}  ({files} files, {size_str})")
+        out.append(
+            f"    htaccess CacheLookup  : {'on' if htaccess else 'off / not set'}"
+        )
+        if isinstance(recent, int) and recent > 0:
+            out.append(f"    cached in last 24h    : {recent} files")
         if lsc.get("lscm_data_dir"):
             out.append(f"    lscmData dir          : {lsc['lscm_data_dir']}")
         if lsc.get("wp_plugin_installed"):
             out.append("    wp plugin             : installed on disk")
         if lsc.get("conflict"):
-            # Print first sentence of the conflict message
             first = lsc["conflict"].split(".")[0] + "."
             out.append(f"  ⚠ CONFLICT              : {first}")
+        elif lsc.get("note"):
+            out.append(f"    note                  : {lsc['note'].split('.')[0]}.")
     else:
         out.append("  lscache                 : not detected")
 
@@ -2675,12 +4675,57 @@ def render_environment_text(env):
     else:
         out.append("  access_logs             : not found")
 
-    # Competing cache plugins
+    # Per-vhost log breakdown (one file per domain, written by cPanel)
+    vh = env.get("vhost_logs", {})
+    if vh.get("available"):
+        out.append(
+            f"  vhost_logs              : {vh.get('domain_count', '?')} domain(s), top 8:"
+        )
+        for r in (vh.get("by_domain") or [])[:8]:
+            out.append(
+                f"    {r['domain']:<46}  "
+                f"{r['size_total_mb']:>7.1f} MiB  "
+                f"(ssl {r['ssl_size_mb']} / plain {r['plain_size_mb']} / ftp {r['ftp_size_mb']})"
+            )
+
+    # Object-cache.php drop-in (who actually owns the WP object cache)
+    do = env.get("object_cache_dropin", {})
+    if do.get("present"):
+        owner = do.get("owner") or "unknown"
+        owner_label = {
+            "pigcache":               "✓ pigcache (this plugin)",
+            "redis-cache-till-kruss": "⚠ Redis Object Cache (Till Krüss original)",
+            "w3-total-cache":         "⚠ W3 Total Cache",
+            "memcached":              "⚠ Memcached drop-in",
+            "redis-other":            "⚠ unknown Redis drop-in",
+        }.get(owner, owner)
+        out.append(f"  object_cache_dropin     : {owner_label}")
+        if do.get("plugin_name"):
+            out.append(f"    plugin_name           : {do['plugin_name']}")
+        if do.get("mtime_iso"):
+            out.append(f"    mtime                 : {do['mtime_iso'][:19]}Z")
+    else:
+        out.append("  object_cache_dropin     : not present (no plugin owns it)")
+
+    # Competing cache plugins (now informational unless conflicts are listed)
     cp = env.get("competing_plugins", {})
-    if cp.get("available"):
-        out.append(f"  competing_plugins       : ⚠ {len(cp['found'])} found on disk")
+    if cp.get("found"):
+        head = "⚠" if cp.get("conflicts") else "·"
+        out.append(
+            f"  competing_plugins       : {head} {len(cp['found'])} cache plugin(s) on disk"
+        )
         for plug in cp.get("found", []):
-            out.append(f"    - {plug['name']}  ({plug['slug']})")
+            tag = "active" if plug.get("likely_active") else "inactive"
+            layers = "+".join(plug.get("layers", []))
+            out.append(
+                f"    - {plug['name']:<40}  ({plug['slug']:<20}) [{tag}, {layers}]"
+            )
+            if plug.get("note"):
+                out.append(f"        note: {plug['note']}")
+        for conflict_msg in cp.get("conflicts") or []:
+            out.append(f"    ⚠ {conflict_msg}")
+        if not cp.get("conflicts") and cp.get("info"):
+            out.append(f"    info: {cp['info']}")
     elif cp.get("plugins_dir_readable"):
         out.append("  competing_plugins       : none detected")
     else:
@@ -3149,8 +5194,28 @@ def cmd_report(args, cfg):
         except Exception as exc:
             stampede_block = {"error": str(exc)}
 
+    # ── Per-DB Redis keyspace (cross-referenced with sites_inventory) ─
+    # Cheap (single INFO keyspace call) and orthogonal to `breakdown`.
+    sites_inv = (sys_block or {}).get("sites_inventory")
+    try:
+        redis_per_db_block = _redis_keyspace_per_db(client, sites_inv)
+    except Exception as exc:
+        redis_per_db_block = {"available": False, "reason": str(exc)}
+
+    # ── Tenant fingerprint (lets the cloud API group sibling sites) ───
+    tenant_block = _build_tenant_fingerprint(
+        hostname=socket.gethostname(),
+        user=getpass.getuser(),
+        sites_inventory=sites_inv,
+        account_snapshot=(sys_block or {}).get("account"),
+    )
+
     # ── Alerts (run health-check logic against this snapshot) ─────────
-    alerts = _compute_alerts(snap, cb, mysql_block, stampede_block, sys_block=sys_block)
+    alerts = _compute_alerts(
+        snap, cb, mysql_block, stampede_block,
+        sys_block=sys_block,
+        redis_per_db=redis_per_db_block,
+    )
 
     # ── Resolve API credentials (constants → wp_options, like cron) ───
     api_url, api_key, site_id, site_url = resolve_api_credentials(
@@ -3180,7 +5245,9 @@ def cmd_report(args, cfg):
             "hostname": socket.gethostname(),
             "user": getpass.getuser(),
         },
+        "tenant": tenant_block,
         "redis": snap,
+        "redis_per_db": redis_per_db_block,
         "circuit_breaker": cb,
         "mysql": mysql_block,
         "breakdown": breakdown_block,
@@ -3237,7 +5304,8 @@ def cmd_report(args, cfg):
 def _compute_alerts(snap, cb, mysql_block, stampede_block, sys_block=None,
                     ping_max_ms=50.0, hit_ratio_min=80.0,
                     memory_fill_max=90.0, stampede_max=25,
-                    mysql_sat_max=80.0):
+                    mysql_sat_max=80.0, redis_per_db=None,
+                    account_quota_warn=85.0, account_quota_crit=95.0):
     """Pure-function version of the rules in run_health(). Used by `report`."""
     alerts = []
 
@@ -3400,29 +5468,159 @@ def _compute_alerts(snap, cb, mysql_block, stampede_block, sys_block=None,
                            f"({mem_used // (1024*1024)} / {mem_limit // (1024*1024)} MiB).",
                 })
 
+    # ── Per-account quotas (cPanel UAPI) ──────────────────────────────
+    # When UAPI data is present, alert on disk / MySQL-disk quota pressure.
+    # Bandwidth has no maximum on most plans → only alert if a quota is set.
+    account = (sys_block or {}).get("account") or {}
+    if account.get("available"):
+        for metric, label in (
+            ("disk_used_pct",       "Disk"),
+            ("mysql_disk_used_pct", "MySQL disk"),
+            ("bandwidth_used_pct",  "Bandwidth"),
+        ):
+            pct = account.get(metric)
+            if not isinstance(pct, (int, float)):
+                continue
+            if pct >= account_quota_crit:
+                alerts.append({
+                    "severity": "critical",
+                    "code": f"account_quota_{metric}",
+                    "msg": f"cPanel account {label} usage {pct}% of quota "
+                           "— host will refuse new writes once full.",
+                })
+            elif pct >= account_quota_warn:
+                alerts.append({
+                    "severity": "warn",
+                    "code": f"account_quota_{metric}",
+                    "msg": f"cPanel account {label} usage {pct}% of quota.",
+                })
+
+    # ── Sites inventory: Redis DB collisions across sibling sites ─────
+    # Only fires for sites that actually have pigcache installed; WP sites
+    # without pigcache aren't reading or writing Redis so a shared DB is fine.
+    sites_inv = (sys_block or {}).get("sites_inventory") or {}
+    if sites_inv.get("available"):
+        for col in sites_inv.get("collisions") or []:
+            db    = col["redis_db"]
+            sites = col["sites"]
+            implicit    = col.get("any_implicit_db")
+            same_prefix = col.get("same_table_prefix")
+            sev = "critical" if same_prefix else "warn"
+            tail = " — and table_prefix matches → keys WILL collide." if same_prefix else ""
+            if implicit and db == 0:
+                alerts.append({
+                    "severity": sev, "code": "redis_db_unset",
+                    "msg": (
+                        f"{len(sites)} pigcache sites have no "
+                        "PIGCACHE_REDIS_DATABASE define and fall back to "
+                        f"shared DB 0: {', '.join(sites)}{tail}"
+                    ),
+                })
+            else:
+                alerts.append({
+                    "severity": sev, "code": "redis_db_collision",
+                    "msg": (
+                        f"{len(sites)} pigcache sites on this account share "
+                        f"Redis DB {db}: {', '.join(sites)}{tail}"
+                    ),
+                })
+
+        # Per-site warning for any pigcache install that didn't pin its DB.
+        for folder in sites_inv.get("risky_implicit_db") or []:
+            alerts.append({
+                "severity": "warn",
+                "code": "pigcache_no_db_pin",
+                "msg": (
+                    f"Site '{folder}' has pigcache installed but no "
+                    "PIGCACHE_REDIS_DATABASE define — falls back to DB 0 "
+                    "which other tenants on this shared Redis can FLUSHDB."
+                ),
+            })
+
+    # ── Per-DB Redis stats: surface DB 0 being shared with other tenants ─
+    if redis_per_db and redis_per_db.get("available"):
+        db0 = (redis_per_db.get("by_db") or {}).get("0")
+        if db0 and db0.get("keys", 0) > 0 and not db0.get("wp_sites_pointing_here"):
+            # DB 0 has keys but NONE of *our* WP sites point there → those
+            # keys belong to another cPanel tenant on the same Redis server.
+            alerts.append({
+                "severity": "warn",
+                "code": "redis_db0_shared_tenant",
+                "msg": (
+                    f"Redis DB 0 holds {db0['keys']:,} keys that don't belong "
+                    "to any of your WordPress sites — this Redis instance is "
+                    "shared with other tenants. Make sure every wp-config.php "
+                    "defines a unique PIGCACHE_REDIS_DATABASE so other tenants "
+                    "cannot FLUSHDB your cache by accident."
+                ),
+            })
+
+    # ── Per-domain process I/O hot-spot ───────────────────────────────
+    by_domain = (sys_block or {}).get("account_by_domain") or {}
+    if by_domain.get("available"):
+        # Flag any single non-special domain doing >1 GiB of disk read
+        for row in by_domain.get("by_folder") or []:
+            if row["folder"].startswith("_"):
+                continue
+            if row["io_read_mb"] > 1024:
+                alerts.append({
+                    "severity": "warn",
+                    "code": "domain_io_read_hot",
+                    "msg": (
+                        f"Domain folder '{row['folder']}' has read "
+                        f"{row['io_read_mb']:.0f} MiB from disk across "
+                        f"{row['procs']} process(es) since they started."
+                    ),
+                })
+
     # Environment-level alerts (LSCache conflict, competing plugins)
     env = (sys_block or {}).get("environment", {})
     if env:
         lsc = env.get("lscache", {})
-        if lsc.get("available") and lsc.get("cache_active"):
+        # Strict: fire only when LSCache has active cache files AND the
+        # webserver is configured to use them via .htaccess CacheLookup.
+        # A single stale file from months ago no longer trips this alert.
+        if (lsc.get("available")
+                and lsc.get("cache_active")
+                and lsc.get("htaccess_cachelookup")):
             alerts.append({
                 "severity": "critical", "code": "lscache_conflict",
-                "msg": "LiteSpeed LSCache has active page-cache files. "
-                       "LSCache intercepts requests before advanced-cache.php runs, "
-                       "so PigCache HTML cache entries are never populated or served. "
-                       "Disable LSCache full-page caching OR PigCache HTML cache — "
-                       "not both.",
+                "msg": lsc.get("conflict")
+                       or ("LSCache is actively serving pages and bypasses "
+                           "PigCache HTML cache. Disable one of them."),
+            })
+        elif (lsc.get("available")
+              and lsc.get("cached_files", 0) > 0
+              and not lsc.get("cache_active")):
+            alerts.append({
+                "severity": "info", "code": "lscache_stale",
+                "msg": lsc.get("note")
+                       or "Found stale ~/lscache/ files but no recent activity.",
             })
 
         cp = env.get("competing_plugins", {})
-        if cp.get("available"):
-            names = ", ".join(p["name"] for p in cp.get("found", [])[:3])
-            extra = f" (+{len(cp['found']) - 3} more)" if len(cp.get("found", [])) > 3 else ""
+        for conflict_msg in cp.get("conflicts", []) or []:
             alerts.append({
                 "severity": "warn", "code": "competing_plugins",
-                "msg": f"Competing cache plugin(s) on disk: {names}{extra}. "
-                       "If active, they may conflict with PigCache at the HTML or "
-                       "object cache layer.",
+                "msg": conflict_msg,
+            })
+        # Drop-in ownership signal: PigCache plugin in disk but drop-in owned
+        # by someone else → PigCache object cache is silently inactive.
+        dropin = env.get("object_cache_dropin", {})
+        if (dropin.get("present")
+                and dropin.get("owner")
+                and dropin.get("owner") != "pigcache"
+                and cp.get("pigcache_installed")):
+            alerts.append({
+                "severity": "critical", "code": "pigcache_dropin_hijacked",
+                "msg": (
+                    f"wp-content/object-cache.php is owned by "
+                    f"'{dropin['owner']}' but PigCache plugin is installed. "
+                    "PigCache object cache is NOT serving any requests "
+                    "(another plugin took the drop-in). Re-activate from "
+                    "PigCache settings or delete object-cache.php and "
+                    "re-enable PigCache."
+                ),
             })
 
     return alerts
