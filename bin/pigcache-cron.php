@@ -884,7 +884,7 @@ function _pigcache_cron_kv_set( mysqli $db, string $table, string $key, $value )
 	$val  = (string) $value;
 	$now  = gmdate( 'Y-m-d H:i:s' );
 	$stmt = $db->prepare(
-		"INSERT INTO `{$table}` (`key`, value, updated_at, expires_at)
+		"INSERT INTO `{$table}` (cache_key, value, updated_at, expires_at)
 		 VALUES (?, ?, ?, NULL)
 		 ON DUPLICATE KEY UPDATE value = VALUES(value), updated_at = VALUES(updated_at), expires_at = NULL"
 	);
@@ -905,7 +905,7 @@ function _pigcache_cron_kv_set( mysqli $db, string $table, string $key, $value )
 function _pigcache_cron_kv_get( mysqli $db, string $table, string $key, string $default = '' ): string {
 	$stmt = $db->prepare(
 		"SELECT value FROM `{$table}`
-		  WHERE `key` = ? AND (expires_at IS NULL OR expires_at > NOW())
+		  WHERE cache_key = ? AND (expires_at IS NULL OR expires_at > NOW())
 		  LIMIT 1"
 	);
 	if ( ! $stmt ) {

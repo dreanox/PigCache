@@ -10,7 +10,7 @@ defined( 'ABSPATH' ) || exit;
 class PigCache_Plugin {
 
 	const DB_VERSION_OPTION = 'pigcache_db_version';
-	const DB_VERSION        = 3;
+	const DB_VERSION        = 4;
 
 	/**
 	 * @var self|null
@@ -59,12 +59,25 @@ class PigCache_Plugin {
 	}
 
 	/**
-	 * Create or upgrade Pro-specific MySQL tables.
+	 * Create or upgrade plugin MySQL tables.
 	 * Runs only when the stored DB version is behind DB_VERSION.
 	 */
 	public static function maybe_install_tables(): void {
-		if ( (int) get_option( self::DB_VERSION_OPTION, 0 ) >= self::DB_VERSION ) {
+		$stored = (int) get_option( self::DB_VERSION_OPTION, 0 );
+		if ( $stored >= self::DB_VERSION ) {
 			return;
+		}
+
+		// v4: rename reserved-word column `key` → `cache_key` on existing installs
+		// so dbDelta() can parse the PRIMARY KEY definition without generating
+		// malformed ALTER TABLE statements.
+		if ( $stored < 4 ) {
+			global $wpdb;
+			$kv_table = $wpdb->prefix . 'pigcache_kv';
+			$has_old  = $wpdb->get_var( "SHOW COLUMNS FROM `{$kv_table}` LIKE 'key'" ); // phpcs:ignore
+			if ( $has_old ) {
+				$wpdb->query( "ALTER TABLE `{$kv_table}` CHANGE `key` cache_key VARCHAR(128) NOT NULL" ); // phpcs:ignore
+			}
 		}
 
 		self::install_tables();
@@ -73,7 +86,7 @@ class PigCache_Plugin {
 	}
 
 	/**
-	 * Create all Pro MySQL tables using dbDelta (idempotent).
+	 * Create all plugin MySQL tables using dbDelta (idempotent).
 	 */
 	public static function install_tables(): void {
 		global $wpdb;
@@ -107,17 +120,17 @@ class PigCache_Plugin {
 		// Used for cron heartbeat timestamps, harvest metadata, and any
 		// plugin state that must be read directly from MySQL (never Redis/APCu).
 		dbDelta( "CREATE TABLE {$wpdb->prefix}pigcache_kv (
-			`key`      varchar(128) NOT NULL,
+			cache_key  varchar(128) NOT NULL,
 			value      mediumtext   NOT NULL,
 			updated_at datetime     NOT NULL,
 			expires_at datetime     DEFAULT NULL,
-			PRIMARY KEY  (`key`),
+			PRIMARY KEY  (cache_key),
 			KEY idx_expires (expires_at)
 		) {$charset};" );
 	}
 
 	/**
-	 * Drop all Pro MySQL tables. Called on plugin uninstall.
+	 * Drop all plugin MySQL tables. Called on plugin uninstall.
 	 */
 	public static function drop_tables(): void {
 		global $wpdb;

@@ -16,7 +16,7 @@
  *       'html_gz' => string gzencoded HTML for clients that send `Accept-Encoding: gzip`,
  *       'status'  => int   HTTP response status code captured at render time,
  *       'ctype'   => string Content-Type header captured at render time,
- *       'tags'    => array tag set (Pro tag-based invalidation),
+ *       'tags'    => array tag set (used for selective invalidation),
  *       'ttl'     => int   TTL the entry was stored with (seconds),
  *       'time'    => int   unix timestamp when stored,
  *   )

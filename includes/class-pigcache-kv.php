@@ -66,14 +66,14 @@ class PigCache_KV {
 		if ( $ttl > 0 ) {
 			$expires = gmdate( 'Y-m-d H:i:s', time() + $ttl );
 			$wpdb->query( $wpdb->prepare(
-				"INSERT INTO `{$table}` (`key`, value, updated_at, expires_at)
+				"INSERT INTO `{$table}` (cache_key, value, updated_at, expires_at)
 				 VALUES (%s, %s, %s, %s)
 				 ON DUPLICATE KEY UPDATE value = VALUES(value), updated_at = VALUES(updated_at), expires_at = VALUES(expires_at)",
 				$key, $serialized, $now, $expires
 			) );
 		} else {
 			$wpdb->query( $wpdb->prepare(
-				"INSERT INTO `{$table}` (`key`, value, updated_at, expires_at)
+				"INSERT INTO `{$table}` (cache_key, value, updated_at, expires_at)
 				 VALUES (%s, %s, %s, NULL)
 				 ON DUPLICATE KEY UPDATE value = VALUES(value), updated_at = VALUES(updated_at), expires_at = NULL",
 				$key, $serialized, $now
@@ -93,7 +93,7 @@ class PigCache_KV {
 
 		$table = self::table();
 		$row   = $wpdb->get_row( $wpdb->prepare(
-			"SELECT value, expires_at FROM `{$table}` WHERE `key` = %s LIMIT 1",
+			"SELECT value, expires_at FROM `{$table}` WHERE cache_key = %s LIMIT 1",
 			$key
 		), ARRAY_A );
 
@@ -115,7 +115,7 @@ class PigCache_KV {
 	 */
 	public static function delete( string $key ): void {
 		global $wpdb;
-		$wpdb->delete( self::table(), array( 'key' => $key ), array( '%s' ) );
+		$wpdb->delete( self::table(), array( 'cache_key' => $key ), array( '%s' ) );
 	}
 
 	/**
@@ -137,14 +137,14 @@ class PigCache_KV {
 
 		$table = self::table();
 		$rows  = $wpdb->get_results(
-			"SELECT `key`, value FROM `{$table}` WHERE expires_at IS NULL OR expires_at > NOW()", // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+			"SELECT cache_key, value FROM `{$table}` WHERE expires_at IS NULL OR expires_at > NOW()", // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
 			ARRAY_A
 		);
 
 		$result = array();
 		if ( is_array( $rows ) ) {
 			foreach ( $rows as $row ) {
-				$result[ $row['key'] ] = maybe_unserialize( $row['value'] );
+				$result[ $row['cache_key'] ] = maybe_unserialize( $row['value'] );
 			}
 		}
 

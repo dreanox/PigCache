@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       PigCache
  * Description:       Redis object-cache drop-in with optional SQL, HTML page, and fragment caching.
- * Version: 1.0.9
+ * Version: 1.0.13
  * Requires at least: 5.8
  * Requires PHP:      7.4
  * Author:            PigCache
@@ -17,7 +17,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'PIGCACHE_VERSION', '1.0.9' );
+define( 'PIGCACHE_VERSION', '1.0.13' );
 define( 'PIGCACHE_FILE', __FILE__ );
 define( 'PIGCACHE_DIR', plugin_dir_path( __FILE__ ) );
 define( 'PIGCACHE_URL', plugin_dir_url( __FILE__ ) );
@@ -32,7 +32,7 @@ if ( ! defined( 'PIGCACHE_OC_VERSION' ) && ! empty( $oc_meta['Version'] ) ) {
 	define( 'PIGCACHE_OC_VERSION', $oc_meta['Version'] );
 }
 
-// Always loaded (Free + Pro).
+// Always loaded.
 require_once PIGCACHE_DIR . 'includes/class-pigcache-config.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-kv.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-sql-cache.php';
@@ -46,7 +46,7 @@ require_once PIGCACHE_DIR . 'includes/class-pigcache-admin.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-metrics.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-plugin.php';
 
-// Pro-only — present in the Pro build, absent in the Free build.
+// Optional modules — loaded when present on disk.
 foreach ( array(
 	'class-pigcache-license.php',
 	'class-pigcache-tag-collector.php',
