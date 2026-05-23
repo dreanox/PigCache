@@ -1398,6 +1398,886 @@ class _MysqlCliCursor:
         pass
 
 
+# ─── Memcached probe ─────────────────────────────────────────────────────────
+
+# Well-known port → service name (used by service detector + monitor)
+_PORT_SERVICES = {
+    21: "ftp", 22: "ssh", 25: "smtp", 53: "dns",
+    80: "http", 110: "pop3", 111: "rpcbind", 143: "imap",
+    443: "https", 465: "smtps", 587: "smtp-submission",
+    783: "spamd", 953: "rndc-dns", 993: "imaps", 995: "pop3s",
+    2077: "cpanel-webdav", 2078: "cpanel-webdav-ssl",
+    2079: "cpanel-caldav", 2080: "cpanel-caldav-ssl",
+    2082: "cpanel", 2083: "cpanel-ssl", 2086: "whm", 2087: "whm-ssl",
+    2091: "cpanel-leechprotect", 2095: "cpanel-webmail", 2096: "cpanel-webmail-ssl",
+    3306: "mysql", 4190: "managesieve",
+    6379: "redis", 6380: "redis-alt",
+    7080: "litespeed-admin", 7443: "litespeed-admin-ssl",
+    8080: "http-alt", 8443: "https-alt",
+    8888: "webshell-or-stats", 8889: "webshell-or-stats-alt",
+    9000: "php-fpm", 9098: "litespeed-internal",
+    11211: "memcached", 11212: "memcached-alt",
+    11234: "imunify360-or-custom", 12131: "imunify360",
+    27217: "imunify360-agent",
+}
+
+
+def memcached_probe(host="127.0.0.1", port=11211, timeout=2.0):
+    """Connect to Memcached, send `stats`, return key metrics.
+
+    Uses raw socket — no deps. Returns {"available": False} when Memcached
+    is unreachable or the response can't be parsed.
+    """
+    try:
+        s = socket.create_connection((host, port), timeout=timeout)
+        s.settimeout(timeout)
+        s.sendall(b"stats\r\n")
+        buf = b""
+        while b"END\r\n" not in buf and len(buf) < 65536:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        s.close()
+    except (socket.timeout, OSError) as exc:
+        return {"available": False, "error": str(exc), "host": host, "port": port}
+
+    raw = {}
+    for line in buf.decode("utf-8", "replace").splitlines():
+        if line.startswith("STAT "):
+            parts = line.split(None, 2)
+            if len(parts) == 3:
+                raw[parts[1]] = parts[2]
+
+    def _i(k, default=0):
+        try:
+            return int(raw.get(k, default))
+        except (ValueError, TypeError):
+            return default
+
+    hits   = _i("get_hits")
+    misses = _i("get_misses")
+    total  = hits + misses
+    limit_bytes = _i("limit_maxbytes")
+    used_bytes  = _i("bytes")
+
+    return {
+        "available":        True,
+        "host":             host,
+        "port":             port,
+        "version":          raw.get("version", "?"),
+        "uptime_s":         _i("uptime"),
+        "curr_connections": _i("curr_connections"),
+        "total_connections":_i("total_connections"),
+        "curr_items":       _i("curr_items"),
+        "total_items":      _i("total_items"),
+        "get_hits":         hits,
+        "get_misses":       misses,
+        "hit_ratio_pct":    round(hits / total * 100, 2) if total else None,
+        "evictions":        _i("evictions"),
+        "limit_bytes":      limit_bytes,
+        "used_bytes":       used_bytes,
+        "mem_used_pct":     round(used_bytes / limit_bytes * 100, 1) if limit_bytes else None,
+        "bytes_read":       _i("bytes_read"),
+        "bytes_written":    _i("bytes_written"),
+        "cmd_get":          _i("cmd_get"),
+        "cmd_set":          _i("cmd_set"),
+        "cas_hits":         _i("cas_hits"),
+    }
+
+
+# ─── Environment scan ────────────────────────────────────────────────────────
+#
+# Every probe is independent.  A failure in one never affects the others.
+# Each sub-function returns a dict with at minimum {"available": bool}.
+# The scan is intentionally exhaustive: it tries many possible paths because
+# cPanel, LiteSpeed, Plesk, and plain LAMP installs all use different layouts.
+
+def environment_scan(wp_root=None):
+    """Probe the server for services, files, and tools that affect PigCache.
+
+    Designed to be run once per `report` invocation.  All checks are best-
+    effort: missing permissions, missing files, or unsupported kernel features
+    produce {"available": False, "reason": "..."} rather than exceptions.
+
+    Covers:
+      - Web server / PHP handler (LiteSpeed vs Apache vs nginx)
+      - LiteSpeed page cache (LSCache) — potential HTML cache conflict
+      - CageFS isolation (CloudLinux) — explains /proc restrictions
+      - Imunify360 presence
+      - WP-CLI availability
+      - Redis RDB dump (location + size — hints at user-space Redis)
+      - AWStats data files (traffic source for Adaptive TTL v2)
+      - Raw access logs (alternative traffic source)
+      - Competing WordPress cache plugins active on disk
+    """
+    home = os.path.expanduser("~")
+    out  = {"home": home}
+
+    out["web_server"]      = _probe_web_server()
+    out["lscache"]         = _probe_lscache(home, wp_root)
+    out["cagefs"]          = _probe_cagefs(home)
+    out["imunify360"]      = _probe_imunify(home)
+    out["wpcli"]           = _probe_wpcli(home)
+    out["redis_rdb"]       = _probe_redis_rdb(home, wp_root)
+    out["awstats"]         = _probe_awstats(home, wp_root)
+    out["access_logs"]     = _probe_access_logs(home, wp_root)
+    out["competing_plugins"] = _probe_competing_plugins(wp_root)
+
+    return out
+
+
+# ── Web server ────────────────────────────────────────────────────────────────
+
+def _probe_web_server():
+    """Detect the web server by looking at listening ports and known binaries."""
+    result = {"available": True}
+
+    # Port fingerprint (from /proc/net/tcp — already done in detect_services,
+    # but we keep this self-contained so it works standalone).
+    listening = set()
+    for proto in ("tcp", "tcp6"):
+        try:
+            for line in open("/proc/net/" + proto).readlines()[1:]:
+                parts = line.split()
+                if len(parts) >= 4 and parts[3] == "0A":
+                    listening.add(int(parts[1].split(":")[1], 16))
+        except OSError:
+            pass
+
+    server = "unknown"
+    if 7080 in listening or 7443 in listening:
+        server = "litespeed"
+    elif 80 in listening or 443 in listening:
+        # Could still be LiteSpeed — try binary detection
+        import shutil
+        if shutil.which("lsws") or shutil.which("litespeed") or \
+                any(os.path.isfile(p) for p in (
+                    "/usr/local/lsws/bin/lshttpd",
+                    "/opt/lsws/bin/lshttpd",
+                )):
+            server = "litespeed"
+        elif shutil.which("nginx") or any(os.path.isfile(p) for p in (
+                "/usr/sbin/nginx", "/usr/local/nginx/sbin/nginx")):
+            server = "nginx"
+        elif shutil.which("apache2") or shutil.which("httpd") or \
+                any(os.path.isfile(p) for p in (
+                    "/usr/sbin/apache2", "/usr/sbin/httpd")):
+            server = "apache"
+
+    result["server"] = server
+    result["litespeed_admin_port"] = 7080 if 7080 in listening else (
+        7443 if 7443 in listening else None
+    )
+
+    # PHP handler hint from our own process names
+    try:
+        pids = [d for d in os.listdir("/proc") if d.isdigit()]
+        php_handlers = set()
+        for pid in pids:
+            try:
+                name = open("/proc/%s/comm" % pid).read().strip()
+                if name in ("lsphp", "php-fpm", "php", "php8.1", "php8.2", "php8.3"):
+                    php_handlers.add(name)
+            except OSError:
+                pass
+        result["php_handler"] = list(php_handlers) or ["unknown"]
+    except OSError:
+        result["php_handler"] = ["unknown"]
+
+    return result
+
+
+# ── LiteSpeed Cache (LSCache) ─────────────────────────────────────────────────
+
+def _probe_lscache(home, wp_root):
+    """Detect LiteSpeed's built-in page cache.
+
+    LSCache operates at the web-server level — BEFORE advanced-cache.php runs.
+    If active for HTML pages, PigCache's HTML cache is bypassed entirely.
+    The cache files live in ~/lscache/ on cPanel installs.
+    """
+    result = {"available": False}
+
+    # 1. Cache directory in home
+    lscache_dir = os.path.join(home, "lscache")
+    if os.path.isdir(lscache_dir):
+        result["available"]  = True
+        result["cache_dir"]  = lscache_dir
+        try:
+            total_files = 0
+            total_bytes = 0
+            for root, _dirs, files in os.walk(lscache_dir):
+                for f in files:
+                    total_files += 1
+                    try:
+                        total_bytes += os.path.getsize(os.path.join(root, f))
+                    except OSError:
+                        pass
+                if total_files > 5000:   # stop counting on huge caches
+                    result["cached_files_approx"] = ">5000"
+                    result["cached_bytes_approx"] = ">estimate"
+                    break
+            else:
+                result["cached_files"] = total_files
+                result["cached_bytes"] = total_bytes
+            result["cache_active"] = total_files > 0
+        except OSError as exc:
+            result["cache_dir_err"] = str(exc)
+
+    # 2. LSCache manager data
+    lscm_dir = os.path.join(home, "lscmData")
+    result["lscm_data_dir"] = lscm_dir if os.path.isdir(lscm_dir) else None
+
+    # 3. WordPress plugin on disk
+    if wp_root:
+        plugin_path = os.path.join(
+            wp_root, "wp-content", "plugins", "litespeed-cache", "litespeed-cache.php"
+        )
+        result["wp_plugin_installed"] = os.path.isfile(plugin_path)
+
+    # 4. Conflict assessment
+    if result["available"] and result.get("cache_active"):
+        result["conflict"] = (
+            "LSCache is active and has cached files. LiteSpeed serves these pages "
+            "before advanced-cache.php runs, so PigCache HTML cache entries in Redis "
+            "are never populated or served for those URLs. "
+            "Disable LSCache full-page caching OR disable PigCache HTML cache "
+            "to avoid serving from two competing page caches."
+        )
+
+    return result
+
+
+# ── CageFS ────────────────────────────────────────────────────────────────────
+
+def _probe_cagefs(home):
+    """Detect CloudLinux CageFS.
+
+    When CageFS is active each user gets a virtualized /proc, /etc, etc.
+    This explains why /proc/lve/list and /sys/fs/cgroup are inaccessible
+    even though the process runs under a CloudLinux LVE.
+    """
+    cagefs_dir = os.path.join(home, ".cagefs")
+    active = os.path.isdir(cagefs_dir)
+    return {
+        "available": active,
+        "dir": cagefs_dir if active else None,
+        "note": (
+            "CageFS virtualizes /proc and blocks /proc/lve/list + cgroup fs access. "
+            "Per-account resource limits are not readable from user-space."
+        ) if active else None,
+    }
+
+
+# ── Imunify360 ────────────────────────────────────────────────────────────────
+
+def _probe_imunify(home):
+    """Detect Imunify360 security suite."""
+    markers = [
+        os.path.join(home, ".imunify_patch_id"),
+        os.path.join(home, ".myimunify_id"),
+    ]
+    found = [m for m in markers if os.path.isfile(m)]
+    active = bool(found)
+    patch_id = None
+    if active:
+        try:
+            patch_id = open(found[0]).read().strip()
+        except OSError:
+            pass
+    return {
+        "available": active,
+        "patch_id":  patch_id,
+        # Imunify360 owns ports 27217 and 12131 on this server
+        "known_ports": [12131, 27217] if active else [],
+    }
+
+
+# ── WP-CLI ────────────────────────────────────────────────────────────────────
+
+def _probe_wpcli(home):
+    """Detect WP-CLI installation."""
+    import shutil
+    candidates = [
+        shutil.which("wp"),
+        os.path.join(home, ".wp-cli", "packages", "vendor", "bin", "wp"),
+        "/usr/local/bin/wp",
+        "/usr/bin/wp",
+    ]
+    for path in candidates:
+        if path and os.path.isfile(path) and os.access(path, os.X_OK):
+            return {"available": True, "path": path}
+    wpcli_dir = os.path.join(home, ".wp-cli")
+    return {
+        "available": False,
+        "config_dir_exists": os.path.isdir(wpcli_dir),
+    }
+
+
+# ── Redis RDB dump ────────────────────────────────────────────────────────────
+
+def _probe_redis_rdb(home, wp_root):
+    """Locate Redis RDB/AOF persistence files.
+
+    On user-space Redis (common on cPanel shared hosting) the dump.rdb is
+    often written to the user's home directory.  Its size indicates the
+    approximate dataset size when Redis INFO is unavailable.
+    """
+    candidates = [home]
+    if wp_root:
+        candidates.append(wp_root)
+    candidates += [
+        "/var/lib/redis",
+        "/var/redis",
+        "/tmp",
+    ]
+
+    found = []
+    for directory in candidates:
+        for fname in ("dump.rdb", "appendonly.aof", "redis.rdb"):
+            fpath = os.path.join(directory, fname)
+            if os.path.isfile(fpath):
+                try:
+                    stat = os.stat(fpath)
+                    found.append({
+                        "path":     fpath,
+                        "size_mb":  round(stat.st_size / (1024 * 1024), 1),
+                        "mtime":    datetime.utcfromtimestamp(stat.st_mtime).isoformat() + "Z",
+                    })
+                except OSError:
+                    found.append({"path": fpath})
+
+    return {"available": bool(found), "files": found}
+
+
+# ── AWStats ───────────────────────────────────────────────────────────────────
+
+def _probe_awstats(home, wp_root):
+    """Detect AWStats data files for URL traffic analysis (Adaptive TTL v2).
+
+    AWStats writes monthly data files to ~/tmp/awstats/ on cPanel.
+    Multiple domains may have separate files.
+    """
+    import glob as _glob
+
+    candidates = [os.path.join(home, "tmp", "awstats")]
+    if wp_root:
+        candidates.append(os.path.join(os.path.dirname(wp_root), "tmp", "awstats"))
+
+    for directory in candidates:
+        if not os.path.isdir(directory):
+            continue
+        files = sorted(_glob.glob(os.path.join(directory, "awstats*.txt")), reverse=True)
+        if not files:
+            continue
+        latest = files[0]
+        size   = 0
+        try:
+            size = os.path.getsize(latest)
+        except OSError:
+            pass
+        return {
+            "available":    True,
+            "dir":          directory,
+            "file_count":   len(files),
+            "latest_file":  latest,
+            "latest_size_kb": round(size / 1024, 1),
+        }
+
+    return {"available": False, "searched": candidates}
+
+
+# ── Raw access logs ───────────────────────────────────────────────────────────
+
+def _probe_access_logs(home, wp_root):
+    """Detect raw HTTP access log files (alternative to AWStats).
+
+    On cPanel the user's access logs live in ~/access-logs/ or ~/logs/.
+    These can be parsed for per-URL hit counts when AWStats is absent.
+    """
+    candidates = [
+        os.path.join(home, "access-logs"),
+        os.path.join(home, "logs"),
+        "/var/log/apache2",
+        "/var/log/nginx",
+        "/usr/local/apache/logs",
+    ]
+    if wp_root:
+        candidates.insert(0, os.path.join(os.path.dirname(wp_root), "logs"))
+
+    for directory in candidates:
+        if not os.path.isdir(directory):
+            continue
+        try:
+            entries = os.listdir(directory)
+        except OSError:
+            continue
+        log_files = [
+            e for e in entries
+            if "access" in e.lower() or e.endswith((".log", ".gz"))
+        ]
+        if not log_files:
+            continue
+        # Find largest (most complete) log
+        biggest = None
+        biggest_size = 0
+        for lf in log_files:
+            try:
+                sz = os.path.getsize(os.path.join(directory, lf))
+                if sz > biggest_size:
+                    biggest_size, biggest = sz, lf
+            except OSError:
+                pass
+        return {
+            "available":     True,
+            "dir":           directory,
+            "file_count":    len(log_files),
+            "largest_file":  biggest,
+            "largest_size_mb": round(biggest_size / (1024 * 1024), 1),
+        }
+
+    return {"available": False, "searched": candidates}
+
+
+# ── Competing WordPress cache plugins ─────────────────────────────────────────
+
+# Plugins that implement full-page HTML caching and/or object cache replacement.
+# If active alongside PigCache they conflict at the same cache layer.
+_COMPETING_CACHE_PLUGINS = {
+    "w3-total-cache":          "W3 Total Cache",
+    "wp-super-cache":          "WP Super Cache",
+    "wp-rocket":               "WP Rocket",
+    "litespeed-cache":         "LiteSpeed Cache (LSCache)",
+    "swift-performance-lite":  "Swift Performance Lite",
+    "swift-performance":       "Swift Performance",
+    "cache-enabler":           "Cache Enabler",
+    "comet-cache":             "Comet Cache",
+    "hyper-cache":             "Hyper Cache",
+    "sg-cachepress":           "SiteGround Optimizer",
+    "hummingbird-performance": "Hummingbird",
+    "wp-fastest-cache":        "WP Fastest Cache",
+    "breeze":                  "Breeze (Cloudways)",
+    "redis-cache":             "Redis Object Cache (Till Krüss)",
+}
+
+
+def _probe_competing_plugins(wp_root):
+    """Scan wp-content/plugins/ for known competing cache plugins.
+
+    Returns a list of plugins found on disk (not necessarily active in WP —
+    disk presence is enough to warn because deactivated plugins can leave
+    drop-ins behind).
+    """
+    result = {"available": False, "found": [], "plugins_dir_readable": False}
+
+    if not wp_root:
+        return result
+
+    plugins_dir = os.path.join(wp_root, "wp-content", "plugins")
+    if not os.path.isdir(plugins_dir):
+        return result
+
+    result["plugins_dir_readable"] = True
+
+    try:
+        installed = set(os.listdir(plugins_dir))
+    except OSError as exc:
+        result["error"] = str(exc)
+        return result
+
+    for slug, name in _COMPETING_CACHE_PLUGINS.items():
+        if slug in installed:
+            plugin_file = os.path.join(plugins_dir, slug, slug + ".php")
+            result["found"].append({
+                "slug":      slug,
+                "name":      name,
+                "php_exists": os.path.isfile(plugin_file),
+            })
+
+    result["available"] = bool(result["found"])
+    if result["available"]:
+        result["warning"] = (
+            "Found %d competing cache plugin(s) on disk. "
+            "If active, they may conflict with PigCache at the HTML cache or "
+            "object cache layer. Check which are truly active in WP admin."
+            % len(result["found"])
+        )
+
+    return result
+
+
+# ─── Service + process detection ─────────────────────────────────────────────
+
+def detect_services():
+    """Scan /proc/net/tcp and tcp6 for listening ports and identify services.
+
+    Returns a dict of port → {service, proto} for all listening sockets,
+    keyed by port number.
+    """
+    listening = {}
+    for proto in ("tcp", "tcp6"):
+        try:
+            for line in open("/proc/net/" + proto).readlines()[1:]:
+                parts = line.split()
+                if len(parts) >= 4 and parts[3] == "0A":   # TCP_LISTEN
+                    port = int(parts[1].split(":")[1], 16)
+                    if port not in listening:
+                        listening[port] = proto
+        except OSError:
+            pass
+
+    result = {}
+    for port, proto in sorted(listening.items()):
+        result[port] = {
+            "proto":   proto,
+            "service": _PORT_SERVICES.get(port, "unknown"),
+        }
+    return result
+
+
+def scan_own_processes():
+    """Return resource stats for all PIDs visible to the current user.
+
+    On cPanel with hidepid=2 this is limited to the account's own processes.
+    Includes name, state, RSS memory, cumulative CPU ticks, and I/O byte counts.
+    """
+    procs = []
+    try:
+        pids = [d for d in os.listdir("/proc") if d.isdigit()]
+    except OSError:
+        return []
+
+    sc_clk = 100  # assume 100 Hz (sysconf(_SC_CLK_TCK)) — correct on virtually all Linux
+
+    for pid in pids:
+        p = {"pid": int(pid)}
+        try:
+            raw = open("/proc/%s/cmdline" % pid).read()
+            p["cmdline"] = raw.replace("\x00", " ").strip()[:120]
+        except OSError:
+            p["cmdline"] = ""
+        try:
+            status = {}
+            for line in open("/proc/%s/status" % pid):
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    status[k.strip()] = v.strip()
+            p["name"]    = status.get("Name", "?")
+            p["state"]   = status.get("State", "?").split()[0]
+            rss = status.get("VmRSS", "0 kB").split()[0]
+            p["rss_mb"]  = round(int(rss) / 1024, 1)
+            p["threads"] = int(status.get("Threads", 1))
+        except (OSError, ValueError):
+            pass
+        try:
+            fields = open("/proc/%s/stat" % pid).read().split()
+            utime  = int(fields[13])
+            stime  = int(fields[14])
+            p["cpu_seconds"] = round((utime + stime) / sc_clk, 2)
+        except (OSError, IndexError, ValueError):
+            pass
+        try:
+            io = {}
+            for line in open("/proc/%s/io" % pid):
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    io[k.strip()] = v.strip()
+            p["io_read_mb"]  = round(int(io.get("read_bytes",  "0")) / (1024 * 1024), 1)
+            p["io_write_mb"] = round(int(io.get("write_bytes", "0")) / (1024 * 1024), 1)
+        except (OSError, ValueError):
+            pass
+        procs.append(p)
+
+    procs.sort(key=lambda x: x.get("rss_mb", 0), reverse=True)
+    return procs
+
+
+# ─── System metrics (OS-level, /proc-based) ──────────────────────────────────
+
+def system_snapshot(wp_root=None):
+    """Collect OS-level server metrics from /proc/*.
+
+    /proc/diskstats is intentionally omitted — it is blocked (EPERM) on most
+    cPanel shared hosts. proc_visible reflects only the calling user's PIDs
+    when hidepid=2 is active (typical on shared cPanel).
+    """
+    snap = {"captured_at": datetime.utcnow().isoformat() + "Z"}
+
+    # CPU cores
+    try:
+        snap["cpu_cores"] = os.cpu_count()
+    except Exception as exc:
+        snap["cpu_cores"] = None
+        snap["cpu_error"] = str(exc)
+
+    # Load avg + process counters from /proc/loadavg
+    try:
+        parts = open("/proc/loadavg").read().split()
+        snap["load_1m"] = float(parts[0])
+        snap["load_5m"] = float(parts[1])
+        snap["load_15m"] = float(parts[2])
+        run, total = parts[3].split("/")
+        snap["proc_running"] = int(run)
+        snap["proc_total"] = int(total)
+    except Exception as exc:
+        snap["load_1m"] = snap["load_5m"] = snap["load_15m"] = None
+        snap["load_error"] = str(exc)
+
+    # RAM + swap from /proc/meminfo
+    try:
+        meminfo = {}
+        for line in open("/proc/meminfo"):
+            if ":" in line:
+                k, v = line.split(":", 1)
+                try:
+                    meminfo[k.strip()] = int(v.split()[0])
+                except (ValueError, IndexError):
+                    pass
+        total_kb = meminfo.get("MemTotal", 0)
+        avail_kb = meminfo.get("MemAvailable", meminfo.get("MemFree", 0))
+        used_kb = total_kb - avail_kb
+        snap["mem_total_mb"] = total_kb // 1024
+        snap["mem_available_mb"] = avail_kb // 1024
+        snap["mem_used_mb"] = used_kb // 1024
+        snap["mem_used_pct"] = round(used_kb / total_kb * 100, 1) if total_kb else None
+        swap_total_kb = meminfo.get("SwapTotal", 0)
+        swap_free_kb = meminfo.get("SwapFree", 0)
+        snap["swap_total_mb"] = swap_total_kb // 1024
+        snap["swap_used_mb"] = (swap_total_kb - swap_free_kb) // 1024
+        snap["swap_used_pct"] = (
+            round((swap_total_kb - swap_free_kb) / swap_total_kb * 100, 1)
+            if swap_total_kb else None
+        )
+    except Exception as exc:
+        snap["mem_error"] = str(exc)
+
+    # Disk: WordPress root partition + filesystem root
+    snap["disk"] = {}
+    paths = []
+    if wp_root and os.path.isdir(wp_root):
+        paths.append(("wp_root", wp_root))
+    paths.append(("root", "/"))
+    for label, path in paths:
+        try:
+            st = os.statvfs(path)
+            total_b = st.f_blocks * st.f_frsize
+            avail_b = st.f_bavail * st.f_frsize   # non-root available bytes
+            used_b = total_b - st.f_bfree * st.f_frsize
+            snap["disk"][label] = {
+                "path": path,
+                "total_gb": round(total_b / 1073741824, 1),
+                "free_gb": round(avail_b / 1073741824, 1),
+                "used_gb": round(used_b / 1073741824, 1),
+                "used_pct": round(used_b / total_b * 100, 1) if total_b else None,
+            }
+        except Exception as exc:
+            snap["disk"][label] = {"path": path, "error": str(exc)}
+
+    # Network I/O: two /proc/net/dev samples 1 s apart → KiB/s
+    def _read_netdev():
+        ifaces = {}
+        try:
+            for line in open("/proc/net/dev"):
+                if ":" in line:
+                    iface, rest = line.split(":", 1)
+                    fields = rest.split()
+                    if len(fields) >= 9:
+                        ifaces[iface.strip()] = (int(fields[0]), int(fields[8]))
+        except Exception:
+            pass
+        return ifaces
+
+    try:
+        n1 = _read_netdev()
+        time.sleep(1)
+        n2 = _read_netdev()
+        active = [k for k in n1 if k != "lo" and k in n2]
+        snap["net_ifaces"] = active
+        snap["net_rx_kbps"] = round(
+            sum(n2[i][0] - n1[i][0] for i in active) / 1024, 1
+        )
+        snap["net_tx_kbps"] = round(
+            sum(n2[i][1] - n1[i][1] for i in active) / 1024, 1
+        )
+    except Exception as exc:
+        snap["net_error"] = str(exc)
+
+    # System uptime
+    try:
+        up = float(open("/proc/uptime").read().split()[0])
+        snap["uptime_seconds"] = int(up)
+        snap["uptime_hours"] = round(up / 3600, 1)
+    except Exception as exc:
+        snap["uptime_error"] = str(exc)
+
+    # Visible process count (hidepid=2 limits to calling user's PIDs on cPanel)
+    try:
+        snap["proc_visible"] = len([d for d in os.listdir("/proc") if d.isdigit()])
+    except Exception as exc:
+        snap["proc_visible_error"] = str(exc)
+
+    # Per-account LVE / cgroup limits (CloudLinux shared hosting)
+    snap["account_limits"] = _lve_snapshot()
+
+    # Clarify scope so the dashboard can show a warning on shared hosts
+    snap["scope"] = "server_wide" if not snap["account_limits"].get("available") else "account"
+
+    # Services listening on this server (detected from /proc/net/tcp)
+    snap["services"] = detect_services()
+
+    # Our own visible processes with resource usage
+    snap["processes"] = scan_own_processes()
+
+    # Full environment scan (web server, LSCache, CageFS, plugins, logs…)
+    snap["environment"] = environment_scan(wp_root)
+
+    return snap
+
+
+def _lve_snapshot():
+    """Try to read per-account CloudLinux LVE resource limits and usage.
+
+    Three sources tried in order:
+      1. /proc/lve/list       — most complete; root-only on some cPanel configs.
+      2. /sys/fs/cgroup/      — constructed from /proc/self/cgroup; works when
+                                the host mounts cgroupfs inside the user namespace.
+      3. None                 — graceful degradation when the host blocks all access
+                                (cgroup fs not mounted, as seen on some dedicated
+                                cPanel servers). Returns {"available": False}.
+
+    CPU quota interpretation:
+      cfs_quota_us / cfs_period_us  → fraction of one core.
+      e.g. quota=100000, period=100000 → 1.0 cores.
+      quota=-1 → unlimited.
+    """
+    uid = os.getuid()
+
+    # ── Source 1: /proc/lve/list ──────────────────────────────────────
+    try:
+        lines = open("/proc/lve/list").readlines()
+        if lines:
+            # Header line maps column index → name.
+            header = lines[0].strip().split()
+            for line in lines[1:]:
+                parts = line.split()
+                if parts and parts[0] == str(uid):
+                    row = dict(zip(header, parts))
+                    result = {"available": True, "source": "lve_list"}
+                    def _i(k):
+                        try: return int(row[k])
+                        except (KeyError, ValueError): return None
+                    result["cpu_limit_pct"]   = _i("lCPU")
+                    result["cpu_usage_pct"]   = _i("CPU")
+                    result["mem_limit_kb"]    = _i("lMEM")
+                    result["mem_usage_kb"]    = _i("MEM")
+                    result["io_limit_kbps"]   = _i("lIO")
+                    result["io_usage_kbps"]   = _i("IO")
+                    result["ep_limit"]        = _i("lEP")
+                    result["ep_current"]      = _i("EP")
+                    result["nproc_limit"]     = _i("lNPROC")
+                    result["nproc_current"]   = _i("PID")
+                    result["fault_cpu"]       = _i("HIT[CPU")
+                    result["fault_mem"]       = _i("HIT[MEM")
+                    result["fault_io"]        = _i("HIT[IO")
+                    result["fault_ep"]        = _i("HIT[EP")
+                    return {k: v for k, v in result.items() if v is not None}
+    except (PermissionError, OSError):
+        pass
+
+    # ── Source 2: /sys/fs/cgroup/ ─────────────────────────────────────
+    cg_base = "/sys/fs/cgroup"
+    if not os.path.isdir(cg_base):
+        return {
+            "available": False,
+            "reason": "cgroup fs not mounted in user namespace",
+            "lve_cgroup": _read_self_cgroup_name(),
+        }
+
+    try:
+        cgroups = _parse_self_cgroups()
+    except Exception:
+        return {"available": False, "reason": "could not parse /proc/self/cgroup"}
+
+    result = {"available": True, "source": "cgroup", "lve_cgroup": cgroups.get("memory", "")}
+
+    # Memory
+    mem_dir = os.path.join(cg_base, "memory" + cgroups.get("memory", ""))
+    for fname, key, transform in [
+        ("memory.limit_in_bytes",      "mem_limit_bytes",   int),
+        ("memory.usage_in_bytes",      "mem_usage_bytes",   int),
+        ("memory.failcnt",             "fault_mem",         int),
+        ("memory.soft_limit_in_bytes", "mem_soft_limit_bytes", int),
+    ]:
+        try:
+            result[key] = transform(open(os.path.join(mem_dir, fname)).read().strip())
+        except Exception:
+            pass
+
+    # CPU (cfs_quota / cfs_period → cores)
+    cpu_subsys = "cpu,cpuacct" if os.path.isdir(os.path.join(cg_base, "cpu,cpuacct")) else "cpu"
+    cpu_dir = os.path.join(cg_base, cpu_subsys + cgroups.get("cpu", cgroups.get("cpuacct", "")))
+    try:
+        quota  = int(open(os.path.join(cpu_dir, "cpu.cfs_quota_us")).read().strip())
+        period = int(open(os.path.join(cpu_dir, "cpu.cfs_period_us")).read().strip())
+        if quota > 0 and period > 0:
+            result["cpu_limit_cores"] = round(quota / period, 3)
+        else:
+            result["cpu_limit_cores"] = None  # unlimited
+    except Exception:
+        pass
+    try:
+        result["cpuacct_usage_ns"] = int(open(os.path.join(cpu_dir, "cpuacct.usage")).read().strip())
+    except Exception:
+        pass
+
+    # PIDs
+    pids_dir = os.path.join(cg_base, "pids" + cgroups.get("pids", ""))
+    try:
+        raw = open(os.path.join(pids_dir, "pids.max")).read().strip()
+        result["nproc_limit"] = None if raw == "max" else int(raw)
+    except Exception:
+        pass
+    try:
+        result["nproc_current"] = int(open(os.path.join(pids_dir, "pids.current")).read().strip())
+    except Exception:
+        pass
+
+    # If we got any real metrics beyond source/available/lve_cgroup, it worked.
+    real_keys = [k for k in result if k not in ("available", "source", "lve_cgroup")]
+    if real_keys:
+        return result
+
+    return {
+        "available": False,
+        "reason": "cgroup files not readable (likely permission-denied by host)",
+        "lve_cgroup": cgroups.get("memory", ""),
+    }
+
+
+def _parse_self_cgroups():
+    """Return {subsystem: cgroup_path} from /proc/self/cgroup."""
+    cgroups = {}
+    for line in open("/proc/self/cgroup"):
+        parts = line.strip().split(":", 2)
+        if len(parts) == 3:
+            for sub in parts[1].split(","):
+                cgroups[sub.lstrip("name=")] = parts[2]
+    return cgroups
+
+
+def _read_self_cgroup_name():
+    """Return the memory cgroup path (e.g. '/lve1327') or empty string."""
+    try:
+        for line in open("/proc/self/cgroup"):
+            parts = line.strip().split(":", 2)
+            if len(parts) == 3 and "memory" in parts[1]:
+                return parts[2]
+    except Exception:
+        pass
+    return ""
+
+
 # ─── Rendering helpers ───────────────────────────────────────────────────────
 
 def _fmt_bytes(b):
@@ -1535,6 +2415,277 @@ def render_mysql_text(m):
         out.append(f"  processlist total       : {m['processlist_total']}")
         for cmd, n in sorted(m["processlist_by_command"].items(), key=lambda x: -x[1]):
             out.append(f"    {n:>4}  {cmd}")
+    return "\n".join(out)
+
+
+def render_system_text(sys_snap):
+    out = []
+    out.append("─── System ───────────────────────────────────────────")
+    cores = sys_snap.get("cpu_cores")
+    l1 = sys_snap.get("load_1m")
+    out.append(f"  cpu_cores               : {cores if cores is not None else '?'}")
+    if l1 is not None:
+        load_pct = round(l1 / cores * 100, 1) if isinstance(cores, int) and cores else None
+        bar = _ascii_bar(load_pct) if load_pct is not None else ""
+        suffix = f"  ({load_pct}% of cores)  {bar}" if load_pct is not None else ""
+        out.append(
+            f"  load (1m/5m/15m)        : {l1} / {sys_snap.get('load_5m')} / "
+            f"{sys_snap.get('load_15m')}{suffix}"
+        )
+        out.append(
+            f"  processes               : {sys_snap.get('proc_running', '?')} running"
+            f" / {sys_snap.get('proc_total', '?')} total"
+            f"  (user-visible: {sys_snap.get('proc_visible', '?')})"
+        )
+    mem_total = sys_snap.get("mem_total_mb")
+    if mem_total is not None:
+        out.append("")
+        out.append(f"  ram_total               : {mem_total:,} MiB  ({mem_total // 1024} GiB)")
+        used_mb = sys_snap.get("mem_used_mb", 0)
+        used_pct = sys_snap.get("mem_used_pct")
+        out.append(
+            f"  ram_used                : {used_mb:,} MiB"
+            f"  {_fmt_pct(used_pct)}  {_ascii_bar(used_pct)}"
+        )
+        out.append(f"  ram_available           : {sys_snap.get('mem_available_mb', '?'):,} MiB")
+        swap_t = sys_snap.get("swap_total_mb", 0)
+        if swap_t:
+            swap_u = sys_snap.get("swap_used_mb", 0)
+            swap_pct = sys_snap.get("swap_used_pct")
+            out.append(
+                f"  swap_used               : {swap_u:,} / {swap_t:,} MiB"
+                f"  {_fmt_pct(swap_pct)}  {_ascii_bar(swap_pct)}"
+            )
+    disks = sys_snap.get("disk", {})
+    if disks:
+        out.append("")
+        for label, d in disks.items():
+            if "error" in d:
+                out.append(f"  disk [{label:<8}] {d.get('path', ''):<20} : error: {d['error']}")
+            else:
+                used_pct = d.get("used_pct")
+                out.append(
+                    f"  disk [{label:<8}] {d.get('path', ''):<20}"
+                    f" : {d['used_gb']} / {d['total_gb']} GiB"
+                    f"  {_fmt_pct(used_pct)}  {_ascii_bar(used_pct)}"
+                )
+    net_rx = sys_snap.get("net_rx_kbps")
+    if net_rx is not None:
+        out.append("")
+        ifaces = ", ".join(sys_snap.get("net_ifaces", []))
+        out.append(f"  net ifaces              : {ifaces}")
+        out.append(
+            f"  net_rx / net_tx (1s)    : {net_rx} KiB/s"
+            f"  /  {sys_snap.get('net_tx_kbps', '?')} KiB/s"
+        )
+    uptime_h = sys_snap.get("uptime_hours")
+    if uptime_h is not None:
+        out.append("")
+        days = sys_snap.get("uptime_seconds", 0) // 86400
+        out.append(f"  uptime                  : {uptime_h} h  ({days} days)")
+
+    # Account limits (LVE / cgroup)
+    lve = sys_snap.get("account_limits", {})
+    out.append("")
+    out.append("─── Account limits (LVE / cgroup) ────────────────────")
+    if not lve.get("available"):
+        cg = lve.get("lve_cgroup", "?")
+        out.append(f"  status                  : not accessible  (cgroup: {cg})")
+        out.append(f"  reason                  : {lve.get('reason', '?')}")
+        out.append("  note: server metrics above are SHARED SERVER TOTALS, not your account quota.")
+    else:
+        src = lve.get("source", "?")
+        out.append(f"  source                  : {src}  (cgroup: {lve.get('lve_cgroup', '')})")
+        if lve.get("cpu_limit_cores") is not None:
+            out.append(f"  cpu_limit               : {lve['cpu_limit_cores']} cores")
+        elif lve.get("cpu_limit_pct") is not None:
+            out.append(f"  cpu_limit               : {lve['cpu_limit_pct']}%")
+        if lve.get("mem_limit_bytes") is not None:
+            limit_mb = lve["mem_limit_bytes"] // (1024 * 1024)
+            used_mb  = (lve.get("mem_usage_bytes") or 0) // (1024 * 1024)
+            pct = round(used_mb / limit_mb * 100, 1) if limit_mb else None
+            out.append(
+                f"  mem_used/limit          : {used_mb} / {limit_mb} MiB"
+                + (f"  {_fmt_pct(pct)}  {_ascii_bar(pct)}" if pct is not None else "")
+            )
+        elif lve.get("mem_limit_kb") is not None:
+            out.append(f"  mem_limit               : {lve['mem_limit_kb']} KiB")
+        if lve.get("ep_limit") is not None:
+            out.append(f"  entry_processes         : {lve.get('ep_current', '?')} / {lve['ep_limit']}")
+        if lve.get("nproc_limit") is not None:
+            out.append(f"  nproc                   : {lve.get('nproc_current', '?')} / {lve['nproc_limit']}")
+        if lve.get("io_limit_kbps") is not None:
+            out.append(f"  io_limit                : {lve['io_limit_kbps']} KiB/s")
+        faults = {k: lve[k] for k in ("fault_cpu", "fault_mem", "fault_io", "fault_ep") if lve.get(k)}
+        if faults:
+            out.append(f"  ⚠ throttle faults       : {faults}")
+
+    scope = sys_snap.get("scope", "server_wide")
+    if scope == "server_wide":
+        out.append("  ─ metrics above = server totals, not your account quota ─")
+
+    return "\n".join(out)
+
+
+def render_memcached_text(m):
+    out = ["─── Memcached ────────────────────────────────────────"]
+    if not m.get("available"):
+        out.append(f"  status                  : unreachable  ({m.get('error', '?')})")
+        return "\n".join(out)
+    out.append(f"  endpoint                : {m['host']}:{m['port']}  v{m['version']}")
+    out.append(f"  uptime                  : {m['uptime_s']}s")
+    out.append(f"  connections             : {m['curr_connections']} current / {m['total_connections']} total")
+    out.append(f"  items                   : {m['curr_items']:,} current / {m['total_items']:,} total")
+    hr = m.get("hit_ratio_pct")
+    out.append(f"  hit ratio               : {_fmt_pct(hr)}  {_ascii_bar(hr)}")
+    out.append(f"  get/set cmds            : {m['cmd_get']:,} / {m['cmd_set']:,}")
+    out.append(f"  evictions               : {m['evictions']:,}")
+    mp = m.get("mem_used_pct")
+    out.append(
+        f"  memory                  : {_fmt_bytes(m['used_bytes'])} / {_fmt_bytes(m['limit_bytes'])}"
+        + (f"  {_fmt_pct(mp)}  {_ascii_bar(mp)}" if mp is not None else "")
+    )
+    return "\n".join(out)
+
+
+def render_services_text(services, processes):
+    out = ["─── Detected services ────────────────────────────────"]
+    for port, info in sorted(services.items()):
+        svc = info["service"]
+        mark = "  " if svc not in ("unknown",) else "? "
+        out.append(f"  {mark}:{port:<6}  {info['proto']:<5}  {svc}")
+    if processes:
+        out.append("")
+        out.append("─── Account processes (visible) ──────────────────────")
+        out.append("  {:<8} {:<16} {:>7} {:>9} {:>10} {:>10}".format(
+            "PID", "name", "state", "RSS MiB", "CPU sec", "I/O r/w MiB"
+        ))
+        out.append("  " + "-" * 68)
+        for p in processes:
+            io_r = p.get("io_read_mb", "-")
+            io_w = p.get("io_write_mb", "-")
+            out.append("  {:<8} {:<16} {:>7} {:>9} {:>10} {:>5}/{:<5}".format(
+                p.get("pid", "?"),
+                (p.get("name") or "?")[:16],
+                p.get("state", "?"),
+                p.get("rss_mb", "-"),
+                p.get("cpu_seconds", "-"),
+                io_r, io_w,
+            ))
+    return "\n".join(out)
+
+
+def render_environment_text(env):
+    """Render the environment_scan() dict as a human-readable text block."""
+    out = ["─── Environment scan ─────────────────────────────────"]
+
+    # Web server
+    ws = env.get("web_server", {})
+    if ws.get("available") is not False:
+        srv = ws.get("server", "unknown")
+        php = ", ".join(ws.get("php_handler") or ["?"])
+        ls_port = ws.get("litespeed_admin_port")
+        ls_note = f"  (admin :{ls_port})" if ls_port else ""
+        out.append(f"  web_server              : {srv}{ls_note}")
+        out.append(f"  php_handler             : {php}")
+
+    # LSCache
+    lsc = env.get("lscache", {})
+    if lsc.get("available"):
+        files = lsc.get("cached_files", lsc.get("cached_files_approx", "?"))
+        size_b = lsc.get("cached_bytes")
+        size_str = _fmt_bytes(size_b) if isinstance(size_b, int) else "?"
+        out.append(f"  lscache                 : ACTIVE  {files} files  {size_str}")
+        if lsc.get("lscm_data_dir"):
+            out.append(f"    lscmData dir          : {lsc['lscm_data_dir']}")
+        if lsc.get("wp_plugin_installed"):
+            out.append("    wp plugin             : installed on disk")
+        if lsc.get("conflict"):
+            # Print first sentence of the conflict message
+            first = lsc["conflict"].split(".")[0] + "."
+            out.append(f"  ⚠ CONFLICT              : {first}")
+    else:
+        out.append("  lscache                 : not detected")
+
+    # CageFS
+    cagefs = env.get("cagefs", {})
+    if cagefs.get("available"):
+        out.append(f"  cagefs                  : detected  ({cagefs.get('dir', '')})")
+        if cagefs.get("note"):
+            out.append(f"    note                  : {cagefs['note']}")
+    else:
+        out.append("  cagefs                  : not detected")
+
+    # Imunify360
+    imunify = env.get("imunify360", {})
+    if imunify.get("available"):
+        patch = imunify.get("patch_id", "?")
+        ports = imunify.get("known_ports", [])
+        out.append(f"  imunify360              : detected  patch_id={patch}  ports={ports}")
+    else:
+        out.append("  imunify360              : not detected")
+
+    # WP-CLI
+    wpcli = env.get("wpcli", {})
+    if wpcli.get("available"):
+        out.append(f"  wp-cli                  : {wpcli.get('path', '?')}")
+    else:
+        note = "config dir present" if wpcli.get("config_dir_exists") else "not installed"
+        out.append(f"  wp-cli                  : not available  ({note})")
+
+    # Redis RDB / AOF persistence files
+    rdb = env.get("redis_rdb", {})
+    if rdb.get("available"):
+        out.append("  redis_rdb               :")
+        for f in rdb.get("files", []):
+            mtime = (f.get("mtime") or "?")[:10]
+            out.append(
+                f"    {f.get('path', '?'):<50}  "
+                f"{f.get('size_mb', '?'):>6} MiB  mtime={mtime}"
+            )
+    else:
+        out.append("  redis_rdb               : no dump files found")
+
+    # AWStats
+    aws = env.get("awstats", {})
+    if aws.get("available"):
+        out.append(
+            f"  awstats                 : {aws.get('file_count', '?')} files in "
+            f"{aws.get('dir', '?')}"
+        )
+        latest = os.path.basename(aws.get("latest_file") or "")
+        out.append(
+            f"    latest: {latest:<40}  {aws.get('latest_size_kb', '?')} KiB"
+        )
+    else:
+        out.append("  awstats                 : not found")
+
+    # Access logs
+    logs = env.get("access_logs", {})
+    if logs.get("available"):
+        out.append(
+            f"  access_logs             : {logs.get('file_count', '?')} files in "
+            f"{logs.get('dir', '?')}"
+        )
+        if logs.get("largest_file"):
+            out.append(
+                f"    largest: {logs['largest_file']:<42}  "
+                f"{logs.get('largest_size_mb', '?')} MiB"
+            )
+    else:
+        out.append("  access_logs             : not found")
+
+    # Competing cache plugins
+    cp = env.get("competing_plugins", {})
+    if cp.get("available"):
+        out.append(f"  competing_plugins       : ⚠ {len(cp['found'])} found on disk")
+        for plug in cp.get("found", []):
+            out.append(f"    - {plug['name']}  ({plug['slug']})")
+    elif cp.get("plugins_dir_readable"):
+        out.append("  competing_plugins       : none detected")
+    else:
+        out.append("  competing_plugins       : plugins dir not accessible")
+
     return "\n".join(out)
 
 
@@ -1923,6 +3074,7 @@ def cmd_report(args, cfg):
             "mysql":            { ...mysql_probe() output... }   | null,
             "breakdown":        { ...scan_breakdown() output... } | null,
             "stampede":         { ...scan_stampede_locks() output... } | null,
+            "system":           { ...system_snapshot() output... }     | null,
             "alerts":           [ { severity, code, msg }, ... ]
         }
 
@@ -1937,6 +3089,17 @@ def cmd_report(args, cfg):
     client, endpoint = connect_redis(args, cfg)
     snap = redis_snapshot(client, endpoint)
     cb = circuit_breaker_state(endpoint["host"], endpoint["port"])
+
+    # ── Gather system metrics (CPU / RAM / disk / net / services) ──────
+    sys_block = None
+    if not args.no_sysinfo:
+        wp_root = os.path.dirname(args.wp_config) if args.wp_config else None
+        sys_block = system_snapshot(wp_root)
+        # Probe Memcached if detected in the service scan
+        if sys_block and sys_block.get("services", {}).get(11211):
+            mc_host = args.memcached_host or "127.0.0.1"
+            mc_port = args.memcached_port or 11211
+            sys_block["memcached"] = memcached_probe(mc_host, mc_port)
 
     # ── Gather MySQL state ────────────────────────────────────────────
     # gather_mysql() transparently falls back to the mariadb/mysql CLI binary
@@ -1987,7 +3150,7 @@ def cmd_report(args, cfg):
             stampede_block = {"error": str(exc)}
 
     # ── Alerts (run health-check logic against this snapshot) ─────────
-    alerts = _compute_alerts(snap, cb, mysql_block, stampede_block)
+    alerts = _compute_alerts(snap, cb, mysql_block, stampede_block, sys_block=sys_block)
 
     # ── Resolve API credentials (constants → wp_options, like cron) ───
     api_url, api_key, site_id, site_url = resolve_api_credentials(
@@ -2022,6 +3185,7 @@ def cmd_report(args, cfg):
         "mysql": mysql_block,
         "breakdown": breakdown_block,
         "stampede": stampede_block,
+        "system": sys_block,
         "alerts": alerts,
     }
 
@@ -2070,7 +3234,7 @@ def cmd_report(args, cfg):
         sys.exit(4)
 
 
-def _compute_alerts(snap, cb, mysql_block, stampede_block,
+def _compute_alerts(snap, cb, mysql_block, stampede_block, sys_block=None,
                     ping_max_ms=50.0, hit_ratio_min=80.0,
                     memory_fill_max=90.0, stampede_max=25,
                     mysql_sat_max=80.0):
@@ -2146,7 +3310,138 @@ def _compute_alerts(snap, cb, mysql_block, stampede_block,
                 "msg": f"MySQL has refused {cme} new connections since boot.",
             })
 
+    # System-level alerts (load, RAM, swap, disk)
+    if sys_block and "load_error" not in sys_block:
+        cores = sys_block.get("cpu_cores") or 1
+        load_1m = sys_block.get("load_1m")
+        if load_1m is not None:
+            if load_1m > cores * 1.5:
+                alerts.append({
+                    "severity": "critical", "code": "high_load",
+                    "msg": f"Load avg {load_1m} (1m) > 150% of {cores} cores — "
+                           "server critically overloaded.",
+                })
+            elif load_1m > cores * 0.85:
+                alerts.append({
+                    "severity": "warn", "code": "high_load",
+                    "msg": f"Load avg {load_1m} (1m) above 85% of {cores} cores.",
+                })
+
+    if sys_block and "mem_error" not in sys_block:
+        mem_pct = sys_block.get("mem_used_pct")
+        if isinstance(mem_pct, (int, float)):
+            if mem_pct > 95:
+                alerts.append({
+                    "severity": "critical", "code": "low_memory",
+                    "msg": f"RAM at {mem_pct}% — system near OOM.",
+                })
+            elif mem_pct > 90:
+                alerts.append({
+                    "severity": "warn", "code": "low_memory",
+                    "msg": f"RAM at {mem_pct}% — less than 10% free.",
+                })
+        swap_pct = sys_block.get("swap_used_pct")
+        if isinstance(swap_pct, (int, float)) and swap_pct > 50:
+            alerts.append({
+                "severity": "warn", "code": "high_swap",
+                "msg": f"Swap at {swap_pct}% — physical RAM under pressure.",
+            })
+
+    if sys_block:
+        for label, d in (sys_block.get("disk") or {}).items():
+            used_pct = d.get("used_pct")
+            if not isinstance(used_pct, (int, float)):
+                continue
+            if used_pct > 95:
+                alerts.append({
+                    "severity": "critical", "code": f"disk_full_{label}",
+                    "msg": f"Disk [{label}] {d.get('path', '')} at {used_pct}% — near full.",
+                })
+            elif used_pct > 85:
+                alerts.append({
+                    "severity": "warn", "code": f"disk_usage_{label}",
+                    "msg": f"Disk [{label}] {d.get('path', '')} at {used_pct}% used.",
+                })
+
+    # Memcached active alongside PigCache → competing object cache
+    if sys_block:
+        services = sys_block.get("services", {})
+        # port 11211 present and Memcached has real traffic
+        mc = sys_block.get("memcached", {})
+        if services.get(11211) and mc.get("available") and (mc.get("cmd_get", 0) or 0) > 0:
+            alerts.append({
+                "severity": "warn", "code": "competing_cache_memcached",
+                "msg": "Memcached is running and receiving GET requests alongside PigCache. "
+                       "A plugin (W3TC, WP Super Cache, etc.) may be using it as object cache, "
+                       "splitting cache traffic between Redis and Memcached.",
+            })
+
+    # LVE throttle faults (only when cgroup/lve data is accessible)
+    lve = (sys_block or {}).get("account_limits", {})
+    if lve.get("available"):
+        for fault_key, label in [("fault_cpu", "CPU"), ("fault_mem", "MEM"),
+                                  ("fault_io", "IO"),  ("fault_ep",  "EntryProcesses")]:
+            faults = lve.get(fault_key, 0) or 0
+            if faults > 0:
+                alerts.append({
+                    "severity": "warn", "code": f"lve_fault_{fault_key}",
+                    "msg": f"LVE {label} limit hit {faults}× since last reset — "
+                           "your account is being throttled by the host.",
+                })
+        # Memory pressure within account quota
+        mem_limit = lve.get("mem_limit_bytes") or lve.get("mem_limit_kb", 0) * 1024
+        mem_used  = lve.get("mem_usage_bytes", 0)
+        if mem_limit and mem_used:
+            pct = mem_used / mem_limit * 100
+            if pct > 90:
+                alerts.append({
+                    "severity": "warn", "code": "lve_mem_pressure",
+                    "msg": f"Account RAM at {round(pct, 1)}% of LVE quota "
+                           f"({mem_used // (1024*1024)} / {mem_limit // (1024*1024)} MiB).",
+                })
+
+    # Environment-level alerts (LSCache conflict, competing plugins)
+    env = (sys_block or {}).get("environment", {})
+    if env:
+        lsc = env.get("lscache", {})
+        if lsc.get("available") and lsc.get("cache_active"):
+            alerts.append({
+                "severity": "critical", "code": "lscache_conflict",
+                "msg": "LiteSpeed LSCache has active page-cache files. "
+                       "LSCache intercepts requests before advanced-cache.php runs, "
+                       "so PigCache HTML cache entries are never populated or served. "
+                       "Disable LSCache full-page caching OR PigCache HTML cache — "
+                       "not both.",
+            })
+
+        cp = env.get("competing_plugins", {})
+        if cp.get("available"):
+            names = ", ".join(p["name"] for p in cp.get("found", [])[:3])
+            extra = f" (+{len(cp['found']) - 3} more)" if len(cp.get("found", [])) > 3 else ""
+            alerts.append({
+                "severity": "warn", "code": "competing_plugins",
+                "msg": f"Competing cache plugin(s) on disk: {names}{extra}. "
+                       "If active, they may conflict with PigCache at the HTML or "
+                       "object cache layer.",
+            })
+
     return alerts
+
+
+def cmd_scan(args, _cfg):
+    """Standalone environment scan — no Redis or MySQL required.
+
+    Probes every available service/file independently and prints a human-
+    readable summary. Each probe falls back gracefully when the source is
+    absent or permission-denied, so the output always shows what IS there
+    rather than crashing on what isn't.
+    """
+    wp_root = os.path.dirname(args.wp_config) if getattr(args, "wp_config", None) else None
+    env = environment_scan(wp_root)
+    if args.json:
+        print(json.dumps(env, indent=2, default=str))
+    else:
+        print(render_environment_text(env))
 
 
 # ─── CLI ─────────────────────────────────────────────────────────────────────
@@ -2188,6 +3483,43 @@ def _build_common_parent():
     parent.add_argument("--scan-count", type=int, default=500,
                         help="COUNT hint per SCAN iteration (default: 500)")
     return parent
+
+
+def cmd_memcached(args, _cfg):
+    host = args.memcached_host or "127.0.0.1"
+    port = args.memcached_port or 11211
+    m = memcached_probe(host, port, timeout=float(args.timeout))
+    if args.json:
+        print(json.dumps(m, indent=2, default=str))
+    else:
+        print(render_memcached_text(m))
+
+
+def cmd_services(args, _cfg):
+    services = detect_services()
+    procs    = scan_own_processes()
+    if args.json:
+        print(json.dumps({"services": services, "processes": procs}, indent=2, default=str))
+    else:
+        print(render_services_text(services, procs))
+
+
+def cmd_sysinfo(args, _cfg):
+    wp_root = os.path.dirname(args.wp_config) if args.wp_config else None
+    sys_snap = system_snapshot(wp_root)
+    if args.json:
+        print(json.dumps(sys_snap, indent=2, default=str))
+    else:
+        print(render_system_text(sys_snap))
+        env = sys_snap.get("environment")
+        if env:
+            print()
+            print(render_environment_text(env))
+        services = sys_snap.get("services")
+        procs    = sys_snap.get("processes")
+        if services is not None:
+            print()
+            print(render_services_text(services, procs or []))
 
 
 def build_parser():
@@ -2276,6 +3608,30 @@ def build_parser():
                    help="Skip stampede lock scan")
     r.add_argument("--http-timeout", type=int, default=20,
                    help="HTTP timeout in seconds for the API POST (default: 20)")
+    r.add_argument("--no-sysinfo", action="store_true",
+                   help="Skip OS-level metrics (CPU/RAM/disk/network) from the payload")
+    r.add_argument("--memcached-host", default="127.0.0.1",
+                   help="Memcached host (default: 127.0.0.1)")
+    r.add_argument("--memcached-port", type=int, default=11211,
+                   help="Memcached port (default: 11211)")
+
+    sub.add_parser("sysinfo", parents=[common],
+                   help="One-shot OS metrics snapshot (CPU, RAM, disk, network, services, processes)")
+
+    mc = sub.add_parser("memcached", parents=[common],
+                        help="Probe a Memcached instance (stats, hit ratio, memory, evictions)")
+    mc.add_argument("--memcached-host", default="127.0.0.1")
+    mc.add_argument("--memcached-port", type=int, default=11211)
+
+    sub.add_parser("services", parents=[common],
+                   help="List listening services and account processes from /proc")
+
+    sub.add_parser(
+        "scan", parents=[common],
+        help="Environment scan — web server, LSCache, CageFS, Imunify360, WP-CLI, "
+             "Redis RDB, access logs, AWStats, competing plugins. "
+             "No Redis or MySQL connection required.",
+    )
 
     return p
 
@@ -2315,6 +3671,14 @@ def main(argv=None):
         cmd_log_line(args, cfg)
     elif args.cmd == "report":
         cmd_report(args, cfg)
+    elif args.cmd == "sysinfo":
+        cmd_sysinfo(args, cfg)
+    elif args.cmd == "memcached":
+        cmd_memcached(args, cfg)
+    elif args.cmd == "services":
+        cmd_services(args, cfg)
+    elif args.cmd == "scan":
+        cmd_scan(args, cfg)
     else:
         parser.error(f"unknown command: {args.cmd}")
 

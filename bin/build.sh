@@ -180,14 +180,12 @@ build_zip() {
   fi
 
   # ---- Inject cron script (bin/ is excluded from rsync via .distignore) ------
-  # Pro: ship as-is. Free: strip Pro-only sections first.
-  # build.sh itself never ships.
-  mkdir -p "${staging}/bin"
+  # Pro only: the standalone cron uses direct mysqli (no WordPress bootstrap) and
+  # handles Pro-only pipelines (query stats, cloud sync, fingerprints, adaptive TTL).
+  # The Free build has none of those features so the script is not included.
   if [[ "${label}" == "pro" ]]; then
+    mkdir -p "${staging}/bin"
     cp "${PLUGIN_DIR}/bin/pigcache-cron.php" "${staging}/bin/pigcache-cron.php"
-  else
-    sed '/\/\/ ── PRO_START/,/\/\/ ── PRO_END/d' \
-      "${PLUGIN_DIR}/bin/pigcache-cron.php" > "${staging}/bin/pigcache-cron.php"
   fi
 
   # ---- Inject Python CLI tooling (cli/ is excluded from rsync via .distignore)

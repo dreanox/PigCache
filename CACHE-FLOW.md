@@ -702,6 +702,215 @@ conflicto directo, pero conceptualmente el v2 es el sistema canónico going forw
 
 ---
 
+## 16. CDN and Cloudflare — Interactions with PigCache
+
+### Stack position
+
+PigCache runs at the **origin server**, inside WordPress, before PHP renders the page.
+A CDN sits in front of the origin. The full request path is:
+
+```
+Visitor
+  ↓
+CDN Edge  (Cloudflare / BunnyCDN / Fastly / nginx proxy_cache / Varnish)
+  ↓  on cache miss, or bypass
+Origin Server (LiteSpeed / Apache / nginx)
+  ↓
+advanced-cache.php   ←  PigCache intercepts here
+  ↓  on HTML cache miss
+WordPress PHP + MySQL
+```
+
+No PigCache code runs if the CDN has a cache hit. PigCache only sees requests that
+reach the origin.
+
+---
+
+### Positive interactions (they help each other)
+
+| Scenario | What happens |
+|----------|-------------|
+| CDN serves a **static asset** (CSS/JS/image) | PigCache and PHP are never invoked. Zero server load. |
+| CDN serves a **cached HTML page** | Origin not reached. PigCache cache warms during that CDN TTL. |
+| CDN misses, **PigCache hits** | Origin receives the request; PigCache serves HTML from Redis — no PHP, no MySQL. CDN caches this fast response for future visitors. |
+| **PigCache Adaptive TTL** assigns a long TTL | CDN can respect the same `Cache-Control: max-age` signal and hold the page at the edge for the same duration. |
+| **High traffic** with CDN | CDN absorbs most hits; only real misses hit PigCache. PigCache hit rate appears lower (fewer requests) but Redis and MySQL are shielded from sustained load spikes. |
+
+---
+
+### Negative interactions (where they conflict)
+
+#### 1. Double caching creates a stale-content window
+
+When both layers cache HTML, a `save_post` event only purges PigCache.
+The CDN still holds the old version until its own TTL expires.
+
+```
+Editor saves post
+  → PigCache purges the page from Redis           ✓
+  → CDN edge still serves old cached HTML          ✗  (until CDN TTL expires)
+```
+
+**Free build**: worse — global flush wipes all Redis keys at once, but each CDN edge
+URL has its own independent TTL, so stale pages can linger at the edge for different
+amounts of time per URL.
+
+**Pro build**: tag-based purge hits the precise Redis keys, but CDN still needs a
+separate purge API call for the same URLs. See section 16.4 below.
+
+---
+
+#### 2. CDN caches pages PigCache intentionally bypasses
+
+Both layers have bypass rules. If they are not aligned, the CDN can cache a response
+that PigCache would never serve from cache — for example a page loaded with an active
+WooCommerce session cookie, or an admin preview.
+
+**Symptom**: logged-in users or cart/checkout pages show stale cached content from the
+CDN edge that should have been dynamic.
+
+**Fix**: mirror PigCache's bypass conditions in CDN rules so both layers agree on what
+is cacheable. The authoritative list of PigCache bypass triggers:
+
+| Condition | PigCache skips cache | Must also bypass CDN |
+|-----------|---------------------|----------------------|
+| Cookie `wordpress_logged_in_*` | ✓ | ✓ |
+| Cookie `woocommerce_*` or `edd_*` | ✓ | ✓ |
+| Cookie `wp-settings-*`, `comment_*` | ✓ | ✓ |
+| Path `/wp-admin/` or `/wp-login.php` | ✓ | ✓ |
+| Query `?preview=true` | ✓ | ✓ |
+| Query `?add-to-cart=`, `?edd-*` | ✓ | ✓ |
+| Method POST, PUT, PATCH, DELETE | ✓ | ✓ |
+| AJAX (`X-Requested-With: XMLHttpRequest`) | ✓ | ✓ |
+
+---
+
+#### 3. Cloudflare Free does not cache HTML by default
+
+Cloudflare Free only caches files it recognises as static by extension (CSS, JS, images,
+fonts). Dynamic HTML responses (`Content-Type: text/html`) pass through to origin on
+every request.
+
+**With default Cloudflare Free**: PigCache handles all HTML caching. No conflict exists.
+
+**If "Cache Everything" is enabled** (via Page Rule or Cache Rule): both layers cache
+HTML → double caching problem above applies. This is not recommended without purge API
+integration (section 16.4).
+
+---
+
+#### 4. Real IP and cache key accuracy
+
+Cloudflare proxies traffic through its own IPs. The server sees Cloudflare's IP in
+`REMOTE_ADDR`, not the real visitor's IP.
+
+PigCache's HTML cache key uses `host + uri` — not IP — so cache hits are not affected.
+
+The only place real IP matters is **security logging and API authentication**. Ensure
+the origin reads `CF-Connecting-IP` (or `X-Forwarded-For`) instead of `REMOTE_ADDR`
+for logging purposes. On cPanel + LiteSpeed this is the "Use Client IP in Header"
+setting. On Apache, `mod_remoteip` handles it.
+
+---
+
+### Cloudflare-specific configuration
+
+#### Bypass Cache Rule (Cloudflare Rules → Cache Rules)
+
+Create one rule with action **"Bypass cache"** matching:
+
+```
+(http.cookie contains "wordpress_logged_in_") or
+(http.cookie contains "woocommerce_") or
+(http.cookie contains "wp-settings-") or
+(http.cookie contains "comment_") or
+(http.request.uri.path contains "/wp-admin") or
+(http.request.uri.path eq "/wp-login.php") or
+(http.request.uri.path eq "/xmlrpc.php") or
+(http.request.uri.query contains "preview=true") or
+(http.request.uri.query contains "add-to-cart=")
+```
+
+#### Browser TTL — respect origin headers
+
+Set **"Browser Cache TTL → Respect Existing Headers"** in Cloudflare Caching settings.
+This lets PigCache's TTL (reflected in `Cache-Control: max-age`) flow through to the
+edge instead of being overridden by Cloudflare's default.
+
+---
+
+### 16.4 Purge CDN on content change (Pro + Cloudflare API)
+
+The key to eliminating stale content when both layers cache HTML is wiring the CDN
+purge call into PigCache's invalidation pipeline.
+
+```php
+// wp-config.php
+define( 'PIGCACHE_CF_ZONE_ID',   'your_zone_id' );
+define( 'PIGCACHE_CF_API_TOKEN', 'your_cache_purge_token' );  // Cache Purge permission only
+```
+
+**Pro — tag-based flow** (precise, per-URL purge):
+
+```
+save_post fires
+  → PigCache_Invalidation resolves tags: ['post:123', 'home', 'term:10']
+  → PigCache_Tag_Index::purge_by_tags(tags)
+       → MySQL: SELECT cache_key, url FROM wp_pigcache_tags WHERE tag IN (...)
+       → Redis:  wp_cache_delete(doc_aaa), wp_cache_delete(doc_bbb), ...
+       → [hook] Cloudflare API: POST /zones/{zone_id}/purge_cache
+                  { "files": [
+                      "https://example.com/my-post/",
+                      "https://example.com/",
+                      "https://example.com/category/news/"
+                    ] }
+```
+
+The URL list comes directly from the same tag index lookup that resolved which Redis
+keys to delete. No extra queries needed.
+
+**Free — global purge only** (no URL resolution available):
+
+```
+save_post fires
+  → global_flush() wipes Redis
+  → [optional] Cloudflare API: POST /zones/{zone_id}/purge_cache
+                  { "purge_everything": true }
+```
+
+Avoid calling `purge_everything` on every `save_post` on a high-traffic site —
+it would obliterate the CDN cache on every edit and cause an origin load spike
+until the edge re-warms. Only use it for manual cache clears or major deployments.
+
+---
+
+### Decision matrix — when to enable Cloudflare HTML caching
+
+| Setup | Recommendation |
+|-------|---------------|
+| Cloudflare Free + PigCache Free | Leave HTML to PigCache only. Cloudflare handles static assets, DDoS, SSL. |
+| Cloudflare Free + PigCache Pro | Leave HTML to PigCache. Add CF purge hook if you later enable Cache Everything. |
+| Cloudflare Pro/Biz + PigCache Pro | Enable CF HTML cache + purge integration. Real benefit for global audiences. |
+| High-traffic news / live blog | PigCache Pro Hot+Dynamic tier (60 s TTL) + CDN HTML cache off or ≤ 60 s TTL. Content changes too fast for edge caching. |
+| WooCommerce | Never enable CDN HTML caching on cart / checkout / account. Bypass rules are critical. |
+| Mostly static (blog, portfolio) | Ideal for CDN HTML caching + PigCache Hot+Stable tier (86 400 s TTL). Few content changes, large edge benefit. |
+| Self-hosted Varnish / nginx in front | PigCache HTML cache becomes redundant — the proxy handles that layer. Keep PigCache for object cache drop-in, SQL cache, and fragment cache. |
+
+---
+
+### Other CDNs — same principles
+
+The bypass and purge logic above applies regardless of CDN vendor:
+
+- **BunnyCDN / KeyCDN**: configure Pull Zone → Edge Rules for bypass; use their purge API in the invalidation hook.
+- **Fastly**: use surrogate keys (cache tags) natively — PigCache's tag values map directly to Fastly's `Surrogate-Key` header.
+- **Varnish (self-hosted)**: use `BAN` or `PURGE` HTTP requests from the invalidation hook.
+- **nginx `proxy_cache`**: use `proxy_cache_purge` module or invalidate by cache key pattern.
+
+The invariant in all cases: **bypass rules on the CDN must mirror PigCache's bypass conditions**, and **purge on content change must hit both layers**.
+
+---
+
 ## 14. Glossary
 
 | Term | Meaning |
