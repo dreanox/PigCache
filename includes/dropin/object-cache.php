@@ -45,6 +45,13 @@ if ( defined( 'PIGCACHE_PLUGIN_DIR' ) ) {
 }
 
 // phpcs:disable Generic.WhiteSpace.ScopeIndent.IncorrectExact, Generic.WhiteSpace.ScopeIndent.Incorrect
+
+// PIGCACHE_DEAD_CODE: PIGCACHE_REDIS_DISABLED wrapper (legacy Till Kruss kill-switch).
+// PigCache replaces this with its own circuit breaker (pigcache_circuit_*),
+// which is smarter (auto-recovers after RETRY_INTERVAL instead of staying off
+// until someone re-deploys wp-config.php). No external code or docs reference
+// PIGCACHE_REDIS_DISABLED. Safe to remove: delete the `if (...) :` here and
+// the matching `endif;` at the bottom of this file (~line 3073).
 if ( ! defined( 'PIGCACHE_REDIS_DISABLED' ) || ! PIGCACHE_REDIS_DISABLED ) :
 
 /**
@@ -594,6 +601,10 @@ class WP_Object_Cache {
                     break;
             }
 
+            // PIGCACHE_DEAD_CODE: Redis Cluster ping branch.
+            // Cluster mode (PIGCACHE_REDIS_CLUSTER) is never used by PigCache
+            // — no external refs, no docs, target deployment is cPanel + standalone
+            // Redis. Replace this whole if/else with just `$this->diagnostics['ping'] = $this->redis->ping();`.
             if ( defined( 'PIGCACHE_REDIS_CLUSTER' ) ) {
                 $connectionId = is_string( PIGCACHE_REDIS_CLUSTER )
                     ? PIGCACHE_REDIS_CLUSTER
@@ -728,6 +739,13 @@ class WP_Object_Cache {
 
         $this->diagnostics[ 'client' ] = sprintf( 'PhpRedis (v%s)', $version );
 
+        // PIGCACHE_DEAD_CODE: phpredis Sharding (RedisArray) and Cluster (RedisCluster) branches.
+        // Lines ~742-771 (the `if SHARDS` and `elseif CLUSTER` branches). Neither
+        // PIGCACHE_REDIS_SHARDS nor PIGCACHE_REDIS_CLUSTER are documented or
+        // referenced outside this dropin. The `else` branch (single Redis
+        // instance, line 772) is the only path PigCache actually exercises.
+        // Safe to delete: collapse the `if/elseif/else` into just the body of
+        // the final `else` block.
         if ( defined( 'PIGCACHE_REDIS_SHARDS' ) ) {
             $this->redis = new RedisArray( array_values( PIGCACHE_REDIS_SHARDS ) );
 
@@ -819,11 +837,20 @@ class WP_Object_Cache {
      * @param  array $parameters Connection parameters built by the `build_parameters` method.
      * @return void
      */
+    // PIGCACHE_DEAD_CODE (Tier 2 — borderline): connect_using_relay() is the
+    // whole Relay client path (lines ~824-895). Relay is mentioned in MANUAL.md
+    // as "supported" but cPanel shared hosts never have the Relay extension
+    // (it requires a license + custom build). If you confirm no client uses
+    // Relay, delete the whole method AND the `case 'relay':` branch in the
+    // constructor switch around line 595.
     protected function connect_using_relay( $parameters ) {
         $version = phpversion( 'relay' );
 
         $this->diagnostics[ 'client' ] = sprintf( 'Relay (v%s)', $version );
 
+        // PIGCACHE_DEAD_CODE: SHARDS/CLUSTER guards inside Relay (~3 lines).
+        // Even if you keep Relay, these throw branches are dead because the
+        // Cluster/Shards constants are themselves dead.
         if ( defined( 'PIGCACHE_REDIS_SHARDS' ) ) {
             throw new Exception('Relay does not support sharding.');
         } elseif ( defined( 'PIGCACHE_REDIS_CLUSTER' ) ) {
@@ -891,12 +918,39 @@ class WP_Object_Cache {
     protected function connect_using_predis( $parameters ) {
         $client = 'Predis';
 
-        // Load bundled Predis library.
+        // Load bundled Predis library. The dropin is loaded by WordPress
+        // BEFORE the main plugin file runs, so PIGCACHE_PLUGIN_DIR is almost
+        // never defined when we get here. Search the standard install
+        // locations (mirrors advanced-cache.php's plugin-discovery pattern)
+        // so we work on hosts that don't have the phpredis PECL extension.
         if ( ! class_exists( 'Predis\Client' ) ) {
+            $autoload_candidates = array();
+
             if ( defined( 'PIGCACHE_PLUGIN_DIR' ) ) {
-                $pigcache_autoload = PIGCACHE_PLUGIN_DIR . '/vendor/autoload.php';
-                if ( is_readable( $pigcache_autoload ) ) {
-                    require_once $pigcache_autoload;
+                $autoload_candidates[] = PIGCACHE_PLUGIN_DIR . '/vendor/autoload.php';
+            }
+
+            if ( defined( 'WP_CONTENT_DIR' ) ) {
+                $autoload_candidates[] = WP_CONTENT_DIR . '/plugins/pigcache/vendor/autoload.php';
+                $autoload_candidates[] = WP_CONTENT_DIR . '/mu-plugins/pigcache/vendor/autoload.php';
+
+                // Anything under wp-content/plugins/* that ships the same vendor.
+                if ( function_exists( 'glob' ) ) {
+                    $glob_matches = glob( WP_CONTENT_DIR . '/plugins/*/vendor/predis/predis/src/Client.php' );
+                    if ( is_array( $glob_matches ) ) {
+                        foreach ( $glob_matches as $client_path ) {
+                            $autoload_candidates[] = dirname( $client_path, 4 ) . '/autoload.php';
+                        }
+                    }
+                }
+            }
+
+            foreach ( $autoload_candidates as $autoload_path ) {
+                if ( $autoload_path && is_readable( $autoload_path ) ) {
+                    require_once $autoload_path;
+                    if ( class_exists( 'Predis\Client' ) ) {
+                        break;
+                    }
                 }
             }
 
@@ -910,6 +964,12 @@ class WP_Object_Cache {
         $servers = false;
         $options = [];
 
+        // PIGCACHE_DEAD_CODE: Predis SHARDS / SENTINEL / SERVERS (replication) / CLUSTER branches.
+        // All four constants (PIGCACHE_REDIS_SHARDS, _SENTINEL, _SERVERS, _CLUSTER)
+        // are dead — zero external refs, zero docs, target environment is single
+        // standalone Redis. Safe to delete this whole `if/elseif` chain; the
+        // `$servers = false` initialization above already handles the only path
+        // PigCache uses (single-server connection via $parameters).
         if ( defined( 'PIGCACHE_REDIS_SHARDS' ) ) {
             $servers = PIGCACHE_REDIS_SHARDS;
             $parameters['shards'] = $servers;
@@ -936,6 +996,9 @@ class WP_Object_Cache {
             $parameters['read_write_timeout'] = $parameters['read_timeout'];
         }
 
+        // PIGCACHE_DEAD_CODE: Predis multi-server option propagation. Only
+        // triggers when one of the dead SERVERS/SHARDS/CLUSTER constants is
+        // defined. Safe to delete with the if/elseif chain above.
         foreach ( [ 'PIGCACHE_REDIS_SERVERS', 'PIGCACHE_REDIS_SHARDS', 'PIGCACHE_REDIS_CLUSTER' ] as $constant ) {
             if ( defined( $constant ) ) {
                 if ( $parameters['database'] ) {
@@ -984,6 +1047,9 @@ class WP_Object_Cache {
      * @return void
      */
     public function fetch_info() {
+        // PIGCACHE_DEAD_CODE: Cluster INFO branch in fetch_info(). Replace the
+        // whole if/else with just `$info = $this->redis->info();` and the
+        // single-instance handling that follows the `else`.
         if ( defined( 'PIGCACHE_REDIS_CLUSTER' ) ) {
             $connectionId = is_string( PIGCACHE_REDIS_CLUSTER )
                 ? 'SERVER'
@@ -1454,10 +1520,16 @@ class WP_Object_Cache {
     protected function execute_lua_script( $script ) {
         $results = [];
 
+        // PIGCACHE_DEAD_CODE: Cluster Lua dispatch — Cluster mode is unused.
+        // Delete this `if` block; the dropin will execute the script on the
+        // single Redis instance below as it already does.
         if ( defined( 'PIGCACHE_REDIS_CLUSTER' ) ) {
             return $this->execute_lua_script_on_cluster( $script );
         }
 
+        // PIGCACHE_DEAD_CODE: PIGCACHE_REDIS_FLUSH_TIMEOUT constant is undocumented
+        // and unreferenced externally. Replace with a hardcoded 5 (or keep — the
+        // savings here are minimal but the constant adds API surface to nothing).
         $flushTimeout = defined( 'PIGCACHE_REDIS_FLUSH_TIMEOUT' ) ? PIGCACHE_REDIS_FLUSH_TIMEOUT : 5;
 
         if ( $this->is_predis() ) {
@@ -1495,6 +1567,10 @@ class WP_Object_Cache {
      *
      * @return array|false  Returns array on success, false on failure
      */
+    // PIGCACHE_DEAD_CODE: execute_lua_script_on_cluster() is only called from
+    // the (also dead) Cluster branch in execute_lua_script(). Delete the whole
+    // method (~35 lines, ends at the next `}` before the comment block for
+    // `public function flush()`).
     protected function execute_lua_script_on_cluster( $script ) {
         $results = [];
         $redis = $this->redis;
@@ -1555,6 +1631,9 @@ class WP_Object_Cache {
                     return false;
                 }
             } else {
+                // PIGCACHE_DEAD_CODE: Cluster flush fan-out (iterates masters).
+                // Unused — Cluster mode is dead. Replace this whole if/else with
+                // just the body of the final `else` (single-instance flushdb call).
                 if ( defined( 'PIGCACHE_REDIS_CLUSTER' ) ) {
                     try {
                         if ( $this->is_predis() ) {
@@ -1619,6 +1698,10 @@ class WP_Object_Cache {
 	 * @return bool Returns TRUE on success or FALSE on failure.
 	 */
     public function flush_group( $group ) {
+        // PIGCACHE_DEAD_CODE: PIGCACHE_REDIS_DISABLE_GROUP_FLUSH escape hatch.
+        // Undocumented, zero external refs. Delete this `if` block to keep the
+        // per-group flush always enabled (which is what PigCache_Sql_Cache and
+        // PigCache_Html_Cache rely on for surgical invalidation).
         if ( defined( 'PIGCACHE_REDIS_DISABLE_GROUP_FLUSH' ) && PIGCACHE_REDIS_DISABLE_GROUP_FLUSH ) {
             return $this->flush();
         }
@@ -2672,6 +2755,10 @@ class WP_Object_Cache {
     protected function validate_expiration( $expiration ) {
         $expiration = is_int( $expiration ) || ctype_digit( (string) $expiration ) ? (int) $expiration : 0;
 
+        // PIGCACHE_DEAD_CODE (Tier 2 — undocumented but harmless if kept):
+        // PIGCACHE_REDIS_MAXTTL caps every TTL. Never documented, no external
+        // refs. Borderline useful as a safety belt — delete only if you don't
+        // want to ever advertise it.
         if ( defined( 'PIGCACHE_REDIS_MAXTTL' ) ) {
             $max = (int) PIGCACHE_REDIS_MAXTTL;
 
@@ -2911,6 +2998,11 @@ class WP_Object_Cache {
             do_action( 'pigcache_object_cache_error', $exception, $exception->getMessage() );
         }
 
+        // PIGCACHE_DEAD_CODE: fail_gracefully=false branch only fires the death
+        // screen below. PigCache's wp_cache_init() always constructs with
+        // graceful=true (default PIGCACHE_REDIS_GRACEFUL=true). Once you delete
+        // show_error_and_die() you can also delete this if-block AND the
+        // $fail_gracefully constructor argument + property (~5 lines saved).
         if ( ! $this->fail_gracefully ) {
             $this->show_error_and_die( $exception );
         }
@@ -2923,6 +3015,12 @@ class WP_Object_Cache {
      *
      * @return void
      */
+    // PIGCACHE_DEAD_CODE: show_error_and_die() is the full Till Kruss "Error
+    // establishing a Redis connection" white-screen-of-death (~60 lines). Only
+    // reachable when fail_gracefully=false, which PigCache never sets. The
+    // whole method including i18n / wp_load_translations_early / verbose
+    // error HTML can be deleted. Method ends at the `}` before
+    // `protected function build_cluster_connection_array()`.
     protected function show_error_and_die( Exception $exception ) {
         wp_load_translations_early();
 
@@ -2989,6 +3087,10 @@ class WP_Object_Cache {
      *
      * @return  array
      */
+    // PIGCACHE_DEAD_CODE: build_cluster_connection_array() — only called from
+    // dead Cluster branches in __construct, connect_using_phpredis,
+    // connect_using_predis, fetch_info, execute_lua_script_on_cluster.
+    // Delete this whole method (~40 lines) once those branches are removed.
     protected function build_cluster_connection_array() {
         $cluster = array_values( PIGCACHE_REDIS_CLUSTER );
 
@@ -3043,5 +3145,7 @@ class WP_Object_Cache {
     }
 }
 
+// PIGCACHE_DEAD_CODE: closing endif; for PIGCACHE_REDIS_DISABLED wrapper above.
+// Remove together with the opening `if (...) :` near the top of this file.
 endif;
 // phpcs:enable Generic.WhiteSpace.ScopeIndent.IncorrectExact, Generic.WhiteSpace.ScopeIndent.Incorrect
