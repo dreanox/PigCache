@@ -1435,3 +1435,404 @@ redis-cli -a tu_password --scan --pattern "a3f8b21c:*" | xargs redis-cli -a tu_p
    PigCache_Tag_Index::cleanup_stale();
    ```
 3. Considera `redis-cli INFO memory` para ver el uso.
+
+---
+
+## 13. Cloud Backend — Pendientes de implementación
+
+Esta sección documenta lo que **todavía no está implementado** en `PigCache-API` / `PigCache-Front`.
+Cuando implementes algo, mueve la subsección a "Historial" con la fecha.
+
+---
+
+### 13.1 Modelo Tenant en base de datos
+
+Actualmente el bloque `tenant` del payload se almacena dentro del JSON de `site_monitor_snapshots.payload`.
+Para aprovechar los datos de agrupación de cuentas cPanel hay que persistirlos en tablas propias.
+
+#### Migración recomendada
+
+```sql
+-- tabla tenants (nueva)
+CREATE TABLE tenants (
+    tenant_id           VARCHAR(190) PRIMARY KEY,  -- "<hostname>::<cpanel_user>"
+    hostname            VARCHAR(190) NOT NULL,
+    cpanel_user         VARCHAR(64)  NOT NULL,
+    shared_hosting      TINYINT(1)   NOT NULL DEFAULT 0,
+    wp_site_count       INT          NOT NULL DEFAULT 0,
+    pigcache_site_count INT          NOT NULL DEFAULT 0,
+    disk_quota_gb       DECIMAL(10,2) NULL,
+    bandwidth_quota_gb  DECIMAL(10,2) NULL,
+    last_seen_at        DATETIME     NOT NULL,
+    INDEX idx_last_seen (last_seen_at)
+);
+
+-- columnas adicionales en sites (existente)
+ALTER TABLE sites
+    ADD COLUMN tenant_id          VARCHAR(190) NULL AFTER id,
+    ADD COLUMN folder_in_account  VARCHAR(64)  NULL AFTER tenant_id,
+    ADD COLUMN pigcache_installed TINYINT(1)   NULL AFTER folder_in_account,
+    ADD COLUMN pigcache_active    TINYINT(1)   NULL AFTER pigcache_installed,
+    ADD INDEX  idx_tenant (tenant_id);
+
+-- tenant_quota_snapshots (nueva, serie temporal)
+CREATE TABLE tenant_quota_snapshots (
+    id                  BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    tenant_id           VARCHAR(190) NOT NULL,
+    captured_at         DATETIME     NOT NULL,
+    disk_used_gb        DECIMAL(10,2) NULL,
+    mysql_disk_used_gb  DECIMAL(10,2) NULL,
+    bandwidth_used_gb   DECIMAL(10,2) NULL,
+    INDEX idx_tenant_time (tenant_id, captured_at)
+    -- deduplicar: una fila por (tenant_id, hora) — usar el primer registro del intervalo
+);
+
+-- tenant_bandwidth_by_domain (nueva, por mes)
+CREATE TABLE tenant_bandwidth_by_domain (
+    tenant_id    VARCHAR(190)    NOT NULL,
+    period_start DATE            NOT NULL,          -- primer día del mes UTC
+    domain       VARCHAR(190)    NOT NULL,
+    bytes        BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    PRIMARY KEY (tenant_id, period_start, domain)
+    -- upsert desde system.account.bandwidth_by_domain[] en cada report
+    -- los hermanos reportan los mismos números — ignorar duplicados del mismo hora
+);
+```
+
+#### Ingest pseudocódigo (en `MonitorSnapshotController::store`)
+
+```php
+// 1) Upsert tenant
+if (!empty($data['tenant']['tenant_id'])) {
+    Tenant::upsertFromPayload($data['tenant']);
+    $site->update([
+        'tenant_id'        => $data['tenant']['tenant_id'],
+        'folder_in_account'=> /* buscar en sites_inventory.sites_wp donde wp_config_path
+                                 coincide con site.wp_config_path del payload */,
+        'pigcache_active'  => /* sites_inventory.sites_wp[].pigcache_active_hint === 'yes' */,
+    ]);
+}
+
+// 2) Cuota de cuenta — deduplicar por hora (hermanos reportan lo mismo)
+if (!empty($data['system']['account']['available'])) {
+    TenantQuotaSnapshot::upsertForHour(
+        $data['tenant']['tenant_id'],
+        $data['system']['account']
+    );
+}
+
+// 3) Ancho de banda por dominio (mes actual)
+foreach ($data['system']['account']['bandwidth_by_domain'] ?? [] as $row) {
+    TenantBandwidthByDomain::upsertForMonth(
+        $data['tenant']['tenant_id'],
+        $row['domain'],
+        $row['bandwidth_bytes']
+    );
+}
+```
+
+#### Seguridad
+- `tenant_id` NO es secreto pero NUNCA confiar en él sin validar que `monitor.hostname`
+  y `monitor.user` del reporte coinciden con los registros previos del mismo `tenant_id`.
+- No exponer `account.bandwidth_by_domain` en endpoints no autenticados.
+- En Redis compartido, exponer solo conteos de claves, nunca nombres de claves.
+
+---
+
+### 13.2 Endpoints REST faltantes (admin)
+
+Rutas sugeridas a agregar en `routes/admin.php` y `SiteAdminController`:
+
+```
+GET /admin/tenants
+    Lista de tenants con: tenant_id, hostname, cpanel_user, wp_site_count,
+    pigcache_site_count, last_seen_at, alerts_count (de sus sites).
+
+GET /admin/tenants/{tenant_id}
+    Detalle: campos del tenant + sites[], quotas{disk,mysql_disk,bandwidth},
+    bandwidth_by_domain[] (mes actual), non_wp_folders[].
+
+GET /admin/tenants/{tenant_id}/quota-history?from=&to=
+    Serie temporal de tenant_quota_snapshots.
+    Respuesta: [{captured_at, disk_used_gb, mysql_disk_used_gb, bandwidth_used_gb}]
+
+GET /admin/sites/{id}/siblings
+    Sitios hermanos dentro del mismo tenant. Sirve para el banner
+    "Este sitio comparte cPanel con N otros sitios".
+
+GET /admin/sites/{id}/redis-dbs
+    Último bloque redis_per_db + cruce con sites_inventory.
+    Para el inspector de DBs de Redis.
+
+GET /admin/sites/{id}/account-by-domain?limit=10&sort=rss_mb
+    Último system.account_by_domain.by_folder[], ordenado por la métrica elegida.
+    Incluir web_server.handler_kind y per_domain_attribution para el badge de confianza.
+
+GET /admin/sites/{id}/cache-conflicts
+    Último environment.object_cache_dropin + environment.competing_plugins.
+    Para una vista consolidada de capas de caché.
+```
+
+#### Dashboard pages correspondientes
+
+- `/tenants` — listado de tenants con ring-widgets de cuotas y upsell badge.
+- `/tenants/:id` — detalle: tabla de sitios hermanos, gráfica bandwidth por dominio, historial de cuotas.
+- Integrar banner "Shared account" en la tabla de Sites cuando `tenant_id != null`.
+
+---
+
+### 13.3 Sistema de deduplicación de alertas
+
+Actualmente las alertas se guardan como array dentro del payload JSON pero no tienen
+persistencia propia ni deduplicación. Para notificaciones y resolución automática:
+
+#### Esquema de tabla
+
+```sql
+CREATE TABLE site_alerts (
+    id            BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    site_id       CHAR(36)     NOT NULL,
+    dedupe_key    VARCHAR(190) NOT NULL,             -- "code" o "code+folder" según catálogo
+    code          VARCHAR(100) NOT NULL,
+    severity      ENUM('info','warn','critical') NOT NULL,
+    msg           TEXT         NOT NULL,
+    first_seen_at DATETIME     NOT NULL,
+    last_seen_at  DATETIME     NOT NULL,
+    resolved_at   DATETIME     NULL,
+    consecutive_clear INT      NOT NULL DEFAULT 0,   -- incrementar por cada snapshot sin el código
+    UNIQUE KEY  uniq_site_dedupe (site_id, dedupe_key),
+    INDEX idx_site (site_id),
+    INDEX idx_severity (severity, resolved_at)
+);
+```
+
+#### Catálogo de códigos
+
+| code | severity | dedupe key | fix_hint |
+|------|----------|------------|----------|
+| redis_unreachable | critical | code | Check Redis service / host firewall |
+| redis_high_latency | warn | code | Reduce key payload size / network hops |
+| redis_low_hit_ratio | warn | code | Increase TTL / pre-warm cache |
+| redis_evictions | warn | code | Raise maxmemory or change policy |
+| redis_no_maxmemory | warn | code | Set maxmemory + policy |
+| redis_db_collision | critical | code+db | Pin each pigcache site to a unique DB |
+| redis_db_unset | warn | code+folder | Add PIGCACHE_REDIS_DATABASE constant |
+| redis_db0_shared_tenant | info | code | Move OUR sites off DB 0 |
+| pigcache_no_db_pin | info | code+folder | Define PIGCACHE_REDIS_DATABASE |
+| pigcache_dropin_hijacked | critical | code | Re-install PigCache object-cache drop-in |
+| mysql_connections_high | warn | code | Raise max_connections or fix leaks |
+| mysql_aborted_connects | warn | code | Check app DB credentials / network |
+| mysql_slow_queries | warn | code | Optimize indexes / queries |
+| circuit_open | critical | code | Check cloud reachability / API key |
+| stampede_locks_active | info | code | Cache warm-up in progress |
+| system_load_high | warn | code | Account for noisy neighbour / spike |
+| system_mem_low | warn | code | Free memory / scale up |
+| system_swap_in_use | warn | code | Trim memory hogs |
+| system_disk_low | warn | code | Free disk space |
+| account_quota_disk_used_pct | warn | code | Free files / upgrade plan |
+| account_quota_mysql_disk_used_pct | warn | code | Drop unused tables / upgrade plan |
+| account_quota_bandwidth_used_pct | warn | code | Enable CDN / optimize bandwidth |
+| domain_io_read_hot | info | code+folder | Profile that folder's PHP code |
+| lscache_conflict | warn | code | Disable LSCache OR PigCache page-cache |
+| lscache_stale | info | code | Purge stale cache or disable plugin |
+| competing_plugins | warn | code+plugin | Disable / uninstall the listed plugin |
+
+#### Lógica de resolución automática
+
+```php
+// En MonitorSnapshotController::store, después de crear el snapshot:
+$incomingCodes = array_column($data['alerts'], 'code');
+
+// Resolver alertas que ya no aparecen en este snapshot
+SiteAlert::where('site_id', $site->id)
+    ->whereNull('resolved_at')
+    ->whereNotIn('code', $incomingCodes)
+    ->each(function (SiteAlert $a) {
+        $a->increment('consecutive_clear');
+        if ($a->consecutive_clear >= 3) {   // 3 snapshots limpios = resuelto
+            $a->update(['resolved_at' => now()]);
+        }
+    });
+
+// Upsert alertas activas
+foreach ($data['alerts'] as $alert) {
+    SiteAlert::updateOrCreate(
+        ['site_id' => $site->id, 'dedupe_key' => buildDedupeKey($alert)],
+        [
+            'code' => $alert['code'], 'severity' => $alert['severity'],
+            'msg'  => $alert['msg'],  'last_seen_at' => now(),
+            'consecutive_clear' => 0,
+        ]
+    );
+}
+```
+
+#### Throttle de notificaciones
+
+- 1 email/Slack por (site_id, dedupe_key) cada 24h.
+- Para `severity=critical`: sin throttle en la primera ocurrencia.
+
+---
+
+### 13.4 Webhooks / push de alertas
+
+```
+POST /api/webhooks/alert-fired
+Payload: { site_id, tenant_id, code, severity, msg, first_seen_at }
+```
+
+Implementar como job en cola (`AlertWebhookJob`) disparado desde el upsert de `site_alerts`.
+Configuración por licencia: webhook URL + secret para firma HMAC-SHA256.
+
+---
+
+### 13.5 Recetas de diagnóstico ("one-click diagnose")
+
+Cuando un usuario abre un ticket con síntoma vago, el dashboard debería ofrecer
+un botón "Diagnosticar" que resalte los campos relevantes del snapshot.
+
+| Síntoma | Campos a inspeccionar |
+|---------|----------------------|
+| "site is slow" | system.load_1m, account_by_domain, redis.hit_ratio_pct, lscache.cache_active, mysql.threads_connected |
+| "error establishing database connection" | mysql.threads_connected_pct, mysql.aborted_connects, account.mysql_disk_used_pct, alerts mysql_* |
+| "redis not working / hit ratio low" | redis.hit_ratio_pct, redis.evicted_keys, object_cache_dropin.owner, competing_plugins.conflicts, sites_inventory.collisions, redis_per_db.by_db.0.shared_with_other_tenants_possible |
+| "hitting disk/bandwidth quota" | account.disk_used_pct, account.bandwidth_used_pct, account.bandwidth_by_domain, account_by_domain.io_*, vhost_logs.by_domain |
+| "another site on my account is the problem" | tenant.sibling_folders vs sibling_pigcache, account_by_domain, account.bandwidth_by_domain, sites_inventory.sites_other |
+| "page cache not serving" | lscache.cache_active, object_cache_dropin.owner, competing_plugins.conflicts |
+| "I installed PigCache but nothing changed" | sites_inventory.pigcache_active_hint, object_cache_dropin.owner, alert pigcache_dropin_hijacked, alert pigcache_no_db_pin |
+
+---
+
+### 13.6 Árbol completo del payload (wire format)
+
+```
+payload
+├── schema_version            int     siempre 1 (solo bump en cambio breaking)
+├── monitor_version           str     "1.0.0"
+├── captured_at               iso8601 UTC con Z al final
+├── site                              { site_url, site_id, table_prefix, wp_config_path }
+├── monitor                           { python_version, redis_driver, hostname, user }
+├── tenant                            fingerprint por cuenta cPanel (§13.1)
+│   ├── tenant_id                     "<hostname>::<cpanel_user>"
+│   ├── hostname / cpanel_user
+│   ├── shared_hosting        bool
+│   ├── wp_site_count / pigcache_site_count / non_wp_site_count
+│   ├── sibling_folders[]             ["jalisciense","jaloy",...]
+│   ├── sibling_pigcache[]            subset con PigCache instalado
+│   ├── sibling_non_wp_folders[]
+│   └── account_quotas                { disk_quota_gb, mysql_disk_quota_gb, bandwidth_quota_gb }
+├── redis                             snapshot — ping, hit ratio, mem, slowlog
+├── redis_per_db                      una fila por Redis DB encontrada
+│   ├── available             bool
+│   ├── by_db                         { "0": {keys, expires, no_ttl_pct,
+│   │                                          wp_sites_pointing_here[],
+│   │                                          shared_with_other_tenants_possible },
+│   │                                   "4": {...}, ... }
+│   └── total_keys_across_dbs
+├── circuit_breaker                   flag de fallo dropin → API
+├── mysql                             saturation, slow_queries, aborted_*
+├── breakdown                         memoria + key counts por grupo PigCache
+├── stampede                          active lock count
+├── system
+│   ├── (load, cpu_cores, mem_*, swap_*, disk, net_*, uptime_*)
+│   ├── account_limits                LVE/cgroup (normalmente unavailable en CageFS)
+│   ├── account                       snapshot UAPI ResourceUsage de cPanel
+│   │   ├── available
+│   │   ├── disk_used_gb / disk_quota_gb / disk_used_pct
+│   │   ├── mysql_disk_used_gb / mysql_disk_quota_gb / mysql_disk_used_pct
+│   │   ├── bandwidth_used_gb / bandwidth_quota_gb / bandwidth_used_pct
+│   │   ├── addon_domains / subdomains / email_accounts / ...
+│   │   ├── bandwidth_by_domain[]    { domain, bandwidth_bytes/mb/gb }
+│   │   ├── bandwidth_by_domain_period   "YYYY-MM-01..YYYY-MM-DD"
+│   │   └── bandwidth_by_domain_total_gb
+│   ├── sites_inventory
+│   │   ├── layout                    cpanel | plesk | directadmin | manual | plesk-vhosts
+│   │   ├── scan_root
+│   │   ├── site_count / wp_site_count / pigcache_site_count / non_wp_count
+│   │   ├── sites_wp[]               { folder, table_prefix, redis_db,
+│   │   │                              redis_db_explicit, pigcache_installed,
+│   │   │                              pigcache_active_hint, wp_content_size_mb }
+│   │   ├── sites_other[]            carpetas no-WP
+│   │   ├── collisions[]             sitios pigcache colisionando en mismo Redis DB
+│   │   └── risky_implicit_db[]      sitios pigcache sin DB pin
+│   ├── account_by_domain
+│   │   ├── available
+│   │   ├── by_folder[]              { folder, procs, rss_mb, cpu_seconds,
+│   │   │                              io_read_mb, io_write_mb, threads, states }
+│   │   └── (totals)
+│   ├── scope                         "account" | "server_wide"
+│   ├── services                      port → service map
+│   ├── processes                     PIDs propios desde /proc
+│   └── environment
+│       ├── web_server               { server, php_handler[], handler_kind,
+│       │                              per_domain_attribution }
+│       ├── lscache                  { available, cache_active, htaccess_cachelookup,
+│       │                              server_module_installed, shard_subdirs_denied,
+│       │                              recent_files_24h, newest_file_age_h, note? }
+│       ├── cagefs / imunify360 / wpcli / redis_rdb / awstats / access_logs
+│       ├── object_cache_dropin      { present, owner, plugin_name, mtime_iso }
+│       │                              owner ∈ { pigcache, redis-cache-till-kruss,
+│       │                                        w3-total-cache, memcached,
+│       │                                        redis-other, unknown }
+│       ├── competing_plugins        { found[], conflicts[], pigcache_installed,
+│       │                              object_cache_owner }
+│       └── vhost_logs               { layout, parsed, by_domain[] }
+└── alerts[]                         { severity, code, msg }
+```
+
+---
+
+### 13.7 Matriz de portabilidad
+
+El script tiene como target principal cPanel + CloudLinux + LiteSpeed, pero el core funciona en cualquier Linux + PHP + Redis/MySQL. Los bloques degradan gracefully en otros stacks.
+
+| Bloque | Disponibilidad |
+|--------|---------------|
+| `redis`, `redis_per_db`, `breakdown`, `stampede`, `mysql`, `circuit_breaker`, `system.{cpu, load, mem, swap, disk, net, uptime, services, processes}` | **Siempre** (cualquier Linux) |
+| `tenant.{tenant_id, hostname, cpanel_user}` | **Siempre** |
+| `system.account` (cuotas UAPI) | **Solo cPanel** (requiere binario `uapi`) |
+| `system.environment.vhost_logs.parsed=true` | **Solo cPanel** (convención de nombres de archivo) |
+| `system.environment.lscache` | **Solo LiteSpeed** (devuelve unavailable en otros) |
+| `system.account_limits` (LVE/cgroup) | **Solo CloudLinux** (unavailable bajo CageFS) |
+| `system.environment.cagefs`, `imunify360` | **Solo CloudLinux** |
+
+#### Atribución por dominio según PHP handler
+
+El campo `system.environment.web_server.per_domain_attribution` dice qué confianza tiene `account_by_domain.by_folder[]`:
+
+| Valor | Significado |
+|-------|-------------|
+| `reliable` | LSPHP — todas las filas son sitios reales |
+| `pool_name` | PHP-FPM — filas son pools, pueden agrupar varios dominios |
+| `cwd_only` | CGI — menor confianza, fallback por path |
+| `unavailable` | mod_php / Apache — suprimir la vista en el UI |
+
+#### Layout del inventory
+
+`system.sites_inventory.layout` es uno de: `cpanel`, `directadmin`, `plesk`, `plesk-vhosts`, `manual`. El UI nunca debe hardcodear `public_html` — usar siempre `sites_inventory.scan_root`.
+
+---
+
+### 13.8 Parsing defensivo (backward compat)
+
+Reglas para el API al parsear payloads:
+
+- Todo campo nuevo es **opcional en lectura**. Si `tenant` falta, tratar el reporte como el flujo legacy de sitio único.
+- `system.account.available == false` → el host no tiene `uapi` (no-cPanel / Plesk). No mostrar 0% — simplemente omitir los widgets de cuota.
+- `system.account_limits` (LVE) suele ser unavailable en CageFS. Preferir `system.account` (UAPI) cuando ambos estén presentes.
+- `system.account.bandwidth_quota_gb == null` es normal — la mayoría de planes compartidos venden "ancho de banda ilimitado". Mostrar solo `used_gb` en ese caso.
+- Las claves de `redis_per_db.by_db` son **strings** ("0","1","7"), no enteros — vienen de los nombres de sección `db0/db1/db7` del `INFO keyspace` de Redis.
+- `_lsphp_master` y `_unknown` en `account_by_domain.by_folder[]` son buckets especiales. Mostrarlos pero nunca atribuir su IO a un sitio real.
+- `bandwidth_by_domain` puede incluir la clave `UNKNOWN` (tráfico de mail u otros no-vhost). Mostrar como "sin categoría" — es normal.
+
+---
+
+### Historial — ya implementado
+
+| Fecha | Qué se implementó |
+|-------|-------------------|
+| 2026-05-23 | Ingest de `tenant`, `redis_per_db`, `monitor_version` en validación del API |
+| 2026-05-23 | Tipos TypeScript para todos los bloques nuevos (MonitorTenant, MonitorRedisPerDb, MonitorCpanelAccount, MonitorSitesInventory, MonitorAccountByDomain, MonitorObjectCacheDropin, MonitorVhostLogs) |
+| 2026-05-23 | Dashboard: tab Tenant, Redis per-DB, cPanel account quotas, sites inventory, account_by_domain, object_cache_dropin, vhost_logs, competing_plugins refinado |
+| 2026-05-23 | Dashboard: modal de historial con gráfica Recharts (filtros 1h/6h/1d/3d/7d, 7 métricas seleccionables, reference lines, circuit-breaker events) |
+| 2026-05-23 | API `monitorHistory`: acepta `from` (ISO) y `limit` (hasta 2016), devuelve snapshots en orden ascendente sin payload completo |

@@ -93,7 +93,11 @@ class PigCache_WPDB extends wpdb {
 
 			if ( $this->pigcache_valid_pack( $pack ) && $this->pigcache_is_fresh( $pack, $query ) ) {
 				$this->pigcache_hydrate_select( $query, $pack );
-
+				// ── PRO_START ─────────────────────────────────────────────────────────────────
+				if ( class_exists( 'PigCache_Stats', false ) ) {
+					PigCache_Stats::db_hit();
+				}
+				// ── PRO_END ───────────────────────────────────────────────────────────────────
 				return $pack['return_val'];
 			}
 		}
@@ -108,6 +112,11 @@ class PigCache_WPDB extends wpdb {
 			$this->pigcache_bypass = true;
 			$this->pigcache_store_select( $this->pigcache_cache_key( $this->last_query ), $out, $this->last_query, $exec_ms );
 			$this->pigcache_bypass = false;
+			// ── PRO_START ─────────────────────────────────────────────────────────────────
+			if ( class_exists( 'PigCache_Stats', false ) ) {
+				PigCache_Stats::db_miss( 'not_found' );
+			}
+			// ── PRO_END ───────────────────────────────────────────────────────────────────
 		}
 
 		// ── PRO_START ─────────────────────────────────────────────────────────────────

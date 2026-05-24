@@ -1,0 +1,95 @@
+version: '3.8'
+
+# Isolated WordPress + MySQL + Redis stack for PigCache E2E tests.
+# The plugin is mounted read-only so tests always run against the working tree.
+#
+# Usage:
+#   cd PigCache/tests/docker
+#   bash setup.sh          # first-time init (installs WP + plugin + debug constants)
+#   docker compose up -d   # start services on subsequent runs
+#   docker compose down -v # teardown + wipe volumes
+
+services:
+  db:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: wordpress
+      MYSQL_USER: wp
+      MYSQL_PASSWORD: wp
+    volumes:
+      - db_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --save "" --appendonly no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  wordpress:
+    build: .
+    image: pigcache-test-wordpress:latest
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8088:80"
+    environment:
+      WORDPRESS_DB_HOST: db
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DB_USER: wp
+      WORDPRESS_DB_PASSWORD: wp
+      WORDPRESS_DEBUG: "1"
+      # Injected verbatim into wp-config.php by the official WordPress Docker image.
+      WORDPRESS_CONFIG_EXTRA: |
+        define('WP_CACHE', true);
+        define('PIGCACHE_REDIS_HOST', 'redis');
+        define('PIGCACHE_REDIS_PORT', 6379);
+        define('PIGCACHE_TESTING', true);
+        define('PIGCACHE_HTML_TTL', 30);
+        define('PIGCACHE_ADAPTIVE_TTL_ENABLED', false);
+        define('PIGCACHE_CRON_VERBOSE', true);
+        define('PIGCACHE_ALLOWED_HOSTS', ['localhost:8088']);
+    volumes:
+      # Shared volume for the entire WordPress root (populated by the WP entrypoint).
+      - wp_html:/var/www/html
+      # Plugin bind-mount overlays on top of the named volume for this path.
+      - ../../:/var/www/html/wp-content/plugins/pigcache:ro
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost/wp-login.php"]
+      interval: 10s
+      timeout: 10s
+      retries: 18
+
+  # WP-CLI sidecar — used only by setup.sh, not kept running.
+  wpcli:
+    image: wordpress:cli-php8.2
+    depends_on:
+      wordpress:
+        condition: service_healthy
+    environment:
+      WORDPRESS_DB_HOST: db
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DB_USER: wp
+      WORDPRESS_DB_PASSWORD: wp
+    volumes:
+      - wp_html:/var/www/html
+      - ../../:/var/www/html/wp-content/plugins/pigcache:ro
+    profiles:
+      - setup
+    user: www-data
+    entrypoint: ["wp", "--path=/var/www/html", "--allow-root"]
+
+volumes:
+  db_data:
+  wp_html:

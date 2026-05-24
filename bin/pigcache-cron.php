@@ -151,13 +151,16 @@ $run_cloud            = true;
 $run_mutation_harvest = true;
 $run_traffic_harvest  = true;
 $run_html_tier_report = true;
+$run_stats_flush      = true;
+$run_html_samples     = true;
 
 foreach ( $argv ?? array() as $arg ) {
-	if ( $arg === '--flush-only'  ) { $run_send = false; $run_cloud = false; $run_mutation_harvest = false; $run_traffic_harvest = false; $run_html_tier_report = false; }
-	if ( $arg === '--send-only'   ) { $run_flush = false; $run_cloud = false; $run_mutation_harvest = false; $run_traffic_harvest = false; $run_html_tier_report = false; }
+	if ( $arg === '--flush-only'  ) { $run_send = false; $run_cloud = false; $run_mutation_harvest = false; $run_traffic_harvest = false; $run_html_tier_report = false; $run_stats_flush = false; $run_html_samples = false; }
+	if ( $arg === '--send-only'   ) { $run_flush = false; $run_cloud = false; $run_mutation_harvest = false; $run_traffic_harvest = false; $run_html_tier_report = false; $run_stats_flush = false; $run_html_samples = false; }
 	if ( $arg === '--no-cloud'    ) { $run_cloud = false; }
-	if ( $arg === '--cloud-only'  ) { $run_flush = false; $run_send = false; $run_mutation_harvest = false; $run_traffic_harvest = false; $run_html_tier_report = false; }
+	if ( $arg === '--cloud-only'  ) { $run_flush = false; $run_send = false; $run_mutation_harvest = false; $run_traffic_harvest = false; $run_html_tier_report = false; $run_stats_flush = false; $run_html_samples = false; }
 	if ( $arg === '--no-adaptive' ) { $run_mutation_harvest = false; $run_traffic_harvest = false; $run_html_tier_report = false; }
+	if ( $arg === '--no-stats'    ) { $run_stats_flush = false; $run_html_samples = false; }
 }
 // ── PRO_END ───────────────────────────────────────────────────────────────────
 
@@ -432,6 +435,38 @@ if ( $run_html_tier_report && $api_key && $site_id ) {
 	} else {
 		_pigcache_cron_log( 'html tier report — no tier log yet' );
 	}
+}
+
+// ── TASK 7: Flush cache hit/miss stats + write-pattern data → API ─────────────
+
+if ( $run_stats_flush && $api_key && $site_id ) {
+	$stats_payload = _pigcache_cron_read_stats( $cfg );
+
+	if ( ! empty( $stats_payload ) ) {
+		$result = _pigcache_cron_api_request( 'POST', $api_url . '/cache-metrics', $api_key, $site_id, $stats_payload );
+		_pigcache_cron_log( 'stats flush done — window=' . ( $stats_payload['window_ts'] ?? 'n/a' ) . ' html_hit=' . ( $stats_payload['html_hit'] ?? 0 ) );
+	} else {
+		_pigcache_cron_log( 'stats flush — no data for previous window' );
+	}
+} elseif ( $run_stats_flush ) {
+	_pigcache_cron_log( 'stats flush skipped — no API key or site ID' );
+}
+
+// ── TASK 8: Forward HTML bypass + partial-render samples → API ────────────────
+
+if ( $run_html_samples && $api_key && $site_id ) {
+	$samples = _pigcache_cron_read_html_samples( $cfg );
+
+	if ( ! empty( $samples ) ) {
+		_pigcache_cron_api_request( 'POST', $api_url . '/html-samples', $api_key, $site_id, array(
+			'samples' => $samples,
+		) );
+		_pigcache_cron_log( 'html samples: ' . count( $samples ) . ' sent' );
+	} else {
+		_pigcache_cron_log( 'html samples: none pending' );
+	}
+} elseif ( $run_html_samples ) {
+	_pigcache_cron_log( 'html samples skipped — no API key or site ID' );
 }
 
 // ── PRO_END ───────────────────────────────────────────────────────────────────
@@ -972,6 +1007,41 @@ function _pigcache_cron_build_stability_map( mysqli $db, string $stability_table
 }
 
 /**
+ * Read HTML bypass and partial-render samples from Redis lists and clear them.
+ * Returns an array of sample objects ready to POST to the API.
+ *
+ * @return array[]
+ */
+function _pigcache_cron_read_html_samples( array $cfg ): array {
+	$redis = _pigcache_cron_redis_connect( $cfg );
+	if ( ! $redis ) {
+		return array();
+	}
+
+	$samples = array();
+
+	foreach ( array( 'pigcache_bypass_samples', 'pigcache_partial_samples' ) as $key ) {
+		try {
+			$raw = $redis->lRange( $key, 0, -1 );
+			if ( ! empty( $raw ) ) {
+				foreach ( $raw as $json ) {
+					$entry = json_decode( (string) $json, true );
+					if ( is_array( $entry ) ) {
+						$samples[] = $entry;
+					}
+				}
+				$redis->del( $key );
+			}
+		} catch ( \Exception $e ) {
+			// Non-critical — continue with other key.
+		}
+	}
+
+	$redis->close();
+	return $samples;
+}
+
+/**
  * Build the traffic map: url → total hits over last 30 days (top 1000).
  *
  * @return array<string,int>
@@ -1198,5 +1268,80 @@ function _pigcache_cron_download_profile( string $api_url, string $api_key, stri
 		. 'return ' . var_export( $data, true ) . ";\n";
 
 	return file_put_contents( $profile_path, $content, LOCK_EX ) !== false;
+}
+
+/**
+ * Read the previous 15-min window's cache stats from Redis and delete the key.
+ *
+ * Returns a structured payload ready to POST to /api/v1/cache-metrics, or an
+ * empty array if Redis is unavailable or the window had no data.
+ *
+ * @param array $cfg  Parsed wp-config constants (PIGCACHE_REDIS_HOST, etc.).
+ * @return array
+ */
+function _pigcache_cron_read_stats( array $cfg ): array {
+	$redis = _pigcache_cron_redis_connect( $cfg );
+	if ( ! $redis ) {
+		return array();
+	}
+
+	$prev_window = ( (int) floor( time() / 900 ) - 1 ) * 900;
+	$key         = 'pigcache_stats:' . $prev_window;
+
+	try {
+		$raw = $redis->hGetAll( $key );
+		if ( empty( $raw ) ) {
+			$redis->close();
+			return array();
+		}
+		$redis->del( $key );
+		$redis->close();
+	} catch ( \Exception $e ) {
+		return array();
+	}
+
+	// Cast all values to int.
+	$data = array();
+	foreach ( $raw as $field => $value ) {
+		$data[ $field ] = (int) $value;
+	}
+
+	// ── Build structured payload ─────────────────────────────────────────────
+	$get  = static function ( string $k ) use ( $data ): int { return $data[ $k ] ?? 0; };
+	$pfx  = static function ( string $prefix ) use ( $data ): array {
+		$out = array();
+		foreach ( $data as $k => $v ) {
+			if ( strncmp( $k, $prefix, strlen( $prefix ) ) === 0 ) {
+				$out[ substr( $k, strlen( $prefix ) ) ] = $v;
+			}
+		}
+		return $out;
+	};
+
+	// Build 24-bucket hour distribution from write_h{0..23}.
+	$write_hours = array();
+	for ( $h = 0; $h < 24; $h++ ) {
+		$count = $get( 'write_h' . $h );
+		if ( $count > 0 ) {
+			$write_hours[ $h ] = $count;
+		}
+	}
+
+	return array(
+		'window_ts'         => gmdate( 'Y-m-d H:i:s', $prev_window ),
+		'html_hit'          => $get( 'html_hit' ),
+		'html_hit_early'    => $get( 'html_hit_early' ),
+		'html_hit_late'     => $get( 'html_hit_late' ),
+		'html_bypass'       => $get( 'html_bypass' ),
+		'html_miss'         => $get( 'html_miss' ),
+		'html_write'        => $get( 'html_write' ),
+		'db_hit'            => $get( 'db_hit' ),
+		'db_miss'           => $get( 'db_miss' ),
+		'write_pub'         => $get( 'write_pub' ),
+		'bypass_breakdown'  => $pfx( 'html_bypass_' ),
+		'miss_breakdown'    => $pfx( 'html_miss_' ),
+		'write_pub_types'   => $pfx( 'write_pub_type_' ),
+		'write_hours'       => $write_hours,
+	);
 }
 // ── PRO_END ───────────────────────────────────────────────────────────────────

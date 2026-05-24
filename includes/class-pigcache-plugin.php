@@ -43,6 +43,12 @@ class PigCache_Plugin {
 		PigCache_Invalidation::init();
 
 		// ── PRO_START ─────────────────────────────────────────────────────────────────
+		if ( class_exists( 'PigCache_Stats', false ) ) {
+			PigCache_Stats::init();
+		}
+		// ── PRO_END ───────────────────────────────────────────────────────────────────
+
+		// ── PRO_START ─────────────────────────────────────────────────────────────────
 		if ( class_exists( 'PigCache_Continuous_Learner', false ) ) {
 			PigCache_Continuous_Learner::init();
 			if ( PigCache_Continuous_Learner::using_wp_cron_fallback() ) {

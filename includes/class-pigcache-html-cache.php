@@ -69,6 +69,12 @@ class PigCache_Html_Cache {
 	/** True while our ob_start() buffer is open and not yet flushed. */
 	private static bool $buffering = false;
 
+	/**
+	 * Reason set by should_cache_request() when it returns false.
+	 * Used by maybe_start_buffer() to record a meaningful bypass event.
+	 */
+	private static string $bypass_reason = '';
+
 	/** Bootstrap hooks. */
 	public static function init() {
 		add_action( 'template_redirect', array( __CLASS__, 'maybe_start_buffer' ), 0 );
@@ -103,8 +109,13 @@ class PigCache_Html_Cache {
 			return;
 		}
 
+		// Strip only HTTP-dangerous control characters (null bytes, CRLF, etc.) but
+		// preserve valid non-ASCII bytes (e.g. raw UTF-8 emoji that some reverse
+		// proxies / Cloudflare pass through decoded). FILTER_SANITIZE_URL would
+		// strip bytes > 0x7F, producing a different string than the late path's
+		// sanitize_text_field(), causing a cache-key mismatch for non-ASCII URIs.
 		$uri_raw = isset( $_SERVER['REQUEST_URI'] )
-			? (string) filter_var( stripslashes( $_SERVER['REQUEST_URI'] ), FILTER_SANITIZE_URL )
+			? (string) preg_replace( '/[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]/', '', stripslashes( $_SERVER['REQUEST_URI'] ) )
 			: '/';
 
 		// Never serve admin / login from cache.
@@ -138,10 +149,21 @@ class PigCache_Html_Cache {
 	 */
 	public static function maybe_start_buffer() {
 		if ( ! self::should_cache_request() ) {
+			// ── PRO_START ─────────────────────────────────────────────────────────────────
+			if ( class_exists( 'PigCache_Stats', false ) ) {
+				PigCache_Stats::html_bypass( self::$bypass_reason );
+				PigCache_Stats::sample_bypass( self::$bypass_reason, self::request_uri(), array_keys( (array) $_COOKIE ) );
+			}
+			// ── PRO_END ───────────────────────────────────────────────────────────────────
 			return;
 		}
 
 		if ( ! wp_using_ext_object_cache() ) {
+			// ── PRO_START ─────────────────────────────────────────────────────────────────
+			if ( class_exists( 'PigCache_Stats', false ) ) {
+				PigCache_Stats::html_bypass( 'no_redis' );
+			}
+			// ── PRO_END ───────────────────────────────────────────────────────────────────
 			return;
 		}
 
@@ -211,6 +233,11 @@ class PigCache_Html_Cache {
 		self::$buffering = false;
 
 		if ( '' === $html ) {
+			// ── PRO_START ─────────────────────────────────────────────────────────────────
+			if ( class_exists( 'PigCache_Stats', false ) ) {
+				PigCache_Stats::html_miss( 'empty' );
+			}
+			// ── PRO_END ───────────────────────────────────────────────────────────────────
 			self::release_lock();
 			return $html;
 		}
@@ -218,12 +245,37 @@ class PigCache_Html_Cache {
 		// Refuse to cache pages where a fatal error tripped mid-render. Caching
 		// half-rendered HTML would otherwise pin a broken page until the TTL
 		// expires.
+		//
+		// Guard against partial renders caused by plugins calling exit() mid-render
+		// (maintenance mode, auth redirects, etc.). A complete HTML document must
+		// end with </html>. Only applied to HTML responses; RSS/XML/JSON do not
+		// end with </html> and are excluded by the leading-tag check.
+		$html_start = ltrim( $html );
+		if ( 0 === stripos( $html_start, '<!doctype' ) || 0 === stripos( $html_start, '<html' ) ) {
+			$tail = strtolower( substr( $html, -512 ) );
+			if ( false === strpos( $tail, '</html>' ) ) {
+				// ── PRO_START ─────────────────────────────────────────────────────────────────
+				if ( class_exists( 'PigCache_Stats', false ) ) {
+					PigCache_Stats::html_miss( 'partial' );
+					PigCache_Stats::sample_partial( self::request_uri(), substr( $html, -300 ) );
+				}
+				// ── PRO_END ───────────────────────────────────────────────────────────────────
+				self::release_lock();
+				return $html;
+			}
+		}
+
 		$last = error_get_last();
 		if ( is_array( $last ) && in_array(
 			(int) $last['type'],
 			array( E_ERROR, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR, E_RECOVERABLE_ERROR ),
 			true
 		) ) {
+			// ── PRO_START ─────────────────────────────────────────────────────────────────
+			if ( class_exists( 'PigCache_Stats', false ) ) {
+				PigCache_Stats::html_miss( 'php_error' );
+			}
+			// ── PRO_END ───────────────────────────────────────────────────────────────────
 			self::release_lock();
 			return $html;
 		}
@@ -234,6 +286,11 @@ class PigCache_Html_Cache {
 			$status = 200;
 		}
 		if ( $status >= 500 ) {
+			// ── PRO_START ─────────────────────────────────────────────────────────────────
+			if ( class_exists( 'PigCache_Stats', false ) ) {
+				PigCache_Stats::html_miss( '5xx' );
+			}
+			// ── PRO_END ───────────────────────────────────────────────────────────────────
 			self::release_lock();
 			return $html;
 		}
@@ -262,6 +319,9 @@ class PigCache_Html_Cache {
 			if ( 0 === $adaptive ) {
 				// ❄️ Cold — skip caching entirely.
 				self::log_tier_decision( self::request_uri(), 0, $tags );
+				if ( class_exists( 'PigCache_Stats', false ) ) {
+					PigCache_Stats::html_miss( 'cold' );
+				}
 				self::release_lock();
 				return $html;
 			}
@@ -313,6 +373,10 @@ class PigCache_Html_Cache {
 		wp_cache_set( $key, $pack, self::GROUP_HTML, $ttl );
 
 		// ── PRO_START ─────────────────────────────────────────────────────────────────
+		if ( class_exists( 'PigCache_Stats', false ) ) {
+			PigCache_Stats::html_write();
+		}
+
 		$tag_inv = class_exists( 'PigCache_Tag_Index', false );
 
 		if ( $tag_inv && ! empty( $tags ) ) {
@@ -628,6 +692,11 @@ class PigCache_Html_Cache {
 	 * @param string $hit_kind "EARLY" | "LATE" | "LATE-RETRY".
 	 */
 	private static function serve_pack( array $pack, string $hit_kind = 'HIT' ): void {
+		// ── PRO_START ─────────────────────────────────────────────────────────────────
+		if ( class_exists( 'PigCache_Stats', false ) ) {
+			PigCache_Stats::html_hit( $hit_kind );
+		}
+		// ── PRO_END ───────────────────────────────────────────────────────────────────
 		$resp = self::build_response( $pack, $hit_kind );
 
 		if ( ! headers_sent() ) {
@@ -655,38 +724,47 @@ class PigCache_Html_Cache {
 	 */
 	public static function should_cache_request() {
 		if ( is_user_logged_in() ) {
+			self::$bypass_reason = 'logged_in';
 			return false;
 		}
 
 		if ( is_admin() || wp_doing_ajax() || wp_doing_cron() || ( defined( 'REST_REQUEST' ) && REST_REQUEST ) ) {
+			self::$bypass_reason = 'admin';
 			return false;
 		}
 
 		if ( isset( $_POST ) && ! empty( $_POST ) ) { // phpcs:ignore WordPress.Security.NonceVerification.Missing
+			self::$bypass_reason = 'post_data';
 			return false;
 		}
 
 		if ( is_preview() ) {
+			self::$bypass_reason = 'preview';
 			return false;
 		}
 
 		if ( self::has_personalisation_cookie_late() ) {
+			self::$bypass_reason = 'cookie';
 			return false;
 		}
 
 		if ( self::is_woocommerce_sensitive() ) {
+			self::$bypass_reason = 'woocommerce';
 			return false;
 		}
 
 		if ( apply_filters( 'pigcache_skip_html_cache', false ) ) {
+			self::$bypass_reason = 'filter';
 			return false;
 		}
 
 		if ( ! isset( $_SERVER['REQUEST_METHOD'] )
 			|| 'GET' !== strtoupper( sanitize_text_field( wp_unslash( $_SERVER['REQUEST_METHOD'] ) ) ) ) {
+			self::$bypass_reason = 'method';
 			return false;
 		}
 
+		self::$bypass_reason = '';
 		return true;
 	}
 
