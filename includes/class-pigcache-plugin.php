@@ -42,6 +42,10 @@ class PigCache_Plugin {
 		PigCache_Html_Cache::init();
 		PigCache_Invalidation::init();
 
+		if ( class_exists( 'PigCache_Url_Firewall', false ) ) {
+			PigCache_Url_Firewall::init();
+		}
+
 		// ── PRO_START ─────────────────────────────────────────────────────────────────
 		if ( class_exists( 'PigCache_Stats', false ) ) {
 			PigCache_Stats::init();
