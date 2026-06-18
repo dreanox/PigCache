@@ -88,6 +88,17 @@ class PigCache_Html_Cache {
 	 * us. Serves a cached response and exits, or returns if no cache hit.
 	 */
 	public static function serve_early() {
+		// URL firewall: corta URLs inexistentes (404 instantáneo) antes de
+		// cualquier otro trabajo, sin bootear WordPress. Self-contained: usa su
+		// propia conexión Redis y $_SERVER. No-op si está desactivado.
+		if ( ! class_exists( 'PigCache_Url_Firewall', false )
+			&& is_readable( __DIR__ . '/class-pigcache-url-firewall.php' ) ) {
+			require_once __DIR__ . '/class-pigcache-url-firewall.php';
+		}
+		if ( class_exists( 'PigCache_Url_Firewall', false ) ) {
+			PigCache_Url_Firewall::maybe_block_early();
+		}
+
 		// Object cache must be loaded (advanced-cache.php loads it for us).
 		if ( ! function_exists( 'wp_cache_get' ) ) {
 			return;
