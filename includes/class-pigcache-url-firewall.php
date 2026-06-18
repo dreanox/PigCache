@@ -435,6 +435,17 @@ class PigCache_Url_Firewall {
 				$p = substr( $p, 0, $i );
 			}
 		}
+		// Decodificar %XX para comparar de forma consistente: REQUEST_URI llega
+		// percent-encoded (p. ej. emoji o acentos: %F0%9F…), mientras que
+		// get_permalink entrega el path como UTF-8 crudo. Sin esto, los slugs no
+		// ASCII generarían un md5 distinto en cada lado → 404 a contenido real.
+		// Quitamos primero bytes de control que rawurldecode pudiera introducir
+		// (p. ej. %00, %0A) para no envenenar el path.
+		$dec = rawurldecode( $p );
+		$dec = preg_replace( '/[\x00-\x1F\x7F]/', '', $dec );
+		if ( null !== $dec && '' !== $dec ) {
+			$p = $dec;
+		}
 		if ( '' === $p ) {
 			$p = '/';
 		}
