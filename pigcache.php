@@ -37,6 +37,7 @@ require_once PIGCACHE_DIR . 'includes/class-pigcache-config.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-kv.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-sql-cache.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-html-cache.php';
+require_once PIGCACHE_DIR . 'includes/class-pigcache-url-firewall.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-invalidation.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-fragments.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-dropin-db.php';
