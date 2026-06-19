@@ -35,6 +35,14 @@ class PigCache_Url_Firewall {
 	const RECENT_MAX = 5000;
 	const INSTR_TTL  = 86400; // 1 día de instrumentación.
 
+	// Guarda anti-rebuild-parcial: no reemplazar un set vigente "sano" por uno
+	// drásticamente más chico (un rebuild a medias por carga/timeout dejaría el
+	// firewall bloqueando casi todo). Solo aplica si el set vigente ya tenía al
+	// menos REBUILD_GUARD_MIN miembros; por debajo, se permite encoger (sitios
+	// nuevos/chicos). Se puede forzar con `wp pigcache-fw rebuild --force`.
+	const REBUILD_MIN_RATIO = 0.80;
+	const REBUILD_GUARD_MIN = 100;
+
 	// ── Configuración ───────────────────────────────────────────────────────
 
 	public static function enabled(): bool {
@@ -255,7 +263,7 @@ class PigCache_Url_Firewall {
 	 * @param callable|null $progress  Recibe mensajes de progreso (CLI).
 	 * @return array{added:int,host:string}|null  null si Redis no responde.
 	 */
-	public static function rebuild( $progress = null ) {
+	public static function rebuild( $progress = null, $force = false ) {
 		$redis = self::connect();
 		if ( ! $redis ) {
 			return null;
@@ -354,21 +362,38 @@ class PigCache_Url_Firewall {
 
 		$flush();
 
+		// Tamaño del set vigente, para decidir si el nuevo es de fiar.
+		$current = 0;
+		try {
+			$current = (int) $redis->sCard( $set );
+		} catch ( \Throwable $e ) {
+		}
+
 		// Swap atómico: renombra tmp → set, marca ready.
 		try {
-			if ( $added > 0 ) {
-				$redis->rename( $tmp, $set );
-			} else {
+			if ( $added <= 0 ) {
 				// Sin URLs: deja el set como esté y no marques ready (evita 404 masivo).
 				$redis->del( $tmp );
-				return array( 'added' => 0, 'host' => $host );
+				return array( 'added' => 0, 'kept' => $current, 'host' => $host, 'skipped' => true );
 			}
+
+			// Guarda anti-rebuild-parcial: si ya había un set sano y el nuevo cae
+			// por debajo del REBUILD_MIN_RATIO del vigente, NO reemplazar (salvo
+			// $force). Un rebuild a medias por carga/timeout no debe tumbar el
+			// firewall (ej.: 1396 nuevas vs 49396 vigentes → bloqueado).
+			$floor = (int) floor( $current * self::REBUILD_MIN_RATIO );
+			if ( ! $force && $current >= self::REBUILD_GUARD_MIN && $added < $floor ) {
+				$redis->del( $tmp );
+				return array( 'added' => $added, 'kept' => $current, 'host' => $host, 'skipped' => true );
+			}
+
+			$redis->rename( $tmp, $set );
 			$redis->set( self::ready_key( $host ), (string) time() );
 		} catch ( \Throwable $e ) {
 			return array( 'added' => $added, 'host' => $host );
 		}
 
-		return array( 'added' => $added, 'host' => $host );
+		return array( 'added' => $added, 'kept' => $current, 'host' => $host );
 	}
 
 	/**
@@ -668,23 +693,38 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 		/**
 		 * Reconstruye el set de URLs válidas desde posts/páginas/términos.
 		 *
-		 * ## EXAMPLES
-		 *     wp pigcache-fw rebuild
-		 */
-		public function rebuild( $args, $assoc ) {
-			\WP_CLI::log( 'Reconstruyendo set de URLs…' );
-			$res = PigCache_Url_Firewall::rebuild( static function ( $msg ) {
-				\WP_CLI::log( '  ' . $msg );
-			} );
-			if ( null === $res ) {
-				\WP_CLI::error( 'Redis no responde. Revisa PIGCACHE_REDIS_* y que redis esté arriba.' );
-			}
-			if ( 0 === $res['added'] ) {
-				\WP_CLI::warning( 'No se agregaron URLs (¿sitio vacío?). El set NO quedó "ready" para evitar 404 masivos.' );
+	 * ## OPTIONS
+	 * [--force]
+	 * : Reemplaza el set aunque el nuevo sea mucho más chico que el vigente
+	 *   (anula la guarda anti-rebuild-parcial). Úsalo solo si borraste contenido
+	 *   a propósito.
+	 *
+	 * ## EXAMPLES
+	 *     wp pigcache-fw rebuild
+	 *     wp pigcache-fw rebuild --force
+	 */
+	public function rebuild( $args, $assoc ) {
+		$force = isset( $assoc['force'] );
+		\WP_CLI::log( 'Reconstruyendo set de URLs…' );
+		$res = PigCache_Url_Firewall::rebuild( static function ( $msg ) {
+			\WP_CLI::log( '  ' . $msg );
+		}, $force );
+		if ( null === $res ) {
+			\WP_CLI::error( 'Redis no responde. Revisa PIGCACHE_REDIS_* y que redis esté arriba.' );
+		}
+		if ( ! empty( $res['skipped'] ) ) {
+			if ( 0 === (int) $res['added'] ) {
+				\WP_CLI::warning( 'No se agregaron URLs (¿sitio vacío?). El set vigente se conservó (NO se reemplazó) para evitar 404 masivos.' );
 				return;
 			}
-			\WP_CLI::success( sprintf( 'Set listo para %s con %d URLs.', $res['host'], $res['added'] ) );
+			\WP_CLI::warning( sprintf(
+				'Rebuild SOSPECHOSAMENTE chico: %d URLs nuevas vs %d vigentes. NO se reemplazó el set para evitar 404 masivos. Si es intencional, corre con --force.',
+				(int) $res['added'], (int) $res['kept']
+			) );
+			return;
 		}
+		\WP_CLI::success( sprintf( 'Set listo para %s con %d URLs.', $res['host'], $res['added'] ) );
+	}
 
 		/**
 		 * Muestra el estado del firewall.
