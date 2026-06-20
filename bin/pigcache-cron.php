@@ -101,6 +101,9 @@ $stats_table   = $table_prefix . 'pigcache_query_stats';
 $options_table = $table_prefix . 'options';
 $kv_table      = $table_prefix . 'pigcache_kv';
 $kv_ready      = _pigcache_cron_table_exists( $db, $kv_table );
+// ── PRO_START ─────────────────────────────────────────────────────────────────
+$stats_ready   = _pigcache_cron_table_exists( $db, $stats_table );
+// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 // ── PRO_START ─────────────────────────────────────────────────────────────────
 // ── Resolve API credentials (reused by tasks + error sink) ───────────────────
@@ -169,7 +172,7 @@ foreach ( $argv ?? array() as $arg ) {
 if ( $run_flush ) {
 	$rows = _pigcache_cron_read_buffer( $cfg );
 
-	if ( ! empty( $rows ) ) {
+	if ( ! empty( $rows ) && $stats_ready ) {
 		$window       = (int) floor( time() / 900 ) * 900;
 		$period_start = gmdate( 'Y-m-d H:i:s', $window );
 		_pigcache_cron_upsert_batch( $db, $stats_table, $rows, $period_start );
@@ -186,7 +189,7 @@ if ( $run_flush ) {
 // ── PRO_START ─────────────────────────────────────────────────────────────────
 // ── TASK 2: Send unsent rows → API ───────────────────────────────────────────
 
-if ( $run_send ) {
+if ( $run_send && $stats_ready ) {
 	$unsent = _pigcache_cron_get_unsent( $db, $stats_table, 200 );
 
 	if ( ! empty( $unsent ) ) {
