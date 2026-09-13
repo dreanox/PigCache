@@ -39,32 +39,55 @@ if ( ! function_exists( 'wp_cache_get' )
 	}
 }
 
-// plugin_dir_path() is unavailable here. WP_CONTENT_DIR is the only viable base.
-// We try fixed paths first (standard + mu-plugins install), then fall back to glob()
-// so custom plugin directory layouts are also supported.
+/*
+ * Resolving the plugin directory from a drop-in.
+ *
+ * plugin_dir_path() and plugins_url() do not exist yet: wp-settings.php includes
+ * advanced-cache.php long before the plugin API is loaded. WP_PLUGIN_DIR and
+ * WPMU_PLUGIN_DIR are also still undefined here, because core only defines them
+ * later in wp_plugin_directory_constants(). So we use those constants when they
+ * happen to be available (custom layouts, sunrise.php, mu-plugin bootstraps) and
+ * only fall back to the core default under WP_CONTENT_DIR when they are not.
+ * A glob() pass covers installs where the plugin folder was renamed.
+ */
 $_pigcache_html_class = null;
-$_pigcache_candidates = array(
-	WP_CONTENT_DIR . '/plugins/pigcache/includes/class-pigcache-html-cache.php',
-	WP_CONTENT_DIR . '/mu-plugins/pigcache/includes/class-pigcache-html-cache.php',
-);
-foreach ( $_pigcache_candidates as $_pigcache_path ) {
+$_pigcache_roots      = array();
+
+if ( defined( 'WP_PLUGIN_DIR' ) ) {
+	$_pigcache_roots[] = WP_PLUGIN_DIR;
+} elseif ( defined( 'WP_CONTENT_DIR' ) ) {
+	$_pigcache_roots[] = WP_CONTENT_DIR . '/plugins';
+}
+
+if ( defined( 'WPMU_PLUGIN_DIR' ) ) {
+	$_pigcache_roots[] = WPMU_PLUGIN_DIR;
+} elseif ( defined( 'WP_CONTENT_DIR' ) ) {
+	$_pigcache_roots[] = WP_CONTENT_DIR . '/mu-plugins';
+}
+
+foreach ( $_pigcache_roots as $_pigcache_root ) {
+	$_pigcache_path = $_pigcache_root . '/pigcache/includes/class-pigcache-html-cache.php';
 	if ( is_readable( $_pigcache_path ) ) {
 		$_pigcache_html_class = $_pigcache_path;
 		break;
 	}
 }
+
 if ( null === $_pigcache_html_class && function_exists( 'glob' ) ) {
-	$_pigcache_matches = glob( WP_CONTENT_DIR . '/plugins/*/includes/class-pigcache-html-cache.php' );
-	if ( is_array( $_pigcache_matches ) ) {
+	foreach ( $_pigcache_roots as $_pigcache_root ) {
+		$_pigcache_matches = glob( $_pigcache_root . '/*/includes/class-pigcache-html-cache.php' );
+		if ( ! is_array( $_pigcache_matches ) ) {
+			continue;
+		}
 		foreach ( $_pigcache_matches as $_pigcache_path ) {
 			if ( is_readable( $_pigcache_path ) ) {
 				$_pigcache_html_class = $_pigcache_path;
-				break;
+				break 2;
 			}
 		}
 	}
 }
-unset( $_pigcache_candidates, $_pigcache_path, $_pigcache_matches );
+unset( $_pigcache_roots, $_pigcache_root, $_pigcache_path, $_pigcache_matches );
 
 if ( null !== $_pigcache_html_class ) {
 	require_once $_pigcache_html_class;

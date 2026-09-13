@@ -212,13 +212,7 @@ class PigCache_Html_Cache {
 			return;
 		}
 
-		// ── PRO_START ─────────────────────────────────────────────────────────────────
-		$tag_inv = class_exists( 'PigCache_Tag_Index', false );
-
-		if ( $tag_inv && class_exists( 'PigCache_Tag_Collector', false ) ) {
-			PigCache_Tag_Collector::start();
-		}
-		// ── PRO_END ───────────────────────────────────────────────────────────────────
+		PigCache_Tag_Collector::start();
 
 		ob_start( array( __CLASS__, 'ob_callback' ) );
 		self::$buffering = true;
@@ -307,11 +301,9 @@ class PigCache_Html_Cache {
 		}
 
 		$tags = array();
-		// ── PRO_START ─────────────────────────────────────────────────────────────────
-		if ( class_exists( 'PigCache_Tag_Collector', false ) && PigCache_Tag_Collector::is_active() ) {
+		if ( PigCache_Tag_Collector::is_active() ) {
 			$tags = PigCache_Tag_Collector::stop();
 		}
-		// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 		$base = class_exists( 'PigCache_Config', false )
 			? PigCache_Config::get_html_cache_ttl()
@@ -387,13 +379,11 @@ class PigCache_Html_Cache {
 		if ( class_exists( 'PigCache_Stats', false ) ) {
 			PigCache_Stats::html_write();
 		}
+		// ── PRO_END ───────────────────────────────────────────────────────────────────
 
-		$tag_inv = class_exists( 'PigCache_Tag_Index', false );
-
-		if ( $tag_inv && ! empty( $tags ) ) {
+		if ( ! empty( $tags ) ) {
 			PigCache_Tag_Index::store_tags( $key, self::GROUP_HTML, $tags );
 		}
-		// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 		self::release_lock();
 

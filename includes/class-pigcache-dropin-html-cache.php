@@ -117,9 +117,6 @@ class PigCache_Dropin_Html_Cache {
 			return new WP_Error( 'pigcache_ac_write', __( 'Could not write wp-content/advanced-cache.php. Check filesystem permissions.', 'pigcache' ) );
 		}
 
-		// Attempt to ensure WP_CACHE is true in wp-config.php.
-		self::maybe_inject_wp_cache_constant();
-
 		return true;
 	}
 
@@ -149,76 +146,13 @@ class PigCache_Dropin_Html_Cache {
 	}
 
 	/**
-	 * Try to add `define('WP_CACHE', true)` to wp-config.php if it's not set.
-	 * Silently returns on any filesystem error.
+	 * The snippet the site owner has to add to wp-config.php for WordPress to
+	 * load the drop-in. PigCache never edits wp-config.php itself.
 	 *
-	 * @return bool True if the constant was injected or already present.
+	 * @return string
 	 */
-	public static function maybe_inject_wp_cache_constant() {
-		if ( defined( 'WP_CACHE' ) ) {
-			return true;
-		}
-
-		$config_path = self::locate_wp_config();
-		if ( null === $config_path ) {
-			return false;
-		}
-
-		if ( ! is_writable( $config_path ) ) {
-			return false;
-		}
-
-		$contents = file_get_contents( $config_path );
-		if ( false === $contents ) {
-			return false;
-		}
-
-		// Already contains WP_CACHE definition.
-		if ( preg_match( "/define\s*\(\s*['\"]WP_CACHE['\"/i", $contents ) ) {
-			return true;
-		}
-
-		// Insert before "/* That's all, stop editing!" marker, or before closing PHP tag.
-		$marker = "/* That's all, stop editing!";
-		$line   = "define( 'WP_CACHE', true ); // Added by PigCache\n";
-
-		if ( strpos( $contents, $marker ) !== false ) {
-			$contents = str_replace( $marker, $line . $marker, $contents );
-		} else {
-			// Append before the last closing PHP tag or at end.
-			$contents = rtrim( $contents );
-			if ( substr( $contents, -2 ) === '?>' ) {
-				$contents = substr( $contents, 0, -2 ) . $line . '?>';
-			} else {
-				$contents .= "\n" . $line;
-			}
-		}
-
-		$result = file_put_contents( $config_path, $contents );
-
-		return false !== $result;
-	}
-
-	/**
-	 * Locate wp-config.php. WordPress core always finds it in one of two places.
-	 * This mirrors the exact check in wp-load.php — no WordPress function exists
-	 * to retrieve the wp-config.php path directly, so dirname(ABSPATH) is correct.
-	 *
-	 * @return string|null Absolute path or null if not found.
-	 */
-	private static function locate_wp_config() {
-		$candidates = array(
-			ABSPATH . 'wp-config.php',
-			dirname( ABSPATH ) . '/wp-config.php', // standard location when wp-config.php is one level above ABSPATH
-		);
-
-		foreach ( $candidates as $path ) {
-			if ( is_readable( $path ) && ! is_dir( $path ) ) {
-				return $path;
-			}
-		}
-
-		return null;
+	public static function wp_cache_snippet() {
+		return "define( 'WP_CACHE', true );";
 	}
 
 	/**

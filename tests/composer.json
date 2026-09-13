@@ -1,0 +1,12 @@
+{
+	"name": "pigcache/tests",
+	"description": "Test tooling for PigCache. Kept out of the plugin's own composer.json so the shipped vendor/ tree stays limited to runtime dependencies.",
+	"license": "GPL-3.0-or-later",
+	"require-dev": {
+		"phpunit/phpunit": "^9.6"
+	},
+	"config": {
+		"sort-packages": true,
+		"vendor-dir": "vendor"
+	}
+}

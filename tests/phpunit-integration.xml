@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Integration suite. Runs inside the Docker stack with a live WordPress,
+  MySQL and Redis. Invoked by tests/run.sh, not directly.
+-->
+<phpunit xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:noNamespaceSchemaLocation="https://schema.phpunit.de/9.6/phpunit.xsd"
+         bootstrap="bootstrap/integration.php"
+         colors="true"
+         beStrictAboutTestsThatDoNotTestAnything="true"
+         cacheResult="false">
+
+    <testsuites>
+        <testsuite name="integration">
+            <directory>integration</directory>
+        </testsuite>
+    </testsuites>
+</phpunit>

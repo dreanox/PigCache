@@ -12,6 +12,12 @@ dist/
 # Development only – vendor/ IS committed for distribution as a WordPress plugin.
 # If you need to rebuild: composer install --no-dev
 
+# Test tooling. Kept in tests/vendor/ so the plugin's own vendor/ — which ships
+# inside the ZIP — stays limited to runtime dependencies.
+tests/vendor/
+tests/composer.lock
+tests/.phpunit.result.cache
+
 # E2E tests (Playwright) — generated output only; source files are committed
 tests/e2e/node_modules/
 tests/e2e/playwright-report/
@@ -19,3 +25,4 @@ tests/e2e/test-results/
 tests/e2e/screenshots/
 # .env.tests is committed (no secrets). Local overrides go in .env.tests.local (gitignored).
 tests/.env.tests.local
+tests/.packaged-edition

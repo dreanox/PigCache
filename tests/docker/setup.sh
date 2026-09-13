@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-WP_URL="http://localhost:8088"
+WP_URL="http://localhost:${PIGCACHE_TEST_PORT:-9520}"
 WP_TITLE="PigCache E2E Tests"
 WP_ADMIN_USER="admin"
 WP_ADMIN_PASS="admin"
@@ -27,6 +27,22 @@ until curl -sf "$WP_URL/wp-login.php" > /dev/null 2>&1; do
   sleep 3
 done
 
+# The constants have to be defined before wp-settings.php runs, so the require
+# goes on the second line of wp-config.php — right after the opening tag and
+# before anything else. Doing it here instead of through WORDPRESS_CONFIG_EXTRA
+# keeps the stack working across WordPress image versions.
+echo "[setup] Wiring PigCache constants into wp-config.php..."
+$COMPOSE exec -T -u root wordpress sh -c '
+  set -e
+  config=/var/www/html/wp-config.php
+  if grep -q "pigcache-test-config.php" "$config"; then
+    echo "  already wired"
+    exit 0
+  fi
+  sed -i "1a require_once __DIR__ . \"/pigcache-test-config.php\";" "$config"
+  echo "  done"
+'
+
 echo "[setup] Installing WordPress core..."
 $WPCLI core install \
   --url="$WP_URL" \
@@ -38,6 +54,24 @@ $WPCLI core install \
 
 echo "[setup] Activating PigCache plugin..."
 $WPCLI plugin activate pigcache || echo "[setup] Already active, continuing..."
+
+# Drop-ins are written into wp-content, which the image leaves owned by root.
+# Without this the installs fail with "Permission denied" and every cache layer
+# stays off, so the tests would quietly exercise an uncached site.
+#
+# Non-recursive on purpose: the plugin is bind-mounted read-only, and a
+# recursive chown fails on it and aborts this script under `set -e`.
+# 33 is the numeric www-data UID in the Apache image that owns the volume; the
+# Alpine-based CLI image resolves that name to a different UID.
+# A fresh install uses plain permalinks (/?p=123), where every post path
+# canonicalises to "/". That makes the firewall and HTML cache tests meaningless,
+# and none of the pretty URLs in .env.tests would resolve.
+echo "[setup] Switching to pretty permalinks..."
+$WPCLI rewrite structure '/%postname%/' --hard
+$WPCLI rewrite flush --hard
+
+echo "[setup] Making wp-content writable by the WP-CLI user..."
+$COMPOSE exec -T -u root wordpress chown 33:33 /var/www/html/wp-content
 
 echo "[setup] Installing drop-ins (object cache, advanced-cache, db)..."
 $WPCLI eval '
@@ -82,8 +116,8 @@ $WPCLI post create \
   --post_type=post \
   --post_status=publish \
   --post_title="PigCache Emoji URL Test 🏆" \
-  --post_content="<p>This post has an emoji in its slug to test the EARLY/LATE cache key symmetry fix (Bug #2). The slug is percent-encoded by WordPress.</p><p>$(python3 -c "print('x ' * 100)")</p>" \
-  --post_name="pigcache-test-emoji-url" \
+  --post_content="<p>This post has an emoji in its slug to test the EARLY/LATE cache key symmetry fix (Bug #2). The slug is percent-encoded by WordPress.</p><p>$(printf 'relleno %.0s' $(seq 1 60))</p>" \
+  --post_name="🏆-pigcache-emoji" \
   --porcelain || echo "[setup] Emoji post may already exist, continuing..."
 
 echo "[setup] Flushing object cache to start fresh..."

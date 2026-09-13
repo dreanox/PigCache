@@ -10,7 +10,10 @@ defined( 'ABSPATH' ) || exit;
 class PigCache_Plugin {
 
 	const DB_VERSION_OPTION = 'pigcache_db_version';
-	const DB_VERSION        = 4;
+	const DB_VERSION        = 5;
+
+	/** Daily wp-cron event that prunes tag rows whose Redis keys are gone. */
+	const TAG_CLEANUP_HOOK = 'pigcache_tag_index_cleanup';
 
 	/**
 	 * @var self|null
@@ -41,6 +44,11 @@ class PigCache_Plugin {
 
 		PigCache_Html_Cache::init();
 		PigCache_Invalidation::init();
+
+		add_action( self::TAG_CLEANUP_HOOK, array( 'PigCache_Tag_Index', 'cleanup_stale' ) );
+		if ( ! wp_next_scheduled( self::TAG_CLEANUP_HOOK ) ) {
+			wp_schedule_event( time() + HOUR_IN_SECONDS, 'daily', self::TAG_CLEANUP_HOOK );
+		}
 
 		if ( class_exists( 'PigCache_Url_Firewall', false ) ) {
 			PigCache_Url_Firewall::init();
@@ -105,6 +113,9 @@ class PigCache_Plugin {
 
 		require_once ABSPATH . 'wp-admin/includes/upgrade.php';
 
+		// Tag index backing selective HTML and fragment invalidation.
+		PigCache_Tag_Index::create_table();
+
 		// ── PRO_START ─────────────────────────────────────────────────────────────────
 		// Per-table mutation frequency for Adaptive TTL v2.
 		dbDelta( "CREATE TABLE {$wpdb->prefix}pigcache_table_stability (
@@ -150,6 +161,8 @@ class PigCache_Plugin {
 		$wpdb->query( "DROP TABLE IF EXISTS {$wpdb->prefix}pigcache_url_traffic" );     // phpcs:ignore
 		// ── PRO_END ───────────────────────────────────────────────────────────────────
 		$wpdb->query( "DROP TABLE IF EXISTS {$wpdb->prefix}pigcache_kv" );              // phpcs:ignore
+
+		PigCache_Tag_Index::drop_table();
 
 		delete_option( self::DB_VERSION_OPTION );
 	}

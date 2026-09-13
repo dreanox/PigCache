@@ -39,7 +39,11 @@ class PigCache_Sql_Cache {
 
 		$new = wp_cache_incr( self::EPOCH_KEY, 1, self::GROUP_META );
 
-		if ( false === $new || 0 === $new ) {
+		// get_epoch() reports 1 for an epoch that was never set, and incrementing
+		// a missing key also lands on 1 — so the first bump after a flush would
+		// leave the epoch exactly where readers already believed it was, and
+		// everything cached beforehand would still look fresh. Skip to 2.
+		if ( false === $new || $new <= 1 ) {
 			wp_cache_set( self::EPOCH_KEY, 2, self::GROUP_META, self::long_ttl() );
 		}
 	}
@@ -74,7 +78,12 @@ class PigCache_Sql_Cache {
 		$key = self::table_epoch_key( $table );
 		$new = wp_cache_incr( $key, 1, self::GROUP_META );
 
-		if ( false === $new || 0 === $new ) {
+		// get_table_epoch() reports 1 for a table that has no epoch stored yet, so
+		// landing on 1 here would be indistinguishable from never having been
+		// bumped — the first write to a table would not invalidate anything cached
+		// before it. Skip straight to 2 whenever the increment did not produce a
+		// value above that floor.
+		if ( false === $new || $new <= 1 ) {
 			wp_cache_set( $key, 2, self::GROUP_META, self::long_ttl() );
 		}
 
@@ -124,6 +133,34 @@ class PigCache_Sql_Cache {
 	 */
 	private static function table_epoch_key( $table ) {
 		return 'pigcache_sql_epoch:' . $table;
+	}
+
+	/**
+	 * Extract the table a mutating statement writes to, so only that table's
+	 * epoch is bumped instead of the global one.
+	 *
+	 * @param string $query Raw SQL.
+	 * @return string Lowercased table name, or '' when it cannot be determined.
+	 */
+	public static function extract_mutation_table( $query ) {
+		$query = ltrim( (string) $query );
+
+		// INTO is optional for both INSERT and REPLACE in MySQL, and the priority
+		// and IGNORE modifiers can appear together.
+		$patterns = array(
+			'/^\s*INSERT\s+(?:LOW_PRIORITY\s+|DELAYED\s+|HIGH_PRIORITY\s+)?(?:IGNORE\s+)?(?:INTO\s+)?`?(\w+)`?/i',
+			'/^\s*REPLACE\s+(?:LOW_PRIORITY\s+|DELAYED\s+)?(?:INTO\s+)?`?(\w+)`?/i',
+			'/^\s*UPDATE\s+(?:LOW_PRIORITY\s+)?(?:IGNORE\s+)?`?(\w+)`?/i',
+			'/^\s*DELETE\s+.*?\bFROM\s+`?(\w+)`?/i',
+		);
+
+		foreach ( $patterns as $pattern ) {
+			if ( preg_match( $pattern, $query, $m ) ) {
+				return strtolower( $m[1] );
+			}
+		}
+
+		return '';
 	}
 
 	// ------------------------------------------------------------------

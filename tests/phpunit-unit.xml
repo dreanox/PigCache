@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Unit suite. No WordPress, no Redis, no MySQL — runs anywhere PHP does.
+
+  The config lives here rather than at the plugin root so it travels with the
+  tests/ directory, which is how the suite gets run against an extracted Free
+  ZIP (the root config is excluded from the package by .distignore).
+
+  Result caching is off because the plugin tree is mounted read-only when
+  testing a built package.
+-->
+<phpunit xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:noNamespaceSchemaLocation="https://schema.phpunit.de/9.6/phpunit.xsd"
+         bootstrap="bootstrap/unit.php"
+         colors="true"
+         beStrictAboutTestsThatDoNotTestAnything="true"
+         beStrictAboutOutputDuringTests="true"
+         failOnWarning="true"
+         failOnRisky="true"
+         cacheResult="false">
+
+    <testsuites>
+        <testsuite name="unit">
+            <directory>unit</directory>
+        </testsuite>
+    </testsuites>
+
+    <coverage>
+        <include>
+            <directory suffix=".php">../includes</directory>
+        </include>
+        <exclude>
+            <directory>../includes/dropin</directory>
+        </exclude>
+    </coverage>
+</phpunit>

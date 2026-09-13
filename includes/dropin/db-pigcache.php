@@ -18,24 +18,42 @@ if ( ! defined( 'WP_CONTENT_DIR' ) ) {
 /**
  * Locate class-pigcache-wpdb.php (plugin slug may differ; may live under mu-plugins).
  *
+ * require_wp_db() includes this drop-in before the plugin API exists, so
+ * plugin_dir_path() is unavailable and WP_PLUGIN_DIR / WPMU_PLUGIN_DIR are usually
+ * still undefined — core defines them later in wp_plugin_directory_constants().
+ * Use them when present, otherwise fall back to the core default locations.
+ *
  * @return string|null Absolute path if readable.
  */
 if ( ! function_exists( 'pigcache_db_dropin_locate_wpdb_class' ) ) {
 function pigcache_db_dropin_locate_wpdb_class() {
-	$candidates = array(
-		WP_CONTENT_DIR . '/plugins/pigcache/includes/class-pigcache-wpdb.php',
-		WP_CONTENT_DIR . '/mu-plugins/pigcache/includes/class-pigcache-wpdb.php',
-	);
+	$roots = array();
 
-	foreach ( $candidates as $path ) {
+	if ( defined( 'WP_PLUGIN_DIR' ) ) {
+		$roots[] = WP_PLUGIN_DIR;
+	} else {
+		$roots[] = WP_CONTENT_DIR . '/plugins';
+	}
+
+	if ( defined( 'WPMU_PLUGIN_DIR' ) ) {
+		$roots[] = WPMU_PLUGIN_DIR;
+	} else {
+		$roots[] = WP_CONTENT_DIR . '/mu-plugins';
+	}
+
+	foreach ( $roots as $root ) {
+		$path = $root . '/pigcache/includes/class-pigcache-wpdb.php';
 		if ( is_readable( $path ) ) {
 			return $path;
 		}
 	}
 
 	if ( function_exists( 'glob' ) ) {
-		$matches = glob( WP_CONTENT_DIR . '/plugins/*/includes/class-pigcache-wpdb.php' );
-		if ( is_array( $matches ) ) {
+		foreach ( $roots as $root ) {
+			$matches = glob( $root . '/*/includes/class-pigcache-wpdb.php' );
+			if ( ! is_array( $matches ) ) {
+				continue;
+			}
 			foreach ( $matches as $path ) {
 				if ( is_readable( $path ) ) {
 					return $path;

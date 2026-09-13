@@ -2,8 +2,8 @@
 Contributors: aixeiger
 Tags: cache, redis, object-cache, performance, html-cache
 Requires at least: 5.8
-Tested up to: 7.0
-Stable tag: 1.0.23
+Tested up to: 7.1
+Stable tag: 1.0.24
 Requires PHP: 7.4
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
@@ -17,12 +17,18 @@ PigCache replaces WordPress’s default object cache with **Redis** (official dr
 Features:
 
 * **Redis object cache** drop-in (PhpRedis or bundled Predis)
-* **SQL query cache** (optional `db.php` drop-in)
+* **SQL query cache** (optional `db.php` drop-in) with per-table invalidation, so writing to one table does not discard results that never read it
 * **Full-page HTML cache** for anonymous visitors with tag-based selective invalidation on content changes
 * **Fragment caching** helpers backed by Redis
 * **Tag-based selective invalidation** — only affected pages are purged when a post, term, or comment changes
 
+Every feature listed above is included and fully enabled. The plugin has no license check, no trial period and no usage limit, and it does not contact any external service.
+
 The object cache drop-in is derived from [Redis Object Cache](https://github.com/rhubarbgroup/redis-cache) (GPLv3, Till Krüss / Rhubarb Group).
+
+== External services ==
+
+This plugin does not connect to any external service. All caching, invalidation and metrics happen on your own server and your own Redis instance.
 
 == Installation ==
 
@@ -30,6 +36,7 @@ The object cache drop-in is derived from [Redis Object Cache](https://github.com
 2. Activate the plugin through the **Plugins** screen.
 3. Go to **Settings → PigCache** and use **Enable object cache (copy drop-in)** when you are ready.
 4. Optionally install the **SQL cache** drop-in from the same screen.
+5. For the full-page HTML cache, install the `advanced-cache.php` drop-in from the same screen and add `define( 'WP_CACHE', true );` to your `wp-config.php`. The plugin never edits `wp-config.php` for you.
 
 Do not run another full Redis object-cache plugin at the same time; PigCache replaces that role.
 
@@ -44,6 +51,21 @@ No. A reachable Redis server is required for the object cache (and for HTML/frag
 PigCache includes its own drop-in and must not be used together with the separate “Redis Object Cache” plugin.
 
 == Changelog ==
+
+= 1.0.25 =
+* Fixed: with a cold object cache, a query could return another query's rows. Caching a result or invalidating one reaches the database itself, and those internal lookups overwrote the result the caller was about to read. It affected the first query of each kind in a request after a cache flush, a Redis restart or a fresh install, and the wrong rows were then cached for the full TTL. Writes were affected too: a lost `insert_id` could attach new rows to the wrong record.
+* Fixed: the first write to a table did not invalidate SELECTs cached before it, because a freshly bumped per-table epoch was indistinguishable from a missing one. The global epoch had the same flaw.
+* Fixed: `wp_cache_decr()` could return negative values instead of clamping at zero as WordPress core does.
+* Fixed: the query-stats table was never created, because MySQL rejects a `DEFAULT` on a `TEXT` column.
+* Fixed: `INSERT`/`REPLACE` statements written without the optional `INTO` keyword were not attributed to their table.
+* The URL firewall now learns from 404s WordPress actually returned instead of matching against a list of known permalinks. It no longer needs to be seeded or rebuilt, and it cannot 404 real content.
+* Tested against WordPress 7.1.
+
+= 1.0.24 =
+* Tag-based selective invalidation and per-table SQL invalidation are now part of the plugin for everyone, with no license check of any kind.
+* The plugin no longer writes to `wp-config.php`; the `WP_CACHE` snippet is shown in the admin screen instead.
+* The Redis circuit breaker keeps its state in shared memory instead of a file in the system temp directory.
+* Drop-ins resolve the plugin directory through `WP_PLUGIN_DIR` / `WPMU_PLUGIN_DIR` when those constants are available.
 
 = 1.0.1 =
 * Security: sanitize $_SERVER inputs in early-boot path and admin handlers.

@@ -1,0 +1,158 @@
+name: tests
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Fast feedback: pure logic, no services. Runs on every PHP version the plugin
+  # claims to support, because most of this code is regex and string handling
+  # where the engine version genuinely matters.
+  unit:
+    name: unit (PHP ${{ matrix.php }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['7.4', '8.0', '8.1', '8.2', '8.3']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          tools: composer
+          coverage: none
+
+      - name: Install test tooling
+        working-directory: tests
+        run: composer install --no-interaction --no-progress
+
+      - name: Lint every shipped PHP file
+        run: |
+          find . -name '*.php' -not -path './vendor/*' -not -path './tests/vendor/*' -print0 \
+            | xargs -0 -n1 -P4 php -l > /dev/null
+
+      - name: Unit suite
+        run: cd tests && ./vendor/bin/phpunit --configuration phpunit-unit.xml
+
+  # The real thing: WordPress, MySQL and Redis, with the drop-ins installed.
+  integration:
+    name: integration
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          tools: composer
+          coverage: none
+
+      - name: Install test tooling
+        working-directory: tests
+        run: composer install --no-interaction --no-progress
+
+      - name: Install plugin runtime dependencies
+        run: composer install --no-dev --no-interaction --no-progress
+
+      - name: Integration suite
+        run: bash tests/run.sh integration
+
+      - name: Resilience — the site must survive Redis going away
+        run: bash tests/run.sh resilience
+
+      - name: Container logs on failure
+        if: failure()
+        run: docker compose -f tests/docker/docker-compose.yml logs --tail=200
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f tests/docker/docker-compose.yml down -v
+
+  e2e:
+    name: e2e
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: tests/e2e/package-lock.json
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          tools: composer
+          coverage: none
+
+      - name: Install plugin runtime dependencies
+        run: composer install --no-dev --no-interaction --no-progress
+
+      - name: E2E suite
+        run: bash tests/run.sh e2e
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: tests/e2e/playwright-report/
+          retention-days: 7
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f tests/docker/docker-compose.yml down -v
+
+  # The Free ZIP must not contain a single trace of Pro code. build.sh already
+  # enforces this; running it here means a violation can never reach a release.
+  build:
+    name: build compliance
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          tools: composer
+          coverage: none
+
+      - name: Install plugin runtime dependencies
+        run: composer install --no-dev --no-interaction --no-progress
+
+      - name: Install test tooling
+        working-directory: tests
+        run: composer install --no-interaction --no-progress
+
+      - name: Build both packages
+        run: printf '5\n' | bash bin/build.sh
+
+      # Neither ZIP is the working tree: build.sh strips whole blocks out of the
+      # Free build and rewrites headers in both. Passing tests on the tree say
+      # nothing about the artefacts that actually ship, so run them against the
+      # packages themselves.
+      - name: Test both packages
+        run: bash tests/run.sh packages
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f tests/docker/docker-compose.yml down -v
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: dist/*.zip
+          retention-days: 7

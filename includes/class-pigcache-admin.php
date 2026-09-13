@@ -275,22 +275,26 @@ class PigCache_Admin {
 		echo '<tr><th>' . esc_html__( 'db.php active', 'pigcache' ) . '</th>';
 		echo '<td>' . ( $sql_active ? '<span style="color:green">&#10003;</span>' : '<span style="color:#b32d2e">&#10007;</span>' ) . '</td></tr>';
 
-		$has_profile = class_exists( 'PigCache_Sql_Profiler', false ) && PigCache_Sql_Profiler::has_profile();
-		$is_learning = class_exists( 'PigCache_Sql_Profiler', false ) && PigCache_Sql_Profiler::is_learning();
+		$has_profile  = false;
+		$profile      = null;
+		$table_names  = array();
+		$table_epochs = array();
+		$mode_label   = __( 'Per-table epochs', 'pigcache' );
 
-		if ( $has_profile ) {
-			$mode_label = __( 'Per-table epochs (profiler active)', 'pigcache' );
-			$mode_color = 'green';
-		} elseif ( $is_learning ) {
-			$mode_label = __( 'Global epoch (profiler learning)', 'pigcache' );
-			$mode_color = '#b36b00';
-		} else {
-			$mode_label = __( 'Global epoch (default)', 'pigcache' );
-			$mode_color = '#666';
+		// ── PRO_START ─────────────────────────────────────────────────────────────────
+		if ( class_exists( 'PigCache_Sql_Profiler', false ) ) {
+			$has_profile = PigCache_Sql_Profiler::has_profile();
+
+			if ( $has_profile ) {
+				$mode_label = __( 'Per-table epochs (profiler active)', 'pigcache' );
+			} elseif ( PigCache_Sql_Profiler::is_learning() ) {
+				$mode_label = __( 'Per-table epochs (profiler learning)', 'pigcache' );
+			}
 		}
+		// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 		echo '<tr><th>' . esc_html__( 'Invalidation mode', 'pigcache' ) . '</th>';
-		echo '<td><span style="color:' . esc_attr( $mode_color ) . '"><strong>' . esc_html( $mode_label ) . '</strong></span></td></tr>';
+		echo '<td><span style="color:green"><strong>' . esc_html( $mode_label ) . '</strong></span></td></tr>';
 
 		if ( class_exists( 'PigCache_Sql_Cache', false ) ) {
 			$global_epoch = PigCache_Sql_Cache::get_epoch();
@@ -298,10 +302,11 @@ class PigCache_Admin {
 			echo '<td>' . esc_html( (string) $global_epoch ) . '</td></tr>';
 		}
 
+		// ── PRO_START ─────────────────────────────────────────────────────────────────
 		if ( $has_profile ) {
 			$profile = PigCache_Sql_Profiler::get_profile_stats();
 			if ( is_array( $profile ) && isset( $profile['tables'] ) ) {
-				$table_names = array_keys( $profile['tables'] );
+				$table_names  = array_keys( $profile['tables'] );
 				$table_epochs = PigCache_Sql_Cache::get_table_epochs( $table_names );
 
 				echo '<tr><th>' . esc_html__( 'Tables tracked', 'pigcache' ) . '</th>';
@@ -310,6 +315,7 @@ class PigCache_Admin {
 				echo '<td>' . esc_html( number_format( $profile['unique_templates'] ) ) . '</td></tr>';
 			}
 		}
+		// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 		$sql_ttl = class_exists( 'PigCache_Sql_Cache', false ) ? PigCache_Sql_Cache::ttl() : 120;
 		echo '<tr><th>' . esc_html__( 'TTL', 'pigcache' ) . '</th>';
@@ -317,6 +323,7 @@ class PigCache_Admin {
 
 		echo '</tbody></table>';
 
+		// ── PRO_START ─────────────────────────────────────────────────────────────────
 		if ( $has_profile && is_array( $profile ) && isset( $profile['tables'] ) && ! empty( $table_epochs ) ) {
 			echo '<details class="pigcache-dashboard-details"><summary>' . esc_html__( 'Per-table epochs', 'pigcache' ) . '</summary>';
 			echo '<table class="widefat striped"><thead><tr>';
@@ -334,6 +341,7 @@ class PigCache_Admin {
 			echo '</tbody></table>';
 			echo '</details>';
 		}
+		// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 		echo '</div>';
 

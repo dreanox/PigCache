@@ -87,8 +87,8 @@ class PigCache_Dropin_DB {
 	 */
 	public static function locate_wpdb_class_file() {
 		$candidates = array(
-			PIGCACHE_DIR . 'includes/class-pigcache-wpdb.php',                            // primary: plugin_dir_path()-based
-			WP_CONTENT_DIR . '/mu-plugins/pigcache/includes/class-pigcache-wpdb.php',     // mu-plugins fallback
+			PIGCACHE_DIR . 'includes/class-pigcache-wpdb.php',                     // primary: plugin_dir_path()-based
+			WPMU_PLUGIN_DIR . '/pigcache/includes/class-pigcache-wpdb.php',        // mu-plugins fallback
 		);
 
 		foreach ( $candidates as $path ) {
@@ -98,7 +98,7 @@ class PigCache_Dropin_DB {
 		}
 
 		if ( function_exists( 'glob' ) ) {
-			$matches = glob( WP_CONTENT_DIR . '/plugins/*/includes/class-pigcache-wpdb.php' );
+			$matches = glob( WP_PLUGIN_DIR . '/*/includes/class-pigcache-wpdb.php' );
 			if ( is_array( $matches ) ) {
 				foreach ( $matches as $path ) {
 					if ( is_readable( $path ) ) {

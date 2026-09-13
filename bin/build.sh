@@ -10,6 +10,10 @@
 # Output: dist/pigcache-free-<version>.zip
 #         dist/pigcache-pro-<version>.zip
 #
+# The Free build runs a compliance gate before zipping: it fails if any Pro or
+# licensing identifier survived the PRO_START/PRO_END strip, or if a shipped PHP
+# file does not parse. Upload only after that gate passes.
+#
 # WordPress.org: upload ONLY the ZIP from dist/ (built with this script). Do not zip the
 # repository root — .git/ and dist/*.zip must never appear inside the uploaded plugin.
 # class-pigcache-updates.php is Pro-only: .org forbids filtering site_transient_update_plugins.
@@ -22,6 +26,13 @@ set -euo pipefail
 
 PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST_DIR="${PLUGIN_DIR}/dist"
+
+# In-place sed. GNU sed wants `-i`, BSD/macOS sed wants `-i ''`.
+if sed --version >/dev/null 2>&1; then
+  sed_i() { sed -i "$@"; }
+else
+  sed_i() { sed -i '' "$@"; }
+fi
 
 # Read current version from plugin header
 VERSION=$(grep -m1 "Version:" "${PLUGIN_DIR}/pigcache.php" \
@@ -82,18 +93,23 @@ if [[ "${NEW_VERSION}" != "${VERSION}" ]]; then
   esac
 
   # 1. Plugin header  (` * Version: x.x.x`)
-  sed -i "s|^ \* Version: .*| \* Version: ${NEW_VERSION}|" "${PLUGIN_DIR}/pigcache.php"
+  sed_i "s|^ \* Version: .*| \* Version: ${NEW_VERSION}|" "${PLUGIN_DIR}/pigcache.php"
 
   # 2. PIGCACHE_VERSION constant
-  sed -i "s|define( 'PIGCACHE_VERSION', '[^']*' )|define( 'PIGCACHE_VERSION', '${NEW_VERSION}' )|" \
+  sed_i "s|define( 'PIGCACHE_VERSION', '[^']*' )|define( 'PIGCACHE_VERSION', '${NEW_VERSION}' )|" \
     "${PLUGIN_DIR}/pigcache.php"
 
   # 3. Stable tag in readme.txt
-  sed -i "s|^Stable tag: .*|Stable tag: ${NEW_VERSION}|" "${PLUGIN_DIR}/readme.txt"
+  sed_i "s|^Stable tag: .*|Stable tag: ${NEW_VERSION}|" "${PLUGIN_DIR}/readme.txt"
 
-  # 4. Changelog entry — inserted right after == Changelog == heading
-  sed -i "s|^== Changelog ==\$|== Changelog ==\n\n= ${NEW_VERSION} =\n* ${_changelog_summary}|" \
-    "${PLUGIN_DIR}/readme.txt"
+  # 4. Changelog entry — inserted right after == Changelog == heading.
+  #    awk instead of sed: multi-line replacements are not portable across
+  #    GNU and BSD sed.
+  awk -v ver="${NEW_VERSION}" -v summary="${_changelog_summary}" '
+    { print }
+    /^== Changelog ==$/ && !done { print ""; print "= " ver " ="; print "* " summary; done = 1 }
+  ' "${PLUGIN_DIR}/readme.txt" > "${PLUGIN_DIR}/readme.txt.tmp" \
+    && mv "${PLUGIN_DIR}/readme.txt.tmp" "${PLUGIN_DIR}/readme.txt"
 
   VERSION="${NEW_VERSION}"
   echo "  Version bumped to ${VERSION}."
@@ -120,7 +136,7 @@ PRO_ONLY_FILES=(
 # -----------------------------------------------------------------------
 build_zip() {
   local label="$1"
-  local zip_name="pigcache-${VERSION}.zip"
+  local zip_name="pigcache-free-${VERSION}.zip"
   [[ "${label}" == "pro" ]] && zip_name="pigcache-pro-${VERSION}.zip"
   local staging_root="${DIST_DIR}/.staging-${label}"
   local staging="${staging_root}/pigcache"
@@ -170,13 +186,9 @@ build_zip() {
       "${staging}/includes/class-pigcache-sql-cache.php" \
       "${staging}/includes/class-pigcache-plugin.php" \
     ; do
-      sed -i '/\/\/ ── PRO_START/,/\/\/ ── PRO_END/d' "${_pro_file}"
+      sed_i '/\/\/ ── PRO_START/,/\/\/ ── PRO_END/d' "${_pro_file}"
     done
     unset _pro_file
-
-    # Strip PRO_START…PRO_END blocks from readme.txt (changelog entries).
-    sed -i '/\/\/ ── PRO_START/,/\/\/ ── PRO_END/d' \
-      "${staging}/readme.txt"
   fi
 
   # ---- Inject cron script (bin/ is excluded from rsync via .distignore) ------
@@ -198,6 +210,65 @@ build_zip() {
     mkdir -p "${staging}/cli"
     cp "${PLUGIN_DIR}/cli/pigcache-monitor.py" "${staging}/cli/pigcache-monitor.py"
     chmod +x "${staging}/cli/pigcache-monitor.py"
+  fi
+
+  # ---- Compliance gate for the Free build -------------------------------
+  # WordPress.org Guideline 5 forbids shipping any mechanism that unlocks
+  # built-in features. Fail the build rather than upload a rejectable ZIP.
+  if [[ "${label}" == "free" ]]; then
+    echo "     Checking WordPress.org compliance ..."
+
+    local violations=0
+
+    if [[ -d "${staging}/includes/pro" ]]; then
+      echo "     ✗ includes/pro/ is present in the Free staging tree" >&2
+      violations=1
+    fi
+
+    # Pro class and licensing identifiers must leave no trace.
+    for _pattern in \
+      'PigCache_License' \
+      'pigcache_license' \
+      'PigCache_Cloud_' \
+      'PigCache_Sql_Profiler' \
+      'PigCache_Continuous_Learner' \
+      'PigCache_Adaptive_Ttl' \
+      'PigCache_Updates' \
+      'PRO_START' \
+      'sys_get_temp_dir' \
+    ; do
+      if grep -rqI --exclude-dir=vendor -- "${_pattern}" "${staging}"; then
+        echo "     ✗ Free build still references '${_pattern}':" >&2
+        grep -rnI --exclude-dir=vendor -- "${_pattern}" "${staging}" | sed 's|^|       |' >&2
+        violations=1
+      fi
+    done
+    unset _pattern
+
+    # Every shipped PHP file must parse. Skipped when no PHP binary is on PATH
+    # so the build still works on machines that only package the plugin.
+    if command -v php >/dev/null 2>&1; then
+      find "${staging}" -name '*.php' -not -path '*/vendor/*' -print > "${staging_root}/php-files.txt"
+      while IFS= read -r _php_file; do
+        [[ -n "${_php_file}" ]] || continue
+        if ! php -l "${_php_file}" >/dev/null 2>&1; then
+          echo "     ✗ PHP syntax error in ${_php_file#"${staging}/"}" >&2
+          violations=1
+        fi
+      done < "${staging_root}/php-files.txt"
+      rm -f "${staging_root}/php-files.txt"
+      unset _php_file
+    else
+      echo "     ! php not found on PATH — skipping syntax check" >&2
+    fi
+
+    if [[ "${violations}" -ne 0 ]]; then
+      echo "" >&2
+      echo "     Build aborted: the Free package is not WordPress.org compliant." >&2
+      exit 1
+    fi
+
+    echo "     ✓ Free package is clean"
   fi
 
   # ---- Create ZIP (pigcache/ wrapper folder required by wordpress.org) ---

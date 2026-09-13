@@ -33,6 +33,11 @@ tests/
 # Planning / internal docs (not for end users)
 plans.md
 
+# WordPress.org review correspondence and working notes — must never ship
+wpreview.md
+wpreview-response.md
+.backup-wpfix/
+
 # Internal docs (not for end users)
 CHANGELOG.md
 CACHE-FLOW.md

@@ -698,24 +698,19 @@ def connect_mysql(args, cfg):
     return conn, None
 
 
-# ─── Redis circuit-breaker flag (matches dropin) ─────────────────────────────
+# ─── Redis circuit-breaker state ─────────────────────────────────────────────
 
 def circuit_breaker_state(host, port):
-    """Mirror class PigCache_Dropin_Object_Cache::pigcache_circuit_path."""
+    """Report the drop-in's circuit-breaker state.
+
+    The drop-in keeps this state in APCu (see WP_Object_Cache::pigcache_circuit_key),
+    which lives inside the PHP-FPM workers and is not reachable from a separate
+    process. There is nothing for this script to inspect, so the state is reported
+    as unknown rather than guessed.
+    """
     import hashlib
-    import tempfile
-    flag = os.path.join(
-        tempfile.gettempdir(),
-        "pigcache_cb_" + hashlib.md5(f"{host}:{port}".encode()).hexdigest() + ".flag",
-    )
-    if not os.path.exists(flag):
-        return {"open": False, "path": flag, "age_seconds": None}
-    try:
-        with open(flag, "r") as f:
-            ts = int(f.read().strip() or "0")
-    except OSError:
-        return {"open": True, "path": flag, "age_seconds": None}
-    return {"open": True, "path": flag, "age_seconds": int(time.time()) - ts}
+    key = "pigcache_cb_" + hashlib.md5(f"{host}:{port}".encode()).hexdigest()
+    return {"open": None, "key": key, "age_seconds": None}
 
 
 # ─── Redis snapshot / metrics gathering ──────────────────────────────────────
@@ -3557,9 +3552,11 @@ def render_snapshot_text(snap, cb_state):
     out.append(f"  uptime                  : {snap['uptime_seconds']}s")
     out.append(f"  ping p50 / max          : {snap['ping_p50_ms']} ms / {snap['ping_max_ms']} ms")
     out.append(f"  info() latency          : {snap['info_latency_ms']} ms")
-    if cb_state["open"]:
+    if cb_state["open"] is None:
+        out.append(f"  circuit breaker         : unknown (APCu state, PHP-FPM local)")
+    elif cb_state["open"]:
         age = cb_state.get("age_seconds")
-        out.append(f"  circuit breaker         : OPEN  (flag {cb_state['path']}, age {age}s)")
+        out.append(f"  circuit breaker         : OPEN  (age {age}s)")
     else:
         out.append(f"  circuit breaker         : closed")
     out.append("")
@@ -4527,7 +4524,7 @@ def cmd_report(args, cfg):
                 "hostname":       "<gethostname()>",
             },
             "redis":            { ...redis_snapshot() output... },
-            "circuit_breaker":  { "open": bool, "age_seconds": int|null, "path": str },
+            "circuit_breaker":  { "open": bool|null, "age_seconds": int|null, "key": str },
             "mysql":            { ...mysql_probe() output... }   | null,
             "breakdown":        { ...scan_breakdown() output... } | null,
             "stampede":         { ...scan_stampede_locks() output... } | null,

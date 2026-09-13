@@ -30,7 +30,10 @@ class PigCache_Query_Stats {
 			id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
 			query_hash    VARCHAR(32)     NOT NULL,
 			normalized    TEXT            NOT NULL,
-			tables        TEXT            NOT NULL DEFAULT '[]',
+			-- No DEFAULT here: MySQL rejects defaults on TEXT columns outright, and
+			-- dbDelta reports the failure without aborting, so the whole table
+			-- silently never got created. Callers always write this column.
+			tables        TEXT            NOT NULL,
 			hit_count     BIGINT UNSIGNED NOT NULL DEFAULT 0,
 			total_exec_ms BIGINT UNSIGNED NOT NULL DEFAULT 0,
 			max_exec_ms   INT UNSIGNED    NOT NULL DEFAULT 0,

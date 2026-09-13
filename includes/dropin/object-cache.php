@@ -17,23 +17,38 @@
 
 defined( 'ABSPATH' ) || exit;
 
-// This dropin runs from wp-content/object-cache.php — plugin_dir_path() is unavailable.
-// Prefer PIGCACHE_DIR already set by pigcache.php via plugin_dir_path(__FILE__), then
-// fall back to scanning common locations when the dropin loads before the plugin does.
+// This dropin runs from wp-content/object-cache.php, loaded by wp_start_object_cache()
+// before any plugin file, so plugin_dir_path() does not exist yet. Prefer PIGCACHE_DIR
+// (set by pigcache.php via plugin_dir_path(__FILE__)) when the plugin got there first.
+// Otherwise use WP_PLUGIN_DIR / WPMU_PLUGIN_DIR when they are already defined, falling
+// back to the core default under WP_CONTENT_DIR — core only defines those constants
+// later, in wp_plugin_directory_constants().
 if ( ! defined( 'PIGCACHE_PLUGIN_DIR' ) ) {
 	if ( defined( 'PIGCACHE_DIR' ) ) {
 		define( 'PIGCACHE_PLUGIN_DIR', untrailingslashit( PIGCACHE_DIR ) );
-	} elseif ( defined( 'WP_CONTENT_DIR' ) ) {
-		foreach ( array(
-			WP_CONTENT_DIR . '/plugins/pigcache',
-			WP_CONTENT_DIR . '/mu-plugins/pigcache',
-		) as $_pigcache_dir ) {
+	} else {
+		$_pigcache_roots = array();
+
+		if ( defined( 'WP_PLUGIN_DIR' ) ) {
+			$_pigcache_roots[] = WP_PLUGIN_DIR;
+		} elseif ( defined( 'WP_CONTENT_DIR' ) ) {
+			$_pigcache_roots[] = WP_CONTENT_DIR . '/plugins';
+		}
+
+		if ( defined( 'WPMU_PLUGIN_DIR' ) ) {
+			$_pigcache_roots[] = WPMU_PLUGIN_DIR;
+		} elseif ( defined( 'WP_CONTENT_DIR' ) ) {
+			$_pigcache_roots[] = WP_CONTENT_DIR . '/mu-plugins';
+		}
+
+		foreach ( $_pigcache_roots as $_pigcache_root ) {
+			$_pigcache_dir = $_pigcache_root . '/pigcache';
 			if ( is_dir( $_pigcache_dir ) ) {
 				define( 'PIGCACHE_PLUGIN_DIR', $_pigcache_dir );
 				break;
 			}
 		}
-		unset( $_pigcache_dir );
+		unset( $_pigcache_roots, $_pigcache_root, $_pigcache_dir );
 	}
 }
 
@@ -930,13 +945,26 @@ class WP_Object_Cache {
                 $autoload_candidates[] = PIGCACHE_PLUGIN_DIR . '/vendor/autoload.php';
             }
 
-            if ( defined( 'WP_CONTENT_DIR' ) ) {
-                $autoload_candidates[] = WP_CONTENT_DIR . '/plugins/pigcache/vendor/autoload.php';
-                $autoload_candidates[] = WP_CONTENT_DIR . '/mu-plugins/pigcache/vendor/autoload.php';
+            $plugin_roots = array();
 
-                // Anything under wp-content/plugins/* that ships the same vendor.
+            if ( defined( 'WP_PLUGIN_DIR' ) ) {
+                $plugin_roots[] = WP_PLUGIN_DIR;
+            } elseif ( defined( 'WP_CONTENT_DIR' ) ) {
+                $plugin_roots[] = WP_CONTENT_DIR . '/plugins';
+            }
+
+            if ( defined( 'WPMU_PLUGIN_DIR' ) ) {
+                $plugin_roots[] = WPMU_PLUGIN_DIR;
+            } elseif ( defined( 'WP_CONTENT_DIR' ) ) {
+                $plugin_roots[] = WP_CONTENT_DIR . '/mu-plugins';
+            }
+
+            foreach ( $plugin_roots as $plugin_root ) {
+                $autoload_candidates[] = $plugin_root . '/pigcache/vendor/autoload.php';
+
+                // Any sibling folder that ships the same vendor (renamed install).
                 if ( function_exists( 'glob' ) ) {
-                    $glob_matches = glob( WP_CONTENT_DIR . '/plugins/*/vendor/predis/predis/src/Client.php' );
+                    $glob_matches = glob( $plugin_root . '/*/vendor/predis/predis/src/Client.php' );
                     if ( is_array( $glob_matches ) ) {
                         foreach ( $glob_matches as $client_path ) {
                             $autoload_candidates[] = dirname( $client_path, 4 ) . '/autoload.php';
@@ -2420,6 +2448,7 @@ class WP_Object_Cache {
         if ( $this->is_ignored_group( $group ) || ! $this->redis_status() ) {
             $value = $this->get_from_internal_cache( $derived_key );
             $value -= $offset;
+            $value = max( 0, $value );
             $this->add_to_internal_cache( $derived_key, $value );
 
             return $value;
@@ -2429,6 +2458,7 @@ class WP_Object_Cache {
             if ( $this->use_igbinary ) {
                 $value = (int) $this->parse_redis_response( $this->maybe_unserialize( $this->redis->get( $derived_key ) ) );
                 $value -= $offset;
+                $value = max( 0, $value );
                 $serialized = $this->maybe_serialize( $value );
 
                 if ( ($pttl = $this->redis->pttl( $derived_key )) > 0 ) {
@@ -2446,8 +2476,17 @@ class WP_Object_Cache {
                     $result = $value;
                 }
             } else {
-                $result = $this->parse_redis_response( $this->redis->decrBy( $derived_key, $offset ) );
-                $this->add_to_internal_cache( $derived_key, (int) $this->redis->get( $derived_key ) );
+                $result = (int) $this->parse_redis_response( $this->redis->decrBy( $derived_key, $offset ) );
+
+                // WP_Object_Cache::decr() clamps at zero, and callers rely on that
+                // to treat a counter as a non-negative quantity. Redis DECRBY does
+                // not clamp, so write the floor back explicitly.
+                if ( $result < 0 ) {
+                    $result = 0;
+                    $this->parse_redis_response( $this->redis->set( $derived_key, 0 ) );
+                }
+
+                $this->add_to_internal_cache( $derived_key, $result );
             }
         } catch ( Exception $exception ) {
             $this->handle_exception( $exception );
@@ -2916,28 +2955,33 @@ class WP_Object_Cache {
     // After the interval a single probe request attempts to reconnect; if it
     // succeeds the circuit closes automatically.
 
+    /** @var int Unix timestamp until which the circuit stays open in this process. */
+    private static $pigcache_circuit_open_until = 0;
+
     /**
-     * Returns the path of the circuit-breaker flag file for this Redis endpoint.
+     * Shared-memory key identifying the circuit state for this Redis endpoint.
      *
-     * sys_get_temp_dir() is intentional and the only viable location for this file.
-     * The circuit breaker must work when Redis is DOWN and WordPress may not be fully
-     * loaded — which means:
-     *   • wp_upload_dir() is unavailable (calls get_option(), which hits the object cache
-     *     we are currently initialising — circular dependency).
-     *   • WP_CONTENT_DIR/cache/ is not guaranteed to exist or be writable at this point.
-     *   • The WordPress DB transient API is unavailable for the same reason.
-     *   • The plugin folder (PIGCACHE_DIR) is not a writable runtime-data location
-     *     and would violate WP.org guidelines.
-     * The system temp directory is the standard PHP location for ephemeral flag files;
-     * it does not persist across reboots (correct behaviour — a stale flag after a
-     * server restart should clear so Redis gets a fresh connection attempt).
+     * The breaker stores its state in APCu, never on disk. It has to work while
+     * Redis is DOWN and WordPress is only half-loaded, which rules out the options
+     * that would normally apply: wp_upload_dir() and the transient API both call
+     * get_option(), which reaches back into the object cache being initialised here.
+     * When APCu is unavailable the breaker degrades to per-request state — correctness
+     * is unaffected, only the cross-request timeout saving is lost.
      *
      * @return string
      */
-    private function pigcache_circuit_path() {
+    private function pigcache_circuit_key() {
         $host = defined( 'PIGCACHE_REDIS_HOST' ) ? PIGCACHE_REDIS_HOST : '127.0.0.1';
         $port = defined( 'PIGCACHE_REDIS_PORT' ) ? (string) PIGCACHE_REDIS_PORT : '6379';
-        return sys_get_temp_dir() . '/pigcache_cb_' . md5( $host . ':' . $port ) . '.flag';
+        return 'pigcache_cb_' . md5( $host . ':' . $port );
+    }
+
+    /**
+     * @return bool Whether APCu is present and enabled for this SAPI.
+     */
+    private function pigcache_apcu_enabled() {
+        return function_exists( 'apcu_fetch' ) && function_exists( 'apcu_store' )
+            && filter_var( ini_get( 'apc.enabled' ), FILTER_VALIDATE_BOOLEAN );
     }
 
     /**
@@ -2946,31 +2990,46 @@ class WP_Object_Cache {
      * @return bool
      */
     private function pigcache_circuit_is_open() {
-        $path = $this->pigcache_circuit_path();
-        if ( ! file_exists( $path ) ) {
+        if ( self::$pigcache_circuit_open_until > 0 ) {
+            return time() < self::$pigcache_circuit_open_until;
+        }
+
+        if ( ! $this->pigcache_apcu_enabled() ) {
             return false;
         }
 
-        $ts  = (int) @file_get_contents( $path ); // phpcs:ignore WordPress.WP.AlternativeFunctions
-        $ttl = defined( 'PIGCACHE_REDIS_RETRY_INTERVAL' ) ? (int) PIGCACHE_REDIS_RETRY_INTERVAL : 30;
+        $found = false;
+        $until = apcu_fetch( $this->pigcache_circuit_key(), $found );
 
-        if ( time() - $ts < $ttl ) {
+        if ( ! $found ) {
+            return false;
+        }
+
+        if ( time() < (int) $until ) {
             return true;
         }
 
-        // Interval elapsed — delete flag and let this request probe Redis.
-        @unlink( $path ); // phpcs:ignore WordPress.WP.AlternativeFunctions
+        // Interval elapsed — clear the entry and let this request probe Redis.
+        apcu_delete( $this->pigcache_circuit_key() );
 
         return false;
     }
 
     /**
-     * Opens the circuit breaker (writes the flag file with the current timestamp).
+     * Opens the circuit breaker for PIGCACHE_REDIS_RETRY_INTERVAL seconds.
      *
      * @return void
      */
     private function pigcache_open_circuit() {
-        @file_put_contents( $this->pigcache_circuit_path(), (string) time() ); // phpcs:ignore WordPress.WP.AlternativeFunctions
+        $ttl   = defined( 'PIGCACHE_REDIS_RETRY_INTERVAL' ) ? (int) PIGCACHE_REDIS_RETRY_INTERVAL : 30;
+        $ttl   = max( 1, $ttl );
+        $until = time() + $ttl;
+
+        self::$pigcache_circuit_open_until = $until;
+
+        if ( $this->pigcache_apcu_enabled() ) {
+            apcu_store( $this->pigcache_circuit_key(), $until, $ttl );
+        }
     }
 
     // ────────────────────────────────────────────────────────────────────────

@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       PigCache
  * Description:       Redis object-cache drop-in with optional SQL, HTML page, and fragment caching.
- * Version: 1.0.23
+ * Version: 1.0.24
  * Requires at least: 5.8
  * Requires PHP:      7.4
  * Author:            PigCache
@@ -17,7 +17,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'PIGCACHE_VERSION', '1.0.23' );
+define( 'PIGCACHE_VERSION', '1.0.24' );
 define( 'PIGCACHE_FILE', __FILE__ );
 define( 'PIGCACHE_DIR', plugin_dir_path( __FILE__ ) );
 define( 'PIGCACHE_URL', plugin_dir_url( __FILE__ ) );
@@ -40,6 +40,8 @@ require_once PIGCACHE_DIR . 'includes/class-pigcache-html-cache.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-url-firewall.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-invalidation.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-fragments.php';
+require_once PIGCACHE_DIR . 'includes/class-pigcache-tag-collector.php';
+require_once PIGCACHE_DIR . 'includes/class-pigcache-tag-index.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-dropin-db.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-dropin-object-cache.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-dropin-html-cache.php';
@@ -47,11 +49,10 @@ require_once PIGCACHE_DIR . 'includes/class-pigcache-admin.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-metrics.php';
 require_once PIGCACHE_DIR . 'includes/class-pigcache-plugin.php';
 
+// ── PRO_START ─────────────────────────────────────────────────────────────────
 // Optional modules — loaded when present on disk.
 foreach ( array(
 	'class-pigcache-license.php',
-	'class-pigcache-tag-collector.php',
-	'class-pigcache-tag-index.php',
 	'class-pigcache-environment.php',
 	'class-pigcache-cloud-client.php',
 	'class-pigcache-cloud-sync.php',
@@ -72,15 +73,14 @@ foreach ( array(
 	}
 }
 unset( $_pigcache_pro_file, $_pigcache_pro_path );
+// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 register_activation_hook(
 	PIGCACHE_FILE,
 	static function () {
 		PigCache_Config::on_activate();
+		PigCache_Tag_Index::create_table();
 		// ── PRO_START ─────────────────────────────────────────────────────────────────
-		if ( class_exists( 'PigCache_Tag_Index', false ) ) {
-			PigCache_Tag_Index::create_table();
-		}
 		PigCache_License::maybe_start_trial();
 
 		if ( class_exists( 'PigCache_Sql_Profile_Store', false ) ) {
@@ -113,6 +113,8 @@ register_deactivation_hook(
 			PigCache_Dropin_Html_Cache::remove();
 		}
 
+		wp_clear_scheduled_hook( PigCache_Plugin::TAG_CLEANUP_HOOK );
+
 		// ── PRO_START ─────────────────────────────────────────────────────────────────
 		if ( class_exists( 'PigCache_Cloud_Sync', false ) ) {
 			PigCache_Cloud_Sync::unschedule();
@@ -128,9 +130,13 @@ register_deactivation_hook(
 add_filter(
 	'cron_schedules',
 	static function ( $schedules ) {
-		$minutes = class_exists( 'PigCache_Continuous_Learner', false )
-			? PigCache_Continuous_Learner::flush_interval_minutes()
-			: ( defined( 'PIGCACHE_FLUSH_INTERVAL' ) ? max( 1, min( 60, (int) PIGCACHE_FLUSH_INTERVAL ) ) : 15 );
+		$minutes = defined( 'PIGCACHE_FLUSH_INTERVAL' ) ? max( 1, min( 60, (int) PIGCACHE_FLUSH_INTERVAL ) ) : 15;
+
+		// ── PRO_START ─────────────────────────────────────────────────────────────────
+		if ( class_exists( 'PigCache_Continuous_Learner', false ) ) {
+			$minutes = PigCache_Continuous_Learner::flush_interval_minutes();
+		}
+		// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 		$schedules['pigcache_flush'] = array(
 			'interval' => $minutes * MINUTE_IN_SECONDS,
@@ -176,11 +182,7 @@ function pigcache_fragment( $key, $callback, $ttl = 60, $group = 'pigcache_fragm
  * @param string $tag  e.g. "widget:recent_posts", "custom:my_slider".
  */
 function pigcache_tag( $tag ) {
-	// ── PRO_START ─────────────────────────────────────────────────────────────────
-	if ( class_exists( 'PigCache_Tag_Collector', false ) ) {
-		PigCache_Tag_Collector::add( $tag );
-	}
-	// ── PRO_END ───────────────────────────────────────────────────────────────────
+	PigCache_Tag_Collector::add( $tag );
 }
 
 // ── PRO_START ─────────────────────────────────────────────────────────────────

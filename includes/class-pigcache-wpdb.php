@@ -80,7 +80,9 @@ class PigCache_WPDB extends wpdb {
 			$this->pigcache_bypass = false;
 
 			if ( false !== $out ) {
+				$state = $this->pigcache_snapshot_result();
 				$this->pigcache_on_mutation( $trim );
+				$this->pigcache_restore_result( $state );
 			}
 
 			return $out;
@@ -92,12 +94,18 @@ class PigCache_WPDB extends wpdb {
 			$pack  = wp_cache_get( $key, $group );
 
 			if ( $this->pigcache_valid_pack( $pack ) && $this->pigcache_is_fresh( $pack, $query ) ) {
-				$this->pigcache_hydrate_select( $query, $pack );
 				// ── PRO_START ─────────────────────────────────────────────────────────────────
+				// Counted before hydrating, never after: recording the hit can
+				// reach the database, and whatever it leaves behind would then
+				// be what the caller reads instead of the cached rows.
 				if ( class_exists( 'PigCache_Stats', false ) ) {
+					$this->pigcache_bypass = true;
 					PigCache_Stats::db_hit();
+					$this->pigcache_bypass = false;
 				}
 				// ── PRO_END ───────────────────────────────────────────────────────────────────
+				$this->pigcache_hydrate_select( $query, $pack );
+
 				return $pack['return_val'];
 			}
 		}
@@ -108,10 +116,15 @@ class PigCache_WPDB extends wpdb {
 		$this->pigcache_bypass = false;
 		$exec_ms               = ( microtime( true ) - $t_start ) * 1000;
 
-		if ( false !== $out && '' === $this->last_error && $this->pigcache_is_cacheable_select( ltrim( $this->last_query ) ) ) {
-			$this->pigcache_bypass = true;
-			$this->pigcache_store_select( $this->pigcache_cache_key( $this->last_query ), $out, $this->last_query, $exec_ms );
-			$this->pigcache_bypass = false;
+		// From here to the return, every line is bookkeeping the caller knows
+		// nothing about, and any of it may query the database: a TTL behind an
+		// uncached get_option(), an epoch lookup, the Pro instrumentation. Put
+		// the caller's result aside for the duration and hand it back intact.
+		$state                 = $this->pigcache_snapshot_result();
+		$this->pigcache_bypass = true;
+
+		if ( false !== $out && '' === $state['last_error'] && $this->pigcache_is_cacheable_select( ltrim( $state['last_query'] ) ) ) {
+			$this->pigcache_store_select( $this->pigcache_cache_key( $state['last_query'] ), $out, $state['last_query'], $exec_ms, $state );
 			// ── PRO_START ─────────────────────────────────────────────────────────────────
 			if ( class_exists( 'PigCache_Stats', false ) ) {
 				PigCache_Stats::db_miss( 'not_found' );
@@ -125,7 +138,7 @@ class PigCache_WPDB extends wpdb {
 			&& PigCache_Sql_Profiler::is_learning()
 			&& $this->pigcache_is_cacheable_select( $trim )
 		) {
-			PigCache_Sql_Profiler::record( $query, $this->num_rows );
+			PigCache_Sql_Profiler::record( $query, $state['num_rows'] );
 		}
 
 		if ( false !== $out
@@ -138,6 +151,9 @@ class PigCache_WPDB extends wpdb {
 			PigCache_Continuous_Learner::record( $normalized, $tables, $exec_ms, $mem_kb );
 		}
 		// ── PRO_END ───────────────────────────────────────────────────────────────────
+
+		$this->pigcache_bypass = false;
+		$this->pigcache_restore_result( $state );
 
 		return $out;
 	}
@@ -235,8 +251,7 @@ class PigCache_WPDB extends wpdb {
 	 * @return bool
 	 */
 	private function pigcache_is_fresh( $pack, $query = '' ) {
-		// ── PRO_START ─────────────────────────────────────────────────────────────────
-		if ( isset( $pack['table_epochs'] ) && is_array( $pack['table_epochs'] ) && ! empty( $pack['table_epochs'] ) ) {
+		if ( ! empty( $pack['table_epochs'] ) && is_array( $pack['table_epochs'] ) ) {
 			if ( class_exists( 'PigCache_Sql_Cache', false ) ) {
 				$current = PigCache_Sql_Cache::get_table_epochs( array_keys( $pack['table_epochs'] ) );
 				foreach ( $pack['table_epochs'] as $table => $stored_epoch ) {
@@ -248,7 +263,6 @@ class PigCache_WPDB extends wpdb {
 				return true;
 			}
 		}
-		// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 		if ( ! isset( $pack['epoch'] ) ) {
 			return false;
@@ -279,7 +293,54 @@ class PigCache_WPDB extends wpdb {
 	 * @param string $query
 	 * @param float  $exec_ms
 	 */
-	private function pigcache_store_select( $key, $return_val, $query = '', $exec_ms = 0.0 ) {
+	/**
+	 * Capture the outcome of the query that just ran.
+	 *
+	 * wpdb reports a query's outcome through shared properties, and callers read
+	 * them only after query() has returned: get_results() reads last_result,
+	 * insert() reads insert_id, and so on. Anything we do in between must leave
+	 * those properties exactly as parent::query() left them.
+	 *
+	 * That is easy to get wrong, because filling or invalidating the cache can
+	 * itself reach the database — a TTL lookup behind an uncached get_option()
+	 * is enough — and the nested query overwrites all of it. The window is
+	 * invisible on a warm cache and opens on every cold one, which is why it
+	 * survived so long: right after a flush, a restart or a fresh install, the
+	 * first query of each kind in a request returned another query's rows.
+	 *
+	 * $result is deliberately left out. It is a live mysqli handle that a nested
+	 * query may have freed, and restoring a freed handle is worse than leaving
+	 * the current one in place; col_info, the only thing read through it, is
+	 * restored directly.
+	 *
+	 * @return array
+	 */
+	private function pigcache_snapshot_result() {
+		return array(
+			'last_result'   => $this->last_result,
+			'num_rows'      => $this->num_rows,
+			'last_query'    => $this->last_query,
+			'last_error'    => $this->last_error,
+			'col_info'      => $this->col_info,
+			'insert_id'     => $this->insert_id,
+			'rows_affected' => $this->rows_affected,
+		);
+	}
+
+	/**
+	 * @param array $state Snapshot from pigcache_snapshot_result().
+	 */
+	private function pigcache_restore_result( array $state ) {
+		$this->last_result   = $state['last_result'];
+		$this->num_rows      = $state['num_rows'];
+		$this->last_query    = $state['last_query'];
+		$this->last_error    = $state['last_error'];
+		$this->col_info      = $state['col_info'];
+		$this->insert_id     = $state['insert_id'];
+		$this->rows_affected = $state['rows_affected'];
+	}
+
+	private function pigcache_store_select( $key, $return_val, $query = '', $exec_ms = 0.0, array $state = array() ) {
 		$ttl = 120;
 		if ( class_exists( 'PigCache_Sql_Cache', false ) ) {
 			$ttl = PigCache_Sql_Cache::ttl();
@@ -294,57 +355,64 @@ class PigCache_WPDB extends wpdb {
 		}
 		// ── PRO_END ───────────────────────────────────────────────────────────────────
 
+		// Read the rows from the snapshot, not from $this: resolving the TTL just
+		// above may already have run a query of its own and replaced them.
 		$pack = array(
-			'last_result' => $this->last_result,
-			'num_rows'    => (int) $this->num_rows,
+			'last_result' => array_key_exists( 'last_result', $state ) ? $state['last_result'] : $this->last_result,
+			'num_rows'    => (int) ( array_key_exists( 'num_rows', $state ) ? $state['num_rows'] : $this->num_rows ),
 			'return_val'  => $return_val,
 		);
 
-		// ── PRO_START ─────────────────────────────────────────────────────────────────
 		$table_epochs = $this->pigcache_resolve_table_epochs( $query );
 
 		if ( ! empty( $table_epochs ) ) {
 			$pack['table_epochs'] = $table_epochs;
-		} else {
-		// ── PRO_END ───────────────────────────────────────────────────────────────────
-		if ( class_exists( 'PigCache_Sql_Cache', false ) ) {
+		} elseif ( class_exists( 'PigCache_Sql_Cache', false ) ) {
 			$pack['epoch'] = PigCache_Sql_Cache::get_epoch();
 		} else {
 			// Drop-in loaded before plugin — skip caching this query.
 			return;
 		}
-		// ── PRO_START ─────────────────────────────────────────────────────────────────
-		} // end else (no table_epochs)
-		// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 		wp_cache_set( $key, $pack, 'pigcache_sql', $ttl );
 	}
 
-	// ── PRO_START ─────────────────────────────────────────────────────────────────
 	/**
-	 * Try to resolve per-table epochs for a query using the compiled profile.
+	 * Resolve the per-table epochs a cached SELECT depends on, so a write to one
+	 * table does not invalidate results that never read it.
 	 *
 	 * @param string $query
-	 * @return array<string, int> table => epoch, or empty if no profile.
+	 * @return array<string, int> table => epoch, or empty when no table could be resolved.
 	 */
 	private function pigcache_resolve_table_epochs( $query ) {
-		if ( ! class_exists( 'PigCache_Sql_Profiler', false ) || ! PigCache_Sql_Profiler::has_profile() ) {
+		if ( ! class_exists( 'PigCache_Sql_Cache', false ) ) {
 			return array();
 		}
 
-		$tables = PigCache_Sql_Profiler::get_tables_for_query( $query );
+		$tables = array();
 
-		if ( false === $tables || empty( $tables ) ) {
+		// ── PRO_START ─────────────────────────────────────────────────────────────────
+		// A compiled profile resolves tables the parser cannot see (subqueries,
+		// aliases, UNIONs). Fall through to the parser when it has no answer.
+		if ( class_exists( 'PigCache_Sql_Profiler', false ) && PigCache_Sql_Profiler::has_profile() ) {
+			$profiled = PigCache_Sql_Profiler::get_tables_for_query( $query );
+
+			if ( is_array( $profiled ) && ! empty( $profiled ) ) {
+				$tables = $profiled;
+			}
+		}
+		// ── PRO_END ───────────────────────────────────────────────────────────────────
+
+		if ( empty( $tables ) ) {
+			$tables = $this->pigcache_extract_tables( ltrim( (string) $query ) );
+		}
+
+		if ( empty( $tables ) ) {
 			return array();
 		}
 
-		if ( class_exists( 'PigCache_Sql_Cache', false ) ) {
-			return PigCache_Sql_Cache::get_table_epochs( $tables );
-		}
-
-		return array();
+		return PigCache_Sql_Cache::get_table_epochs( array_map( 'strtolower', $tables ) );
 	}
-	// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 	/**
 	 * Handle a successful mutation: bump only the mutated table's epoch when
@@ -353,12 +421,8 @@ class PigCache_WPDB extends wpdb {
 	 * @param string $trim Left-trimmed SQL of the mutating statement.
 	 */
 	private function pigcache_on_mutation( $trim ) {
-		// ── PRO_START ─────────────────────────────────────────────────────────────────
-		if ( class_exists( 'PigCache_Sql_Profiler', false )
-			&& PigCache_Sql_Profiler::has_profile()
-			&& class_exists( 'PigCache_Sql_Cache', false )
-		) {
-			$table = PigCache_Sql_Profiler::extract_mutation_table( $trim );
+		if ( class_exists( 'PigCache_Sql_Cache', false ) ) {
+			$table = PigCache_Sql_Cache::extract_mutation_table( $trim );
 
 			if ( $table !== '' ) {
 				PigCache_Sql_Cache::bump_table_epoch( $table );
@@ -366,7 +430,6 @@ class PigCache_WPDB extends wpdb {
 			}
 		}
 
-		// ── PRO_END ───────────────────────────────────────────────────────────────────
 		$this->pigcache_bump_epoch();
 	}
 
@@ -385,10 +448,11 @@ class PigCache_WPDB extends wpdb {
 		// Collapse whitespace.
 		return preg_replace( '/\s+/', ' ', trim( $q ) );
 	}
+	// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 	/**
-	 * Extract table names from a SELECT for lightweight analytics tagging.
-	 * Not exhaustive — covers simple FROM/JOIN patterns.
+	 * Extract the table names a SELECT reads from, so the cached result can be
+	 * tied to those tables' epochs. Not exhaustive — covers FROM/JOIN patterns.
 	 *
 	 * @param string $trim Left-trimmed SQL.
 	 * @return string[]
@@ -400,7 +464,6 @@ class PigCache_WPDB extends wpdb {
 		}
 		return array_values( $tables );
 	}
-	// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 	/**
 	 * Global epoch bump fallback.
@@ -417,7 +480,9 @@ class PigCache_WPDB extends wpdb {
 
 		$new = wp_cache_incr( 'pigcache_sql_epoch', 1, 'pigcache' );
 
-		if ( false === $new || 0 === $new ) {
+		// Same reasoning as PigCache_Sql_Cache::bump_epoch(): a bump that lands on
+		// 1 is indistinguishable from never having been set.
+		if ( false === $new || $new <= 1 ) {
 			$ttl = defined( 'YEAR_IN_SECONDS' ) ? (int) YEAR_IN_SECONDS * 10 : 315360000;
 			wp_cache_set( 'pigcache_sql_epoch', 2, 'pigcache', $ttl );
 		}

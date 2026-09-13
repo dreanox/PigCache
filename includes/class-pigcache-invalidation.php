@@ -121,7 +121,6 @@ class PigCache_Invalidation {
 			return;
 		}
 
-		// ── PRO_START ─────────────────────────────────────────────────────────────────
 		if ( self::can_use_tag_invalidation() ) {
 			$tags = self::resolve_post_tags( $post_id );
 			$tags = apply_filters( 'pigcache_invalidation_tags', $tags, $post_id );
@@ -130,16 +129,12 @@ class PigCache_Invalidation {
 				PigCache_Tag_Index::purge_by_tags( $tags );
 			}
 		} else {
-		// ── PRO_END ───────────────────────────────────────────────────────────────────
 			self::global_flush();
-		// ── PRO_START ─────────────────────────────────────────────────────────────────
 		}
-		// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 		self::bump_sql_epoch();
 	}
 
-	// ── PRO_START ─────────────────────────────────────────────────────────────────
 	/**
 	 * Build the tag list for a given post.
 	 *
@@ -178,7 +173,6 @@ class PigCache_Invalidation {
 
 		return array_unique( $tags );
 	}
-	// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 	// ------------------------------------------------------------------
 	// Term hooks — tag-based
@@ -194,7 +188,6 @@ class PigCache_Invalidation {
 			return;
 		}
 
-		// ── PRO_START ─────────────────────────────────────────────────────────────────
 		if ( self::can_use_tag_invalidation() ) {
 			$tags = array(
 				'term:' . (int) $term_id,
@@ -205,11 +198,8 @@ class PigCache_Invalidation {
 				PigCache_Tag_Index::purge_by_tags( $tags );
 			}
 		} else {
-		// ── PRO_END ───────────────────────────────────────────────────────────────────
 			self::global_flush();
-		// ── PRO_START ─────────────────────────────────────────────────────────────────
 		}
-		// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 		self::bump_sql_epoch();
 	}
@@ -227,7 +217,6 @@ class PigCache_Invalidation {
 			return;
 		}
 
-		// ── PRO_START ─────────────────────────────────────────────────────────────────
 		if ( self::can_use_tag_invalidation() ) {
 			$comment_obj = get_comment( $comment_id );
 			if ( $comment_obj && $comment_obj->comment_post_ID ) {
@@ -237,11 +226,8 @@ class PigCache_Invalidation {
 				}
 			}
 		} else {
-		// ── PRO_END ───────────────────────────────────────────────────────────────────
 			self::global_flush();
-		// ── PRO_START ─────────────────────────────────────────────────────────────────
 		}
-		// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 		self::bump_sql_epoch();
 	}
@@ -273,7 +259,6 @@ class PigCache_Invalidation {
 			return;
 		}
 
-		// ── PRO_START ─────────────────────────────────────────────────────────────────
 		if ( self::can_use_tag_invalidation() ) {
 			$tags = array( 'nav_menu:' . (int) $menu_id );
 
@@ -281,11 +266,8 @@ class PigCache_Invalidation {
 				PigCache_Tag_Index::purge_by_tags( $tags );
 			}
 		} else {
-		// ── PRO_END ───────────────────────────────────────────────────────────────────
 			self::global_flush();
-		// ── PRO_START ─────────────────────────────────────────────────────────────────
 		}
-		// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 		self::bump_sql_epoch();
 	}
@@ -302,7 +284,6 @@ class PigCache_Invalidation {
 			return;
 		}
 
-		// ── PRO_START ─────────────────────────────────────────────────────────────────
 		if ( self::can_use_tag_invalidation() ) {
 			$tags = array( 'author:' . (int) $user_id );
 
@@ -310,11 +291,8 @@ class PigCache_Invalidation {
 				PigCache_Tag_Index::purge_by_tags( $tags );
 			}
 		} else {
-		// ── PRO_END ───────────────────────────────────────────────────────────────────
 			self::global_flush();
-		// ── PRO_START ─────────────────────────────────────────────────────────────────
 		}
-		// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 		self::bump_sql_epoch();
 	}
@@ -353,13 +331,9 @@ class PigCache_Invalidation {
 			return;
 		}
 
-		// ── PRO_START ─────────────────────────────────────────────────────────────────
 		if ( ! self::can_use_tag_invalidation() ) {
-		// ── PRO_END ───────────────────────────────────────────────────────────────────
 			self::global_flush();
-		// ── PRO_START ─────────────────────────────────────────────────────────────────
 		}
-		// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 		self::bump_sql_epoch();
 	}
@@ -415,12 +389,10 @@ class PigCache_Invalidation {
 		}
 	}
 
-	// ── PRO_START ─────────────────────────────────────────────────────────────────
 	/**
 	 * @return bool
 	 */
 	private static function can_use_tag_invalidation() {
-		return class_exists( 'PigCache_Tag_Index', false );
+		return (bool) apply_filters( 'pigcache_use_tag_invalidation', true );
 	}
-	// ── PRO_END ───────────────────────────────────────────────────────────────────
 }

@@ -33,19 +33,16 @@ class PigCache_Fragments {
 
 		wp_cache_set( $safe_key, $data, $group, (int) $ttl );
 
-		// ── PRO_START ─────────────────────────────────────────────────────────────────
-		$tag_inv = class_exists( 'PigCache_Tag_Index', false );
-
-		if ( $tag_inv && ! empty( $tags ) ) {
+		if ( ! empty( $tags ) ) {
 			PigCache_Tag_Index::store_tags( $safe_key, $group, $tags );
 		}
-		// ── PRO_END ───────────────────────────────────────────────────────────────────
 
 		return $data;
 	}
 
 	/**
-	 * Flush the entire fragment cache group (global invalidation for Free tier).
+	 * Flush the entire fragment cache group. Used as the fallback when tag-based
+	 * invalidation is disabled via the `pigcache_use_tag_invalidation` filter.
 	 */
 	public static function flush_all() {
 		wp_cache_flush_group( 'pigcache_fragments' );
