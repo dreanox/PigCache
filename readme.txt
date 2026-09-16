@@ -53,6 +53,7 @@ PigCache includes its own drop-in and must not be used together with the separat
 == Changelog ==
 
 = 1.0.25 =
+* Fixed: activating the plugin on a fresh site — or deactivating and reactivating it — could break the request outright. The constructor scheduled the plugin's WP-Cron events on `plugins_loaded`, before `init`, and building the cron label touched a translation function that early. WordPress logs that as a notice, but because it is the very first byte of output in the entire request, every later `header()` call in that request then fails with "headers already sent" — which shows up as WordPress reporting unexpected output during activation, or the plugin being silently left deactivated. Cron registration now waits for `init`, like it always should have.
 * Fixed: with a cold object cache, a query could return another query's rows. Caching a result or invalidating one reaches the database itself, and those internal lookups overwrote the result the caller was about to read. It affected the first query of each kind in a request after a cache flush, a Redis restart or a fresh install, and the wrong rows were then cached for the full TTL. Writes were affected too: a lost `insert_id` could attach new rows to the wrong record.
 * Fixed: the first write to a table did not invalidate SELECTs cached before it, because a freshly bumped per-table epoch was indistinguishable from a missing one. The global epoch had the same flaw.
 * Fixed: `wp_cache_decr()` could return negative values instead of clamping at zero as WordPress core does.
