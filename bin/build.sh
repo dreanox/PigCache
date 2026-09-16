@@ -136,7 +136,7 @@ PRO_ONLY_FILES=(
 # -----------------------------------------------------------------------
 build_zip() {
   local label="$1"
-  local zip_name="pigcache-free-${VERSION}.zip"
+  local zip_name="pigcache-${VERSION}.zip"
   [[ "${label}" == "pro" ]] && zip_name="pigcache-pro-${VERSION}.zip"
   local staging_root="${DIST_DIR}/.staging-${label}"
   local staging="${staging_root}/pigcache"

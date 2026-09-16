@@ -118,8 +118,12 @@ class PigCache_Plugin {
 
 		// v4: rename reserved-word column `key` → `cache_key` on existing installs
 		// so dbDelta() can parse the PRIMARY KEY definition without generating
-		// malformed ALTER TABLE statements.
-		if ( $stored < 4 ) {
+		// malformed ALTER TABLE statements. Only applies when the table already
+		// exists from a prior install ($stored > 0) — a fresh site has $stored
+		// at its get_option() default of 0, and querying the not-yet-created
+		// table below throws a DB error that WP_DEBUG prints straight to
+		// output, breaking every header()/redirect for the rest of the request.
+		if ( $stored > 0 && $stored < 4 ) {
 			global $wpdb;
 			$kv_table = $wpdb->prefix . 'pigcache_kv';
 			$has_old  = $wpdb->get_var( "SHOW COLUMNS FROM `{$kv_table}` LIKE 'key'" ); // phpcs:ignore
