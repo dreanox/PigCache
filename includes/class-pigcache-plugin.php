@@ -46,9 +46,6 @@ class PigCache_Plugin {
 		PigCache_Invalidation::init();
 
 		add_action( self::TAG_CLEANUP_HOOK, array( 'PigCache_Tag_Index', 'cleanup_stale' ) );
-		if ( ! wp_next_scheduled( self::TAG_CLEANUP_HOOK ) ) {
-			wp_schedule_event( time() + HOUR_IN_SECONDS, 'daily', self::TAG_CLEANUP_HOOK );
-		}
 
 		if ( class_exists( 'PigCache_Url_Firewall', false ) ) {
 			PigCache_Url_Firewall::init();
@@ -63,9 +60,6 @@ class PigCache_Plugin {
 		// ── PRO_START ─────────────────────────────────────────────────────────────────
 		if ( class_exists( 'PigCache_Continuous_Learner', false ) ) {
 			PigCache_Continuous_Learner::init();
-			if ( PigCache_Continuous_Learner::using_wp_cron_fallback() ) {
-				PigCache_Continuous_Learner::schedule();
-			}
 		}
 		// ── PRO_END ───────────────────────────────────────────────────────────────────
 
@@ -74,6 +68,42 @@ class PigCache_Plugin {
 			PigCache_Metrics::init();
 			add_action( 'admin_notices', array( $this, 'maybe_notice_standalone_redis_plugin' ) );
 		}
+
+		// wp_schedule_event() calls apply_filters( 'cron_schedules', ... ), and our
+		// own callback for that filter (in pigcache.php) builds its 'display' label
+		// with __(). The constructor runs on 'plugins_loaded' — before 'init' — so
+		// doing this here made every fresh site (or every deactivate/reactivate,
+		// which clears the cron) trip WordPress's "translation loaded too early"
+		// notice on the very first request that actually schedules the event.
+		//
+		// That notice is not cosmetic: because it fires this early, it is emitted
+		// before anything else has sent output, which means every later header()
+		// call in the same request (redirects, nocache_headers(), a cookie) fails
+		// with "headers already sent". Hit during plugin activation specifically,
+		// that stray output is exactly what WordPress's own activation safeguard
+		// is watching for, and it reports the plugin as having produced unexpected
+		// output — or, on Free, silently leaves it deactivated when the redirect
+		// that would normally confirm activation never makes it out.
+		//
+		// Scheduling on 'init' avoids the whole class of bug: by then WordPress
+		// itself has already loaded translations for every active plugin.
+		add_action( 'init', array( __CLASS__, 'maybe_schedule_cron' ) );
+	}
+
+	/**
+	 * Register the WP-Cron events this plugin owns, if they are not already
+	 * scheduled. Must run on 'init' or later — see the comment in __construct().
+	 */
+	public static function maybe_schedule_cron(): void {
+		if ( ! wp_next_scheduled( self::TAG_CLEANUP_HOOK ) ) {
+			wp_schedule_event( time() + HOUR_IN_SECONDS, 'daily', self::TAG_CLEANUP_HOOK );
+		}
+
+		// ── PRO_START ─────────────────────────────────────────────────────────────────
+		if ( class_exists( 'PigCache_Continuous_Learner', false ) && PigCache_Continuous_Learner::using_wp_cron_fallback() ) {
+			PigCache_Continuous_Learner::schedule();
+		}
+		// ── PRO_END ───────────────────────────────────────────────────────────────────
 	}
 
 	/**
