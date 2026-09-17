@@ -136,8 +136,8 @@ class PigCache_Url_Firewall {
 			return null;
 		}
 
-		$uri  = isset( $_SERVER['REQUEST_URI'] ) ? (string) $_SERVER['REQUEST_URI'] : '/';
-		$path = self::canonical_path( $uri );
+		$uri  = isset( $_SERVER['REQUEST_URI'] ) ? self::unslash( $_SERVER['REQUEST_URI'] ) : '/';
+		$path = self::canonical_path( (string) $uri );
 
 		return self::is_bypassed( $path ) ? null : $path;
 	}
@@ -225,8 +225,8 @@ class PigCache_Url_Firewall {
 
 	private static function record( $redis, string $host, string $path ): void {
 		$ip  = self::client_ip();
-		$ua  = isset( $_SERVER['HTTP_USER_AGENT'] ) ? substr( (string) $_SERVER['HTTP_USER_AGENT'], 0, 300 ) : '';
-		$ref = isset( $_SERVER['HTTP_REFERER'] ) ? substr( (string) $_SERVER['HTTP_REFERER'], 0, 300 ) : '';
+		$ua  = isset( $_SERVER['HTTP_USER_AGENT'] ) ? substr( self::sanitize_header( $_SERVER['HTTP_USER_AGENT'] ), 0, 300 ) : '';
+		$ref = isset( $_SERVER['HTTP_REFERER'] ) ? substr( self::sanitize_header( $_SERVER['HTTP_REFERER'] ), 0, 300 ) : '';
 
 		$entry = wp_json_encode_safe( array(
 			't'    => time(),
@@ -547,7 +547,7 @@ class PigCache_Url_Firewall {
 		}
 		$prefixes = array( 'wordpress_logged_in_', 'comment_author_', 'wp-postpass_', 'woocommerce_items_in_cart' );
 		foreach ( array_keys( $_COOKIE ) as $name ) {
-			$name = (string) $name;
+			$name = self::sanitize_header( $name );
 			foreach ( $prefixes as $pre ) {
 				if ( 0 === strncmp( $name, $pre, strlen( $pre ) ) ) {
 					return true;
@@ -557,14 +557,72 @@ class PigCache_Url_Firewall {
 		return false;
 	}
 
+	/**
+	 * Best-effort client IP for instrumentation only — never used for access
+	 * control, so a spoofed CF-Connecting-IP header cannot bypass anything.
+	 *
+	 * Both candidates are validated with filter_var()/FILTER_VALIDATE_IP before
+	 * being returned: that guarantees the result is a well-formed IPv4/IPv6
+	 * address and nothing else, which is what the request headers are — a
+	 * client can put any string in CF-Connecting-IP, including terminal control
+	 * sequences, and this value ends up stored in Redis and later printed
+	 * verbatim by `wp pigcache-fw report`.
+	 *
+	 * @return string Empty string when neither candidate is a valid IP.
+	 */
 	private static function client_ip(): string {
 		if ( ! empty( $_SERVER['HTTP_CF_CONNECTING_IP'] ) ) {
-			return substr( (string) $_SERVER['HTTP_CF_CONNECTING_IP'], 0, 45 );
+			$cf = filter_var( self::unslash( $_SERVER['HTTP_CF_CONNECTING_IP'] ), FILTER_VALIDATE_IP );
+			if ( false !== $cf ) {
+				return $cf;
+			}
 		}
 		if ( ! empty( $_SERVER['REMOTE_ADDR'] ) ) {
-			return (string) $_SERVER['REMOTE_ADDR'];
+			$remote = filter_var( self::unslash( $_SERVER['REMOTE_ADDR'] ), FILTER_VALIDATE_IP );
+			if ( false !== $remote ) {
+				return $remote;
+			}
 		}
 		return '';
+	}
+
+	/**
+	 * wp_unslash() without depending on it — this class is used from
+	 * maybe_block_early(), which runs before WordPress (and formatting.php,
+	 * where wp_unslash() lives) is loaded. Falls through to the real
+	 * function once it exists so behaviour matches core exactly on the
+	 * late path.
+	 *
+	 * @param mixed $value
+	 * @return mixed
+	 */
+	private static function unslash( $value ) {
+		if ( function_exists( 'wp_unslash' ) ) {
+			return wp_unslash( $value );
+		}
+		return is_array( $value ) ? array_map( array( __CLASS__, 'unslash' ), $value ) : stripslashes( (string) $value );
+	}
+
+	/**
+	 * Free-text request header sanitiser safe to call before WordPress
+	 * loads: strips control/line-break bytes and undoes WordPress's
+	 * addslashes() pass on superglobals, without requiring
+	 * sanitize_text_field()/wp_unslash() to be defined yet.
+	 *
+	 * Used for values (User-Agent, Referer) that are attacker-controlled,
+	 * stored in Redis for the `wp pigcache-fw report` instrumentation, and
+	 * later printed to a terminal — see cli_safe().
+	 *
+	 * @param mixed $raw
+	 * @return string
+	 */
+	private static function sanitize_header( $raw ): string {
+		$val = (string) self::unslash( $raw );
+		if ( function_exists( 'sanitize_text_field' ) ) {
+			return sanitize_text_field( $val );
+		}
+		$val = preg_replace( '/[\x00-\x1F\x7F]/', '', $val );
+		return trim( (string) $val );
 	}
 
 	// ── Host / llaves ────────────────────────────────────────────────────────
@@ -665,6 +723,28 @@ class PigCache_Url_Firewall {
 		self::$redis    = null;
 		self::$observed = false;
 	}
+
+	/**
+	 * Make an attacker-controlled string safe to print to a terminal.
+	 *
+	 * The values shown by `wp pigcache-fw report` (IPs, user agents, paths) are
+	 * exactly the request data recorded in record() above. Storage already
+	 * sanitizes them, but this report can also read entries written by an older
+	 * version of the plugin, or by a client whose header contained raw ANSI/VT
+	 * escape sequences (cursor moves, screen clears, hidden text) — printing
+	 * those verbatim to a terminal via WP_CLI::log() lets the request forging
+	 * the header influence what an administrator sees or where their cursor
+	 * ends up. Stripping C0/C1 control and escape bytes removes that class of
+	 * terminal injection regardless of what made it into storage.
+	 *
+	 * @param mixed $value
+	 * @return string
+	 */
+	public static function cli_safe( $value ): string {
+		$str = (string) $value;
+		$str = preg_replace( '/[\x00-\x1F\x7F-\x9F]/', '', $str );
+		return null === $str ? '' : $str;
+	}
 }
 
 /**
@@ -703,7 +783,7 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 		 */
 		public function status( $args, $assoc ) {
 			$rep = PigCache_Url_Firewall::report( 0 );
-			\WP_CLI::log( 'Host:      ' . $rep['host'] );
+			\WP_CLI::log( 'Host:      ' . PigCache_Url_Firewall::cli_safe( $rep['host'] ) );
 			\WP_CLI::log( 'Activado:  ' . ( PigCache_Url_Firewall::enabled() ? 'sí' : 'no' ) );
 			\WP_CLI::log( 'Modo:      ' . PigCache_Url_Firewall::mode() );
 			\WP_CLI::log( '404 vivos: ' . $rep['learned'] );
@@ -744,7 +824,7 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 			$rep = PigCache_Url_Firewall::report( $top );
 
 			\WP_CLI::log( sprintf( 'Host %s · 404 vivos=%d · modo=%s · ttl=%ds',
-				$rep['host'], $rep['learned'], PigCache_Url_Firewall::mode(), $rep['ttl'] ) );
+				PigCache_Url_Firewall::cli_safe( $rep['host'] ), $rep['learned'], PigCache_Url_Firewall::mode(), $rep['ttl'] ) );
 
 			$print = static function ( $title, $rows ) {
 				\WP_CLI::log( "\n== $title ==" );
@@ -753,7 +833,10 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 					return;
 				}
 				foreach ( $rows as $r ) {
-					\WP_CLI::log( sprintf( '  %6d  %s', $r['count'], $r['key'] ) );
+					// $r['key'] is untrusted request data (IP/UA/path) read back
+					// from Redis; strip control/escape bytes before it reaches
+					// the terminal. See PigCache_Url_Firewall::cli_safe().
+					\WP_CLI::log( sprintf( '  %6d  %s', $r['count'], PigCache_Url_Firewall::cli_safe( $r['key'] ) ) );
 				}
 			};
 			$print( 'Top URLs bloqueadas', $rep['top_paths'] );
