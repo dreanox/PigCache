@@ -126,6 +126,10 @@ class PigCache_Html_Cache {
 		// strip bytes > 0x7F, producing a different string than the late path's
 		// sanitize_text_field(), causing a cache-key mismatch for non-ASCII URIs.
 		$uri_raw = isset( $_SERVER['REQUEST_URI'] )
+			// stripslashes(), not wp_unslash(): this runs from advanced-cache.php
+			// before wp-includes/formatting.php (where wp_unslash() lives) is
+			// loaded. stripslashes() undoes the same WordPress addslashes() pass
+			// on superglobals without requiring WP to be bootstrapped yet.
 			? (string) preg_replace( '/[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]/', '', stripslashes( $_SERVER['REQUEST_URI'] ) )
 			: '/';
 
@@ -588,7 +592,12 @@ class PigCache_Html_Cache {
 			return false;
 		}
 		foreach ( array_keys( $_COOKIE ) as $cookie_name ) {
-			$name = (string) $cookie_name;
+			// stripslashes(), not wp_unslash(): runs before WordPress (and
+			// wp_unslash()) is loaded. Only the cookie *name* is used, and only
+			// for a prefix comparison against a fixed literal list below — it
+			// is never stored or echoed — but we still normalise it the same
+			// way the late path does.
+			$name = stripslashes( (string) $cookie_name );
 			foreach ( self::$personalisation_cookie_prefixes as $prefix ) {
 				if ( 0 === strncmp( $name, $prefix, strlen( $prefix ) ) ) {
 					return true;
@@ -607,7 +616,7 @@ class PigCache_Html_Cache {
 			self::$personalisation_cookie_prefixes
 		);
 		foreach ( array_keys( $_COOKIE ) as $cookie_name ) {
-			$name = (string) $cookie_name;
+			$name = sanitize_text_field( wp_unslash( (string) $cookie_name ) );
 			foreach ( $prefixes as $prefix ) {
 				if ( 0 === strncmp( $name, (string) $prefix, strlen( (string) $prefix ) ) ) {
 					return true;
