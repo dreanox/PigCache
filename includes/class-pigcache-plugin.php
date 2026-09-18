@@ -118,17 +118,24 @@ class PigCache_Plugin {
 
 		// v4: rename reserved-word column `key` → `cache_key` on existing installs
 		// so dbDelta() can parse the PRIMARY KEY definition without generating
-		// malformed ALTER TABLE statements. Only applies when the table already
-		// exists from a prior install ($stored > 0) — a fresh site has $stored
-		// at its get_option() default of 0, and querying the not-yet-created
-		// table below throws a DB error that WP_DEBUG prints straight to
-		// output, breaking every header()/redirect for the rest of the request.
+		// malformed ALTER TABLE statements.
+		//
+		// On a brand-new site $stored is 0 and the table has never been created —
+		// install_tables() below creates it for the first time. Querying
+		// SHOW COLUMNS against a table that doesn't exist yet is a genuine SQL
+		// error, and with WP_DEBUG on, wpdb echoes that error directly (see
+		// wpdb::print_error()), which is unexpected output during activation on
+		// any fresh install with debugging enabled. Guard on the table actually
+		// existing first so this branch only ever runs on real upgrades.
 		if ( $stored > 0 && $stored < 4 ) {
 			global $wpdb;
-			$kv_table = $wpdb->prefix . 'pigcache_kv';
-			$has_old  = $wpdb->get_var( "SHOW COLUMNS FROM `{$kv_table}` LIKE 'key'" ); // phpcs:ignore
-			if ( $has_old ) {
-				$wpdb->query( "ALTER TABLE `{$kv_table}` CHANGE `key` cache_key VARCHAR(128) NOT NULL" ); // phpcs:ignore
+			$kv_table     = $wpdb->prefix . 'pigcache_kv';
+			$table_exists = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $kv_table ) ); // phpcs:ignore
+			if ( $table_exists ) {
+				$has_old = $wpdb->get_var( "SHOW COLUMNS FROM `{$kv_table}` LIKE 'key'" ); // phpcs:ignore
+				if ( $has_old ) {
+					$wpdb->query( "ALTER TABLE `{$kv_table}` CHANGE `key` cache_key VARCHAR(128) NOT NULL" ); // phpcs:ignore
+				}
 			}
 		}
 
