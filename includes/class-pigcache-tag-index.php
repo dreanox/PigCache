@@ -33,12 +33,17 @@ class PigCache_Tag_Index {
 		$table   = self::table_name();
 		$charset = $wpdb->get_charset_collate();
 
+		// `created` has no DEFAULT: MySQL only allowed DEFAULT CURRENT_TIMESTAMP on
+		// DATETIME columns starting in 5.6.5 (older versions only allowed it on
+		// TIMESTAMP). WordPress supports older MySQL than that, and dbDelta()
+		// reports the failure without aborting, so the table silently never got
+		// created. store_tags() below sets this column explicitly instead.
 		$sql = "CREATE TABLE {$table} (
 			id        BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
 			cache_key VARCHAR(255)  NOT NULL,
 			grp       VARCHAR(64)   NOT NULL DEFAULT 'pigcache_html',
 			tag       VARCHAR(128)  NOT NULL,
-			created   DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			created   DATETIME      NOT NULL,
 			PRIMARY KEY  (id),
 			INDEX idx_tag (tag),
 			INDEX idx_key_grp (cache_key, grp)
@@ -66,6 +71,8 @@ class PigCache_Tag_Index {
 
 		$wpdb->delete( $table, array( 'cache_key' => $cache_key, 'grp' => $group ) );
 
+		$now = function_exists( 'current_time' ) ? current_time( 'mysql', true ) : gmdate( 'Y-m-d H:i:s' );
+
 		$values  = array();
 		$holders = array();
 
@@ -74,17 +81,18 @@ class PigCache_Tag_Index {
 			if ( $tag === '' || strlen( $tag ) > 128 ) {
 				continue;
 			}
-			$holders[] = '(%s, %s, %s)';
+			$holders[] = '(%s, %s, %s, %s)';
 			$values[]  = $cache_key;
 			$values[]  = $group;
 			$values[]  = $tag;
+			$values[]  = $now;
 		}
 
 		if ( empty( $holders ) ) {
 			return;
 		}
 
-		$sql = "INSERT INTO {$table} (cache_key, grp, tag) VALUES " . implode( ', ', $holders );
+		$sql = "INSERT INTO {$table} (cache_key, grp, tag, created) VALUES " . implode( ', ', $holders );
 
 		// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
 		$wpdb->query( $wpdb->prepare( $sql, $values ) );
