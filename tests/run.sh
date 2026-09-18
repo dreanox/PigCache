@@ -231,11 +231,74 @@ run_package() {
       php "${CONTAINER_PLUGIN}/tests/vendor/bin/phpunit" \
         --configuration "${CONTAINER_PLUGIN}/tests/phpunit-integration.xml"
     ok "Integration suite passed on ${edition}"
+
+    run_lifecycle "${edition}" "${plugin_root}"
   )
 
   say "Restoring the stack to the working tree"
   compose down -v >/dev/null 2>&1 || true
   ok "${edition} package verified"
+}
+
+# Exercises deactivate → reactivate → deactivate → uninstall through WP-CLI,
+# with WP_DEBUG/WP_DEBUG_LOG on, and fails loudly on any warning/notice/error
+# or any byte of unexpected output. This is exactly the class of bug
+# WordPress.org's review flags as "unexpected output during activation".
+#
+# The copy under test is `docker cp`-ed into the container's own filesystem
+# (the wp_html named volume) rather than exercised through the host bind
+# mount at $2: a real WordPress install's plugin folder is a plain directory
+# on a plain disk, never a bind-mount point, and `rm -rf` against the actual
+# mount point fails with EBUSY ("device or resource busy") purely as a Docker
+# artefact — that would fail this check for a reason no real site ever hits.
+run_lifecycle() {
+  local edition="${1}"
+  local plugin_root="${2}"
+  local slug="pigcache-lifecycle-${edition}"
+  local container_path="/var/www/html/wp-content/plugins/${slug}"
+
+  say "Activation lifecycle against the ${edition} package"
+
+  local cid
+  cid="$(compose ps -q wordpress)"
+  [[ -n "${cid}" ]] || die "wordpress container is not running."
+
+  # The bind-mounted copy at wp-content/plugins/pigcache is active from
+  # ensure_installed(); both declare the same global functions
+  # (pigcache_fragment() etc.), so it must be off before the second copy
+  # under test can be activated.
+  compose run --rm wpcli plugin deactivate pigcache >/dev/null 2>&1 || true
+
+  compose exec -T -u www-data wordpress rm -rf "${container_path}"
+  docker cp "${plugin_root}" "${cid}:${container_path}"
+  compose exec -T -u root wordpress chown -R 33:33 "${container_path}"
+  compose exec -T -u www-data wordpress rm -f /var/www/html/wp-content/debug.log
+
+  local step
+  for step in "deactivate" "activate" "deactivate" "activate" "deactivate"; do
+    compose run --rm wpcli plugin "${step}" "${slug}"
+  done
+
+  local log
+  log="$(compose exec -T -u www-data wordpress cat /var/www/html/wp-content/debug.log 2>/dev/null || true)"
+  if [[ -n "${log}" ]]; then
+    printf '%s\n' "${log}"
+    die "debug.log is not empty after activate/deactivate cycles on ${edition} — see output above."
+  fi
+  ok "No warnings/notices/errors during activate/deactivate on ${edition}"
+
+  compose run --rm wpcli plugin uninstall "${slug}"
+
+  log="$(compose exec -T -u www-data wordpress cat /var/www/html/wp-content/debug.log 2>/dev/null || true)"
+  if [[ -n "${log}" ]]; then
+    printf '%s\n' "${log}"
+    die "debug.log is not empty after uninstall on ${edition} — see output above."
+  fi
+
+  if compose exec -T -u www-data wordpress test -d "${container_path}"; then
+    die "${container_path} still exists after uninstall on ${edition} — the plugin directory was not removed."
+  fi
+  ok "Uninstall removed the plugin directory cleanly on ${edition}, no warnings/notices/errors"
 }
 
 # ── End-to-end ────────────────────────────────────────────────────────────────
