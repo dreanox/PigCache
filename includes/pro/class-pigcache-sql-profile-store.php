@@ -30,6 +30,10 @@ class PigCache_Sql_Profile_Store {
 		$table   = self::table_name();
 		$charset = $wpdb->get_charset_collate();
 
+		// first_seen/last_seen have no DEFAULT: MySQL only allowed DEFAULT
+		// CURRENT_TIMESTAMP on DATETIME columns starting in 5.6.5 (older versions
+		// only allowed it on TIMESTAMP), and dbDelta() reports the failure without
+		// aborting the table create. upsert() below always sets both explicitly.
 		$sql = "CREATE TABLE {$table} (
 			id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
 			fingerprint VARCHAR(32)   NOT NULL,
@@ -37,8 +41,8 @@ class PigCache_Sql_Profile_Store {
 			tables_json VARCHAR(512)  NOT NULL,
 			hit_count   INT UNSIGNED  NOT NULL DEFAULT 1,
 			avg_rows    FLOAT         NOT NULL DEFAULT 0,
-			first_seen  DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			last_seen   DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			first_seen  DATETIME      NOT NULL,
+			last_seen   DATETIME      NOT NULL,
 			synced_at   DATETIME      DEFAULT NULL,
 			PRIMARY KEY  (id),
 			UNIQUE KEY uk_fingerprint (fingerprint)
