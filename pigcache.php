@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       PigCache
  * Description:       Redis object-cache drop-in with optional SQL, HTML page, and fragment caching.
- * Version: 1.0.27
+ * Version: 1.0.28
  * Requires at least: 5.8
  * Requires PHP:      7.4
  * Author:            PigCache
@@ -17,7 +17,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'PIGCACHE_VERSION', '1.0.27' );
+define( 'PIGCACHE_VERSION', '1.0.28' );
 define( 'PIGCACHE_FILE', __FILE__ );
 define( 'PIGCACHE_DIR', plugin_dir_path( __FILE__ ) );
 define( 'PIGCACHE_URL', plugin_dir_url( __FILE__ ) );
