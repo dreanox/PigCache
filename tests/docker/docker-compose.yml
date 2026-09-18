@@ -61,7 +61,14 @@ services:
       # Defaults to the working tree, which is the Pro configuration. `run.sh free`
       # points it at an extracted Free ZIP instead, so the exact artefact that
       # ships to WordPress.org gets the same test run.
-      - ${PIGCACHE_SOURCE:-../..}:/var/www/html/wp-content/plugins/pigcache:ro
+      #
+      # Mode defaults to `ro` to protect the real source tree — `wp plugin
+      # uninstall` does `rm -rf` on this path, which must never be able to
+      # touch the working tree. run.sh sets PIGCACHE_MOUNT_MODE=rw only when
+      # PIGCACHE_SOURCE points at a disposable dist/*-tree extracted from a
+      # built ZIP, so activate/deactivate/uninstall can be exercised for real,
+      # the same way it behaves on an actual WordPress site.
+      - ${PIGCACHE_SOURCE:-../..}:/var/www/html/wp-content/plugins/pigcache:${PIGCACHE_MOUNT_MODE:-ro}
       # PigCache constants. setup.sh requires this from the top of wp-config.php
       # rather than using WORDPRESS_CONFIG_EXTRA, which newer WordPress images
       # no longer apply.
@@ -85,7 +92,7 @@ services:
       WORDPRESS_DB_PASSWORD: wp
     volumes:
       - wp_html:/var/www/html
-      - ${PIGCACHE_SOURCE:-../..}:/var/www/html/wp-content/plugins/pigcache:ro
+      - ${PIGCACHE_SOURCE:-../..}:/var/www/html/wp-content/plugins/pigcache:${PIGCACHE_MOUNT_MODE:-ro}
       - ./wp-config-extra.php:/var/www/html/pigcache-test-config.php:ro
     profiles:
       - setup
