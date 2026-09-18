@@ -18,6 +18,28 @@
 // Enables the advanced-cache.php drop-in. Without it the HTML cache never runs.
 define( 'WP_CACHE', true );
 
+// WP_DEBUG itself comes from the WORDPRESS_DEBUG=1 env var in
+// docker-compose.yml — the base image's wp-config.php template defines it
+// later in the same file with a plain define(), so defining it again here
+// would just produce a "Constant already defined" warning of our own making.
+//
+// WP_DEBUG_LOG / WP_DEBUG_DISPLAY / SCRIPT_DEBUG are not wired to any env var
+// by the base image, so these are safe to set explicitly: everything
+// (including deprecation notices) goes to wp-content/debug.log AND to the
+// screen, so both `wp` command output and page responses surface problems
+// immediately during activation/deactivation testing.
+if ( ! defined( 'WP_DEBUG_LOG' ) ) {
+	define( 'WP_DEBUG_LOG', true );
+}
+if ( ! defined( 'WP_DEBUG_DISPLAY' ) ) {
+	define( 'WP_DEBUG_DISPLAY', true );
+}
+if ( ! defined( 'SCRIPT_DEBUG' ) ) {
+	define( 'SCRIPT_DEBUG', true );
+}
+error_reporting( E_ALL );
+ini_set( 'display_errors', '1' );
+
 // Redis — points at the 'redis' Compose service.
 define( 'PIGCACHE_REDIS_HOST', 'redis' );
 define( 'PIGCACHE_REDIS_PORT', 6379 );
